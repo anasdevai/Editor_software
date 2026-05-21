@@ -23,6 +23,7 @@ class CreateVersionRequest(BaseModel):
     change_summary: Optional[str] = None
     change_justification: Optional[str] = None # Enforced in later logic
     metadata_json: Optional[Any] = None
+    suggestion_id: Optional[UUID] = None
 
 class LinkRequest(BaseModel):
     source_id: UUID
@@ -316,6 +317,10 @@ class AIActionRequest(BaseModel):
     sop_entity_id: Optional[str] = None
     # Who invoked the action: ``editor_bubble`` | ``kl_assistant`` (for logs only).
     triggered_by: Optional[str] = None
+    # Original user instruction/prompt so explicit style references can reach the LLM layer.
+    instruction: Optional[str] = None
+    # When true, accepting the suggestion should also save learned style back into the linked company profile.
+    learn_to_profile: Optional[bool] = False
 
 class AIActionResponse(BaseModel):
     action: str

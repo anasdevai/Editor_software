@@ -331,6 +331,9 @@ export async function classifyAssistantIntent(payload = {}) {
     has_active_sop: Boolean(payload.has_active_sop),
     has_editor_selection: Boolean(payload.has_editor_selection),
   }
+  if (Array.isArray(payload.recent_messages) && payload.recent_messages.length > 0) {
+    body.recent_messages = payload.recent_messages.slice(-8)
+  }
   if (payload.assistant_context && typeof payload.assistant_context === 'object') {
     body.assistant_context = payload.assistant_context
   }
@@ -456,6 +459,8 @@ export async function performAIAction(payload) {
         client_structured_json: payload?.client_structured_json || null,
         sop_entity_id: payload?.sop_entity_id || null,
         triggered_by: payload?.triggered_by || null,
+        instruction: payload?.instruction || payload?.prompt || null,
+        learn_to_profile: Boolean(payload?.learn_to_profile),
       }),
       signal: controller.signal,
     })

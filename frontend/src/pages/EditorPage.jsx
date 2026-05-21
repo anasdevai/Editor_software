@@ -83,6 +83,88 @@ const EMPTY_DOC = {
 const STORAGE_KEY = 'current_document_id'
 const KL_EDITOR_CONTEXT_KEY = 'kl_assistant_editor_state_v2'
 
+const isLikelySectionHeading = (line) => {
+  const text = String(line || '').trim()
+  if (!text) return false
+  if (/^\d+(?:\.\d+)*[)\].:-]?\s+\S/u.test(text) && text.length < 180) return true
+  if (/^(purpose|scope|procedure|responsibilities|definitions|approval|revision history|zweck|geltungsbereich|verfahren|verantwortlichkeiten)\b/i.test(text)) return true
+  if (/^[A-ZÄÖÜ][A-ZÄÖÜ0-9\s/&()-]{4,}$/u.test(text) && text.length < 120) return true
+  return false
+}
+
+const deriveEditorSelectionSnapshot = (editorInstance) => {
+  if (!editorInstance || editorInstance.isDestroyed) {
+    return {
+      selectedText: '',
+      selectedRange: { from: 0, to: 0, empty: true },
+      selectedSection: { name: '', type: '', scope: 'cursor_context', text_excerpt: '' },
+    }
+  }
+
+  const { state } = editorInstance
+  const { selection } = state
+  const docSize = state.doc.content.size
+  const from = Number(selection?.from) || 0
+  const to = Number(selection?.to) || from
+  const empty = !selection || selection.empty
+  const selectedText = empty
+    ? ''
+    : (state.doc.textBetween(from, to, '\n') || '').trim()
+  const prefixText = state.doc.textBetween(0, Math.max(to, 0), '\n') || ''
+  const prefixLines = prefixText
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter(Boolean)
+  let sectionName = ''
+  for (let i = prefixLines.length - 1; i >= 0; i -= 1) {
+    if (isLikelySectionHeading(prefixLines[i])) {
+      sectionName = prefixLines[i]
+      break
+    }
+  }
+  if (!sectionName && !empty) {
+    sectionName = selectedText.split(/\r?\n/).find((line) => String(line || '').trim()) || ''
+  }
+  if (!sectionName) {
+    try {
+      sectionName = selection?.$from?.parent?.textContent || ''
+    } catch {
+      sectionName = ''
+    }
+  }
+
+  const blockText = (() => {
+    try {
+      return (selection?.$from?.parent?.textContent || '').trim()
+    } catch {
+      return ''
+    }
+  })()
+
+  const scope = empty ? 'cursor_context' : 'selection'
+  const excerpt = selectedText || blockText || sectionName
+  const sectionType = /table/i.test(selection?.$from?.parent?.type?.name || '')
+    ? 'Table'
+    : /heading/i.test(selection?.$from?.parent?.type?.name || '')
+      ? 'Heading'
+      : 'Paragraph'
+
+  return {
+    selectedText,
+    selectedRange: {
+      from,
+      to: Math.min(to, docSize),
+      empty,
+    },
+    selectedSection: {
+      name: String(sectionName || '').trim().slice(0, 180),
+      type: sectionType,
+      scope,
+      text_excerpt: String(excerpt || '').trim().slice(0, 1600),
+    },
+  }
+}
+
 const EditorShortcuts = Extension.create({
   name: 'editorShortcuts',
   addKeyboardShortcuts() {
@@ -542,6 +624,7 @@ const EditorPage = ({
 
   const persistKlEditorContext = useCallback(() => {
     if (!editor || editor.isDestroyed) return
+    const selectionSnapshot = deriveEditorSelectionSnapshot(editor)
     const linked = {
       deviations: Array.isArray(relatedContextSnapshot?.related_deviations) ? relatedContextSnapshot.related_deviations : [],
       capas: Array.isArray(relatedContextSnapshot?.related_capas) ? relatedContextSnapshot.related_capas : [],
@@ -557,18 +640,35 @@ const EditorPage = ({
         documentId: metadata?.documentId || '',
         title: metadata?.title || '',
         version: metadata?.sopVersion || '',
+        current_version_id: currentVersionId || '',
         status: sopStatus || '',
         references: Array.isArray(metadata?.references) ? metadata.references : [],
+        metadata: {
+          ...metadata,
+        },
+        metadata_json: {
+          sopStatus,
+          sopMetadata: {
+            ...metadata,
+          },
+          auditTrail: Array.isArray(auditTrail) ? auditTrail.slice(-12) : [],
+          versionNote: versionNote || '',
+        },
       },
       linked,
       editor_text: editor.getText() || '',
+      selected_text: selectionSnapshot.selectedText,
+      selected_range: selectionSnapshot.selectedRange,
+      selected_section_name: selectionSnapshot.selectedSection.name,
+      selected_section: selectionSnapshot.selectedSection,
     }
     try {
       localStorage.setItem(KL_EDITOR_CONTEXT_KEY, JSON.stringify(payload))
+      notifySopEditorContextChanged()
     } catch {
       // ignore storage failures
     }
-  }, [documentId, metadata, sopStatus, editor, relatedContextSnapshot])
+  }, [documentId, metadata, sopStatus, editor, relatedContextSnapshot, currentVersionId, auditTrail, versionNote])
 
   useEffect(() => {
     persistKlEditorContext()
@@ -580,8 +680,10 @@ const EditorPage = ({
       persistKlEditorContext()
     }, 1200)
     editor.on('update', syncContext)
+    editor.on('selectionUpdate', syncContext)
     return () => {
       editor.off('update', syncContext)
+      editor.off('selectionUpdate', syncContext)
       syncContext.cancel()
     }
   }, [editor, isEditorMounted, persistKlEditorContext])

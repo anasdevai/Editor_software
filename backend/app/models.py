@@ -72,6 +72,27 @@ class AIActionLog(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 
+class AISuggestion(Base):
+    __tablename__ = "ai_suggestions"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    action_log_id = Column(UUID(as_uuid=True), ForeignKey("ai_action_logs.id", ondelete="SET NULL"), nullable=True, index=True)
+    sop_id = Column(UUID(as_uuid=True), ForeignKey("sops.id", ondelete="CASCADE"), nullable=True, index=True)
+    sop_version_id = Column(UUID(as_uuid=True), ForeignKey("sop_versions.id", ondelete="SET NULL"), nullable=True, index=True)
+    action = Column(String(50), nullable=False, index=True)
+    target_scope = Column(String(50), nullable=True)
+    original_text = Column(Text, nullable=False)
+    suggested_text = Column(Text, nullable=False)
+    profile_id = Column(UUID(as_uuid=True), ForeignKey("client_profiles.id", ondelete="SET NULL"), nullable=True, index=True)
+    profile_version_id = Column(UUID(as_uuid=True), ForeignKey("profile_versions.id", ondelete="SET NULL"), nullable=True)
+    status = Column(String(30), nullable=False, default="pending", index=True)
+    accepted_version_id = Column(UUID(as_uuid=True), ForeignKey("sop_versions.id", ondelete="SET NULL"), nullable=True)
+    metadata_json = Column(JSONB, nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+    accepted_at = Column(TIMESTAMP, nullable=True)
+
+
 class EmbeddingJob(Base):
     __tablename__ = "embedding_jobs"
 

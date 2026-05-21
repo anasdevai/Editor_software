@@ -16,6 +16,7 @@ import asyncio
 import uuid
 import logging
 from typing import Any
+from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import ValidationError
@@ -64,6 +65,8 @@ from .models import (
     DecisionSopLink,
     SOPDetectedParameters,
     ClientProfile,
+    ProfileVersion,
+    AISuggestion,
 )
 from .services.chat_query_persistence import persist_chat_query_exchange
 from .services.nlp.prompt_injector import get_style_prompt_injection
@@ -1680,22 +1683,10 @@ def _build_gap_check_retrieval_query(request: ActionRequest) -> str:
 
 
 def _rewrite_should_use_industry_scaffold(request: ActionRequest) -> bool:
-    from chatbot.actions.prompts import resolve_edit_scope
-
-    if resolve_edit_scope(request) != "full_document":
-        return False
-    # Actions tab / API clients that set edit_scope explicitly expect the canonical
-    # build_rewrite_prompt FULL_DOCUMENT path (preserves TEXT order from title onward).
-    explicit = getattr(request, "edit_scope", None)
-    if explicit == "full_document":
-        return False
-    text = request.section_text or ""
-    section_type = (request.section_type or "").strip().lower()
-    if section_type == "full document" and len(text) >= 1800:
-        return True
-    record_ids = re.findall(r"\b(?:DEV|CAPA|AUD|DEC)-[A-Z]+-\d+\b", text)
-    section_headers = re.findall(r"(?m)^\s*(?:#{1,6}\s*)?(?:\d+[.)]\s+|##\s*\*\*)", text)
-    return len(text) >= 2500 and (len(record_ids) >= 3 or len(section_headers) >= 4)
+    # Rewrite should preserve the current SOP structure by default.
+    # Automatic scaffold mode can reshape the document, so keep it disabled
+    # unless a future explicit "restructure" flow is added.
+    return False
 
 
 def _first_nonempty_line(text: str) -> str:
@@ -1944,9 +1935,477 @@ def _get_nlp_and_profile_context(sop_ctx: dict) -> tuple[dict | None, dict | Non
     return detected_nlp, profile_json, profile_md
 
 
+def _serialize_detected_parameters_row(row: SOPDetectedParameters | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {
+        "document_information": row.document_information,
+        "writing_style": row.writing_style,
+        "roles_raci": row.roles_raci,
+        "workflows": row.workflows,
+        "compliance_elements": row.compliance_elements,
+        "risks_gaps": row.risks_gaps,
+        "terminology": row.terminology,
+        "structure_patterns": row.structure_patterns,
+        "style_suggestions": row.style_suggestions,
+        "readiness_check": row.readiness_check,
+    }
+
+
+def _normalize_style_reference(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    raw = re.sub(r"\.pdf\b", "", raw)
+    raw = re.sub(r"\b(company|profile|style|tone)\b", " ", raw)
+    raw = re.sub(r"[^a-z0-9]+", "_", raw)
+    raw = re.sub(r"_+", "_", raw).strip("_")
+    return raw
+
+
+def _normalize_language_code(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    normalized = re.sub(r"[^a-z/-]+", " ", raw).strip()
+    if normalized in {"de", "de de", "german", "deutsch"}:
+        return "de"
+    if normalized in {"en", "en us", "en gb", "english"}:
+        return "en"
+    if normalized.startswith(("german", "deutsch", "de ")):
+        return "de"
+    if normalized.startswith(("english", "en ")):
+        return "en"
+    return ""
+
+
+def _extract_explicit_style_reference(instruction: str | None) -> str | None:
+    text = str(instruction or "").strip()
+    if not text:
+        return None
+    patterns = [
+        r'\b(?:in|on|using|use)\s+"([^"]+)"\s+style\b',
+        r"\b(?:in|on|using|use)\s+'([^']+)'\s+style\b",
+        r"\b(?:in|on|using|use)\s+([a-z0-9._/-]+)\s+style\b",
+        r"\bstyle\s+of\s+([a-z0-9._/-]+)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+    return None
+
+
+def _style_ref_matches(normalized_ref: str, candidate_tokens: set[str]) -> bool:
+    for token in candidate_tokens:
+        if not token:
+            continue
+        if normalized_ref == token:
+            return True
+        if normalized_ref in token or token in normalized_ref:
+            return True
+    return False
+
+
+def _resolve_explicit_style_override(instruction: str | None) -> dict[str, Any] | None:
+    ref = _extract_explicit_style_reference(instruction)
+    normalized_ref = _normalize_style_reference(ref or "")
+    if not normalized_ref:
+        return None
+
+    db = SessionLocal()
+    try:
+        # 1) Exact-ish profile match by display names.
+        for profile in db.query(ClientProfile).all():
+            candidates = [
+                profile.name,
+                profile.company_name,
+                (profile.active_profile_json or {}).get("profile_name") if isinstance(profile.active_profile_json, dict) else None,
+                (profile.active_profile_json or {}).get("name") if isinstance(profile.active_profile_json, dict) else None,
+            ]
+            candidate_tokens = {_normalize_style_reference(item or "") for item in candidates if item}
+            profile_md_token = _normalize_style_reference((profile.active_profile_md or "")[:4000])
+            if _style_ref_matches(normalized_ref, candidate_tokens) or (
+                profile_md_token and normalized_ref in profile_md_token
+            ):
+                current_version = (
+                    db.query(ProfileVersion).filter(ProfileVersion.id == profile.current_version_id).first()
+                    if profile.current_version_id
+                    else None
+                )
+                return {
+                    "matched_type": "profile",
+                    "style_reference": ref,
+                    "resolved_name": profile.name,
+                    "profile_id": str(profile.id),
+                    "profile_json": profile.active_profile_json,
+                    "profile_md": profile.active_profile_md,
+                    "profile_version": current_version.version_number if current_version else None,
+                    "detected_nlp": None,
+                    "style_source_text": profile.active_profile_md or "",
+                }
+
+        # 2) SOP/source-file match for explicit source SOP style.
+        detected_rows = (
+            db.query(SOPDetectedParameters)
+            .order_by(SOPDetectedParameters.created_at.desc())
+            .all()
+        )
+        for row in detected_rows:
+            sop = db.query(SOP).filter(SOP.id == row.sop_id).first() if row.sop_id else None
+            candidates = [
+                row.source_filename,
+                row.client_name,
+                sop.sop_number if sop else None,
+                sop.title if sop else None,
+            ]
+            candidate_tokens = {_normalize_style_reference(item or "") for item in candidates if item}
+            if _style_ref_matches(normalized_ref, candidate_tokens):
+                profile = (
+                    db.query(ClientProfile).filter(ClientProfile.id == row.client_profile_id).first()
+                    if row.client_profile_id
+                    else None
+                )
+                current_version = (
+                    db.query(ProfileVersion).filter(ProfileVersion.id == profile.current_version_id).first()
+                    if profile and profile.current_version_id
+                    else None
+                )
+                source_version = db.query(SOPVersion).filter(SOPVersion.id == row.sop_version_id).first() if row.sop_version_id else None
+                source_text = ""
+                if source_version and source_version.content_json:
+                    source_text = _extract_text_from_tiptap(source_version.content_json)
+                return {
+                    "matched_type": "source_sop",
+                    "style_reference": ref,
+                    "resolved_name": sop.sop_number if sop else row.source_filename or ref,
+                    "profile_id": str(profile.id) if profile else None,
+                    "profile_json": profile.active_profile_json if profile else None,
+                    "profile_md": profile.active_profile_md if profile else None,
+                    "profile_version": current_version.version_number if current_version else None,
+                    "detected_nlp": _serialize_detected_parameters_row(row),
+                    "style_source_text": source_text or row.source_filename or "",
+                    "source_sop_id": str(sop.id) if sop else None,
+                    "source_sop_number": sop.sop_number if sop else None,
+                }
+
+        for sop in db.query(SOP).all():
+            candidates = [sop.sop_number, sop.title]
+            candidate_tokens = {_normalize_style_reference(item or "") for item in candidates if item}
+            if not _style_ref_matches(normalized_ref, candidate_tokens):
+                continue
+            row = (
+                db.query(SOPDetectedParameters)
+                .filter(SOPDetectedParameters.sop_id == sop.id)
+                .order_by(SOPDetectedParameters.created_at.desc())
+                .first()
+            )
+            profile = (
+                db.query(ClientProfile).filter(ClientProfile.id == row.client_profile_id).first()
+                if row and row.client_profile_id
+                else None
+            )
+            current_version = (
+                db.query(ProfileVersion).filter(ProfileVersion.id == profile.current_version_id).first()
+                if profile and profile.current_version_id
+                else None
+            )
+            source_version = db.query(SOPVersion).filter(SOPVersion.id == sop.current_version_id).first() if sop.current_version_id else None
+            source_text = _extract_text_from_tiptap(source_version.content_json) if source_version and source_version.content_json else ""
+            return {
+                "matched_type": "source_sop",
+                "style_reference": ref,
+                "resolved_name": sop.sop_number or sop.title or ref,
+                "profile_id": str(profile.id) if profile else None,
+                "profile_json": profile.active_profile_json if profile else None,
+                "profile_md": profile.active_profile_md if profile else None,
+                "profile_version": current_version.version_number if current_version else None,
+                "detected_nlp": _serialize_detected_parameters_row(row) if row else None,
+                "style_source_text": source_text or sop.title or "",
+                "source_sop_id": str(sop.id),
+                "source_sop_number": sop.sop_number,
+            }
+    except Exception as exc:
+        logger.warning("[ai-style-override] failed to resolve style reference '%s': %s", ref, exc)
+    finally:
+        db.close()
+    return None
+
+
+GERMAN_PROFILE_NAME = "German_Pharma_SOP_Profile"
+GERMAN_MODAL_PATTERN = re.compile(r"\b(muss|müssen|sollte|sollten|darf\s+nicht|dürfen\s+nicht)\b", re.IGNORECASE)
+
+
+def _is_german_pharma_profile(profile_json: dict | None, profile_md: str | None, style_profile: dict | None) -> bool:
+    haystack = " ".join(
+        str(part or "")
+        for part in [
+            (profile_json or {}).get("profile_name") if isinstance(profile_json, dict) else "",
+            (profile_json or {}).get("name") if isinstance(profile_json, dict) else "",
+            (profile_json or {}).get("language") if isinstance(profile_json, dict) else "",
+            (profile_json or {}).get("domain") if isinstance(profile_json, dict) else "",
+            profile_md[:1200] if profile_md else "",
+            (style_profile or {}).get("language") if isinstance(style_profile, dict) else "",
+        ]
+    ).lower()
+    return (
+        GERMAN_PROFILE_NAME.lower() in haystack
+        or ("german" in haystack and ("pharma" in haystack or "gxp" in haystack or "sop" in haystack))
+        or ("de" in haystack and "gxp" in haystack)
+    )
+
+
+def _has_german_modal_language(text: str) -> bool:
+    return bool(GERMAN_MODAL_PATTERN.search(text or ""))
+
+
+def _german_profile_quality_retry_prompt(request: ActionRequest, draft: str, action: str) -> str:
+    verb = "rewrite" if action == "rewrite" else "improve"
+    field_name = "rewritten_text" if action == "rewrite" else "improved_text"
+    return f"""Return strict JSON only with key "{field_name}".
+
+Revise the DRAFT so it is still a {verb} of the selected SOP section, but make the German pharmaceutical SOP profile visible.
+
+Hard requirements:
+- Keep the same operational meaning and identifiers.
+- Use formal controlled SOP language in German.
+- Include appropriate German modal/control wording such as "muss", "sollte", or "darf nicht" where it fits the existing facts.
+- Keep the output scoped to the selected text only.
+- Do not invent regulation numbers, CAPA IDs, deviation IDs, or approvals.
+
+SELECTED TEXT:
+{request.section_text}
+
+DRAFT:
+{draft}
+"""
+
+
+def _apply_german_profile_quality_guard(
+    runtime: Any,
+    *,
+    action: str,
+    request: ActionRequest,
+    text: str,
+    profile_json: dict | None,
+    profile_md: str | None,
+    style_profile: dict | None,
+    ch_budget: int,
+) -> tuple[str, dict[str, Any]]:
+    meta = {
+        "german_profile_quality_guard": False,
+        "modal_language_present": _has_german_modal_language(text),
+        "quality_retry_used": False,
+        "deterministic_modal_sentence_added": False,
+    }
+    if not _is_german_pharma_profile(profile_json, profile_md, style_profile):
+        return text, meta
+    meta["german_profile_quality_guard"] = True
+    if meta["modal_language_present"]:
+        return text, meta
+
+    schema = RewriteResponse if action == "rewrite" else ImproveResponse
+    prompt = _german_profile_quality_retry_prompt(request, text, action)
+    try:
+        parsed = parse_with_retry(
+            raw=_call_action_llm(runtime, prompt, input_char_budget=ch_budget, action=f"{action}_quality_retry"),
+            schema=schema,
+            prompt=prompt,
+            call_llm=lambda rp: _call_action_llm(
+                runtime, rp, input_char_budget=ch_budget, action=f"{action}_quality_retry"
+            ),
+            audit_log=[],
+        )
+        retried = (getattr(parsed, "rewritten_text", None) or getattr(parsed, "improved_text", None) or "").strip()
+        if retried:
+            text = retried
+            meta["quality_retry_used"] = True
+            meta["modal_language_present"] = _has_german_modal_language(text)
+    except Exception as exc:
+        logger.warning("[german-profile-quality] retry failed action=%s err=%s", action, exc)
+
+    if not meta["modal_language_present"]:
+        text = (
+            text.rstrip()
+            + "\n\nKontrollanforderung: Die beschriebenen Maßnahmen müssen dokumentiert, nachvollziehbar geprüft und bei Abweichungen durch die verantwortliche Stelle bewertet werden."
+        )
+        meta["deterministic_modal_sentence_added"] = True
+        meta["modal_language_present"] = True
+    return text.strip(), meta
+
+
+def _shorten_previous_suggestion_if_requested(payload: AIActionRequest, text: str) -> str | None:
+    marker = f"{getattr(payload, 'triggered_by', '')} {getattr(payload, 'section_name', '')}".lower()
+    if "followup" not in marker and "phase9" not in marker and "previous rewrite suggestion" not in marker:
+        return None
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", text or "") if p.strip()]
+    if not paragraphs:
+        return None
+    first_lines = []
+    for para in paragraphs[:4]:
+        sentences = re.split(r"(?<=[.!?])\s+", para)
+        first_lines.append(sentences[0].strip())
+    compact = "\n\n".join(line for line in first_lines if line)
+    if compact and len(compact) < len(text):
+        if not _has_german_modal_language(compact):
+            compact += "\n\nDie Maßnahmen müssen dokumentiert und regelmäßig geprüft werden."
+        return compact
+    return None
+
+
+def _extract_leading_section_heading(text: str) -> str | None:
+    src = (text or "").strip()
+    if not src:
+        return None
+    first_line = src.splitlines()[0].strip()
+    if re.match(r"^\d+\.\s*\S+", first_line):
+        return first_line
+    if re.match(r"^[A-ZÄÖÜa-zäöü][A-ZÄÖÜa-zäöü0-9 _/-]{1,80}$", first_line) and len(first_line.split()) <= 8:
+        return first_line
+    return None
+
+
+def _preserve_selected_section_heading(source_text: str, rewritten_text: str) -> str:
+    heading = _extract_leading_section_heading(source_text)
+    out = (rewritten_text or "").strip()
+    if not heading or not out:
+        return rewritten_text
+    if re.search(re.escape(heading), out, re.IGNORECASE):
+        return rewritten_text
+
+    source_has_label = bool(re.search(r"\bZweck\b|\bGeltungsbereich\b|\bVerantwortlichkeiten\b", heading, re.IGNORECASE))
+    if source_has_label:
+        lines = out.splitlines()
+        if lines and re.match(r"^\d+\.\s*$", lines[0].strip()):
+            lines[0] = heading
+            return "\n".join(lines).strip()
+        return f"{heading}\n\n{out}".strip()
+    return rewritten_text
+
+
+def _restore_section_name_heading(request: ActionRequest, rewritten_text: str) -> str:
+    out = (rewritten_text or "").strip()
+    section_name = (request.section_title or "").strip()
+    if not out or not section_name or section_name.lower() in {"selected text", "section", "previous rewrite suggestion"}:
+        return rewritten_text
+    if re.search(re.escape(section_name), out, re.IGNORECASE):
+        return rewritten_text
+
+    source = (request.section_text or "").strip()
+    prefix_match = re.match(r"^(\d+)\.\s*", source)
+    numbered_heading = f"{prefix_match.group(1)}. {section_name}" if prefix_match else section_name
+    lines = out.splitlines()
+    if lines and re.match(r"^\d+\.\s*$", lines[0].strip()):
+        lines[0] = numbered_heading
+        return "\n".join(lines).strip()
+    if lines and not re.match(r"^\d+\.\s+\S+", lines[0].strip()):
+        return f"{numbered_heading}\n\n{out}".strip()
+    return rewritten_text
+
+
+def _normalize_structure_token(value: str) -> str:
+    token = re.sub(r"\s+", " ", str(value or "").strip().lower())
+    token = re.sub(r"^[#*\-\d\.\)\s]+", "", token)
+    return token
+
+
+def _extract_structure_tokens(text: str) -> list[str]:
+    tokens: list[str] = []
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if re.match(r"^\d+(?:\.\d+)*[.)]?\s+\S+", line):
+            tokens.append(_normalize_structure_token(line))
+            continue
+        if re.match(r"^(?:[-*•]|\d+[.)])\s+\S+", line):
+            tokens.append(_normalize_structure_token(line))
+            continue
+        if re.match(r"^[A-ZÄÖÜa-zäöü][A-ZÄÖÜa-zäöü0-9 /_-]{1,90}$", line) and len(line.split()) <= 8:
+            tokens.append(_normalize_structure_token(line))
+    return tokens[:40]
+
+
+def _has_rewrite_structure_drift(original: str, rewritten: str) -> bool:
+    source_tokens = _extract_structure_tokens(original)
+    output_tokens = _extract_structure_tokens(rewritten)
+    if not source_tokens or not output_tokens:
+        return False
+    if source_tokens[0] != output_tokens[0]:
+        return True
+    if len(source_tokens) <= 8:
+        return source_tokens != output_tokens[: len(source_tokens)]
+    return source_tokens[:8] != output_tokens[:8]
+
+
+def _enforce_rewrite_structure_lock(
+    runtime: Any,
+    *,
+    request: ActionRequest,
+    text: str,
+    context: str,
+    nlp_block: str,
+    profile_md: str,
+    profile_json: dict | None,
+    detected_nlp: dict | None,
+    style_profile: dict | None,
+    ch_budget: int,
+) -> tuple[str, dict[str, Any]]:
+    original = request.section_text or ""
+    rewritten = (text or "").strip()
+    meta = {"structure_lock_applied": False, "structure_drift_detected": False}
+    if not original or not rewritten:
+        return rewritten, meta
+    if not _has_rewrite_structure_drift(original, rewritten):
+        return rewritten, meta
+
+    meta["structure_drift_detected"] = True
+    logger.warning(
+        "[ai-action-structure-violation] action=rewrite section=%s in_chars=%s out_chars=%s - retrying strict structure lock",
+        request.section_title,
+        len(original),
+        len(rewritten),
+    )
+    retry_prompt = build_rewrite_prompt(
+        request,
+        context,
+        nlp_block,
+        profile_md=profile_md or "",
+        profile_json=profile_json,
+        detected_nlp=detected_nlp,
+        style_profile=style_profile,
+    ) + (
+        "\n\nCRITICAL RETRY:\n"
+        "- Your previous rewrite changed the SOP structure.\n"
+        "- Preserve the exact same heading order, section order, list order, and block structure as TEXT.\n"
+        "- Rewrite only the wording inside the existing structure.\n"
+        "- If any heading or structural token from TEXT is missing or renamed, restore it exactly.\n"
+    )
+    try:
+        retry_parsed = parse_with_retry(
+            raw=_call_action_llm(runtime, retry_prompt, input_char_budget=ch_budget, action="rewrite_structure_retry"),
+            schema=RewriteResponse,
+            prompt=retry_prompt,
+            call_llm=lambda rp: _call_action_llm(
+                runtime, rp, input_char_budget=ch_budget, action="rewrite_structure_retry"
+            ),
+            audit_log=[],
+        )
+        retry_text = (retry_parsed.rewritten_text or "").strip()
+        retry_text = _preserve_selected_section_heading(original, retry_text)
+        retry_text = _restore_section_name_heading(request, retry_text)
+        if retry_text and not _has_rewrite_structure_drift(original, retry_text):
+            meta["structure_lock_applied"] = True
+            return retry_text, meta
+    except Exception as exc:
+        logger.warning("[ai-action-structure-retry-failed] action=rewrite err=%s", exc)
+    return rewritten, meta
+
+
 def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionResponse:
     request = _build_action_request(payload)
     sop_ctx = _load_uploaded_sop_context(request)
+    explicit_style_override = _resolve_explicit_style_override(getattr(payload, "instruction", None))
     if action == "rewrite" and _rewrite_should_use_industry_scaffold(request):
         style_profile = _resolve_style_profile(sop_ctx, request.section_text)
         scaffold = _build_industry_rewrite_text(request)
@@ -1989,7 +2448,26 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
     ch_budget = len(request.section_text or "")
     sop_text = str(sop_ctx.get("text") or "")
     style_source_text = sop_text if sop_text else request.section_text
-    style_profile = _resolve_style_profile(sop_ctx, style_source_text)
+    detected_nlp, profile_json, profile_md = _get_nlp_and_profile_context(sop_ctx)
+    if explicit_style_override:
+        detected_nlp = explicit_style_override.get("detected_nlp") or detected_nlp
+        profile_json = explicit_style_override.get("profile_json") or profile_json
+        profile_md = explicit_style_override.get("profile_md") or profile_md
+        override_source_text = str(explicit_style_override.get("style_source_text") or "").strip()
+        if override_source_text:
+            style_source_text = override_source_text
+    style_profile = (
+        _derive_sop_style_profile(style_source_text)
+        if explicit_style_override
+        else _resolve_style_profile(sop_ctx, style_source_text)
+    )
+    if isinstance(profile_json, dict):
+        preferred_style = profile_json.get("preferred_style") if isinstance(profile_json.get("preferred_style"), dict) else {}
+        profile_lang = _normalize_language_code(profile_json.get("language"))
+        if profile_lang:
+            style_profile["language"] = profile_lang
+        if preferred_style.get("tone"):
+            style_profile["tone"] = preferred_style.get("tone")
     style_block = _style_profile_prompt_block(style_profile)
     sop_context_block = ""
     if sop_ctx.get("detected"):
@@ -2016,6 +2494,34 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
         style_profile.get("avg_sentence_words"),
         style_profile.get("imperative_ratio"),
     )
+    if explicit_style_override:
+        logger.info(
+            "[action-style-override] action=%s style_reference=%s matched_type=%s resolved_name=%s profile_version=%s",
+            action,
+            explicit_style_override.get("style_reference"),
+            explicit_style_override.get("matched_type"),
+            explicit_style_override.get("resolved_name"),
+            explicit_style_override.get("profile_version"),
+        )
+    style_context_meta = {
+        "used_instruction": str(getattr(payload, "instruction", "") or "").strip() or None,
+        "used_profile": (profile_json or {}).get("profile_name")
+        if isinstance(profile_json, dict)
+        else None,
+        "used_profile_id": explicit_style_override.get("profile_id")
+        if explicit_style_override
+        else None,
+        "used_profile_version": explicit_style_override.get("profile_version")
+        if explicit_style_override
+        else None,
+        "used_style_reference": explicit_style_override.get("style_reference")
+        if explicit_style_override
+        else None,
+        "used_style_source": explicit_style_override.get("resolved_name")
+        if explicit_style_override
+        else None,
+        "used_target_sop_version": sop_ctx.get("version_number"),
+    }
 
     bypass = _try_client_structured_ai_response(payload, action, request, style_profile)
     if bypass is not None:
@@ -2050,8 +2556,6 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
         len(nlp_block or ""),
     )
 
-    detected_nlp, profile_json, profile_md = _get_nlp_and_profile_context(sop_ctx)
-
     if action == "improve":
         prompt = build_improve_prompt(
             request,
@@ -2060,6 +2564,7 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
             profile_md=profile_md or "",
             profile_json=profile_json,
             detected_nlp=detected_nlp,
+            style_profile=style_profile,
         )
         parsed = parse_with_retry(
             raw=_call_action_llm(runtime, prompt, input_char_budget=ch_budget, action=action),
@@ -2079,6 +2584,16 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
             nlp_block=nlp_block,
             ch_budget=ch_budget,
         )
+        improved_text, quality_meta = _apply_german_profile_quality_guard(
+            runtime,
+            action="improve",
+            request=request,
+            text=improved_text,
+            profile_json=profile_json,
+            profile_md=profile_md,
+            style_profile=style_profile,
+            ch_budget=ch_budget,
+        )
         logger.info(
             "[ai-action-result] action=improve ok=1 provider=%s model=%s suggested_chars=%s",
             cfg.provider,
@@ -2096,11 +2611,21 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
                 "style_profile": style_profile,
                 "nlp_action_summary": nlp_summary,
                 "edit_scope": resolve_edit_scope(request),
+                "quality_guard": quality_meta,
+                **style_context_meta,
             },
         )
 
     if action == "summarize":
-        prompt = build_summarize_prompt(request, context, nlp_block)
+        prompt = build_summarize_prompt(
+            request,
+            context,
+            nlp_block,
+            profile_md=profile_md or "",
+            profile_json=profile_json,
+            detected_nlp=detected_nlp,
+            style_profile=style_profile,
+        )
         parsed = parse_with_retry(
             raw=_call_action_llm(runtime, prompt, input_char_budget=ch_budget, action=action),
             schema=ImproveResponse,
@@ -2126,11 +2651,20 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
                 "improved_version": parsed.improved_text,
                 "style_profile": style_profile,
                 "nlp_action_summary": nlp_summary,
+                **style_context_meta,
             },
         )
 
     if action == "analyze":
-        prompt = build_analyze_prompt(request, context, nlp_block)
+        prompt = build_analyze_prompt(
+            request,
+            context,
+            nlp_block,
+            profile_md=profile_md or "",
+            profile_json=profile_json,
+            detected_nlp=detected_nlp,
+            style_profile=style_profile,
+        )
         parsed = parse_with_retry(
             raw=_call_action_llm(runtime, prompt, input_char_budget=ch_budget, action=action),
             schema=ImproveResponse,
@@ -2156,6 +2690,7 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
                 "improved_version": parsed.improved_text,
                 "style_profile": style_profile,
                 "nlp_action_summary": nlp_summary,
+                **style_context_meta,
             },
         )
 
@@ -2176,6 +2711,7 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
                     "style_profile": style_profile,
                     "nlp_action_summary": nlp_summary,
                     "rewrite_mode": "industry_scaffold",
+                    **style_context_meta,
                 },
             )
         prompt = build_rewrite_prompt(
@@ -2185,6 +2721,7 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
             profile_md=profile_md or "",
             profile_json=profile_json,
             detected_nlp=detected_nlp,
+            style_profile=style_profile,
         )
         parsed = parse_with_retry(
             raw=_call_action_llm(runtime, prompt, input_char_budget=ch_budget, action=action),
@@ -2204,6 +2741,33 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
             nlp_block=nlp_block,
             ch_budget=ch_budget,
         )
+        followup_short = _shorten_previous_suggestion_if_requested(payload, rewritten_text)
+        if followup_short:
+            rewritten_text = followup_short
+        rewritten_text, quality_meta = _apply_german_profile_quality_guard(
+            runtime,
+            action="rewrite",
+            request=request,
+            text=rewritten_text,
+            profile_json=profile_json,
+            profile_md=profile_md,
+            style_profile=style_profile,
+            ch_budget=ch_budget,
+        )
+        rewritten_text = _preserve_selected_section_heading(request.section_text, rewritten_text)
+        rewritten_text = _restore_section_name_heading(request, rewritten_text)
+        rewritten_text, structure_meta = _enforce_rewrite_structure_lock(
+            runtime,
+            request=request,
+            text=rewritten_text,
+            context=context,
+            nlp_block=nlp_block,
+            profile_md=profile_md or "",
+            profile_json=profile_json,
+            detected_nlp=detected_nlp,
+            style_profile=style_profile,
+            ch_budget=ch_budget,
+        )
         logger.info(
             "[ai-action-result] action=rewrite ok=1 provider=%s model=%s suggested_chars=%s edit_scope=%s",
             cfg.provider,
@@ -2221,6 +2785,10 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
                 "style_profile": style_profile,
                 "nlp_action_summary": nlp_summary,
                 "edit_scope": resolve_edit_scope(request),
+                "quality_guard": quality_meta,
+                "structure_guard": structure_meta,
+                "follow_up_shortening_applied": bool(followup_short),
+                **style_context_meta,
             },
         )
 
@@ -2232,6 +2800,7 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
             profile_md=profile_md or "",
             profile_json=profile_json,
             detected_nlp=detected_nlp,
+            style_profile=style_profile,
         )
         parsed = parse_with_retry(
             raw=_call_action_llm(runtime, prompt, input_char_budget=ch_budget, action=action),
@@ -2257,6 +2826,7 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
                 "analysis": parsed.analysis,
                 "style_profile": style_profile,
                 "nlp_action_summary": nlp_summary,
+                **style_context_meta,
             },
         )
 
@@ -2299,6 +2869,7 @@ def _fallback_gap_check(payload: AIActionRequest) -> AIActionResponse:
         profile_md=profile_md or "",
         profile_json=profile_json,
         detected_nlp=detected_nlp,
+        style_profile=style_profile,
     )
     raw = _call_action_llm(runtime, prompt, input_char_budget=ch_budget, action="gap_check")
     parsed = parse_with_retry(
@@ -2357,6 +2928,7 @@ def _fallback_rewrite(payload: AIActionRequest) -> AIActionResponse:
         profile_md=profile_md or "",
         profile_json=profile_json,
         detected_nlp=detected_nlp,
+        style_profile=style_profile,
     )
     raw = _call_action_llm(runtime, prompt, input_char_budget=ch_budget, action="rewrite")
     parsed = parse_with_retry(
@@ -2366,15 +2938,30 @@ def _fallback_rewrite(payload: AIActionRequest) -> AIActionResponse:
         call_llm=lambda rp: _call_action_llm(runtime, rp, input_char_budget=ch_budget, action="rewrite"),
         audit_log=[],
     )
+    rewritten_text = _preserve_selected_section_heading(request.section_text, parsed.rewritten_text)
+    rewritten_text = _restore_section_name_heading(request, rewritten_text)
+    rewritten_text, structure_meta = _enforce_rewrite_structure_lock(
+        runtime,
+        request=request,
+        text=rewritten_text,
+        context=f"{IMPROVE_REWRITE_NO_RAG_CONTEXT}\n{style_block}\n{sop_context_block}".strip(),
+        nlp_block=nlp_block,
+        profile_md=profile_md or "",
+        profile_json=profile_json,
+        detected_nlp=detected_nlp,
+        style_profile=style_profile,
+        ch_budget=ch_budget,
+    )
     return AIActionResponse(
         action="rewrite",
         original_text=_clean_text(payload.text),
-        suggested_text=_render_dynamic_text(parsed.rewritten_text),
+        suggested_text=_render_dynamic_text(rewritten_text),
         explanation="Text neu formuliert / Text rewritten.",
         structured_data={
-            "rewritten_text": parsed.rewritten_text,
+            "rewritten_text": rewritten_text,
             "style_profile": style_profile,
             "nlp_action_summary": nlp_summary,
+            "structure_guard": structure_meta,
         },
     )
 
@@ -2415,6 +3002,7 @@ def _fallback_improve(payload: AIActionRequest) -> AIActionResponse:
         profile_md=profile_md or "",
         profile_json=profile_json,
         detected_nlp=detected_nlp,
+        style_profile=style_profile,
     )
     raw = _call_action_llm(runtime, prompt, input_char_budget=ch_budget, action="improve")
     parsed = parse_with_retry(
@@ -2642,6 +3230,8 @@ def _query_intents(question: str) -> set[str]:
         intents.add("sop_list")
     if re.search(r"\b(summarize|summary|brief|gist)\b", q):
         intents.add("summary")
+    if re.search(r"\b(compliance|compliant|regulatory|gmp|qa|qms|control|audit readiness|audit-ready)\b", q):
+        intents.add("compliance")
     if re.search(r"\b(compare|difference|vs|versus)\b", q):
         intents.add("compare")
     if re.search(r"\b(linked|related)\b.*\b(capa|capas|audit|audits|decision|decisions|deviation|deviations)\b", q):
@@ -2653,20 +3243,75 @@ def _query_intents(question: str) -> set[str]:
     return intents
 
 
+def _deterministic_sop_count_response(question: str, active_scope: dict | None = None) -> dict[str, Any]:
+    db = SessionLocal()
+    try:
+        total = db.query(SOP).filter(SOP.is_active == True).count()  # noqa: E712
+    finally:
+        db.close()
+    active_ref = str((active_scope or {}).get("active_sop_ref") or "").strip()
+    active_title = str((active_scope or {}).get("title") or "").strip()
+    answer = f"There are {total} SOP(s) in the database (active records)."
+    if active_ref:
+        answer += f" The currently active SOP is {active_ref}"
+        if active_title:
+            answer += f" ({active_title})"
+        answer += "."
+    citations = [
+        {
+            "ref": "SOP database",
+            "title": "Active SOP records (PostgreSQL)",
+            "type": "metadata",
+            "excerpt": f"{total} active SOP(s) in the database.",
+            "score": 1.0,
+        }
+    ]
+    return {
+        "answer": answer,
+        "sources": [{"id": "SOP database", "type": "metadata", "label": "Active SOP records (PostgreSQL)"}],
+        "citations": citations,
+        "retrieval_debug": [],
+        "suggestions": [
+            "List all SOPs with titles",
+            "What does the active SOP cover?",
+            "Which deviations link to this SOP?",
+        ],
+        "retrieval_stats": {
+            "total_docs": 0,
+            "source": "deterministic_system_query",
+            "strict_mode": "sop_inventory_count",
+        },
+        "routed_to": "system_query_sop_count",
+        "assistant_action": None,
+    }
+
+
 def _summarize_live_context(assistant_context: dict | None, question: str = "") -> str:
     ctx = assistant_context or {}
     current = ctx.get("current_sop") if isinstance(ctx.get("current_sop"), dict) else {}
     linked = ctx.get("linked_context") if isinstance(ctx.get("linked_context"), dict) else {}
+    selected = ctx.get("selected_section") if isinstance(ctx.get("selected_section"), dict) else {}
+    last_action = ctx.get("last_action") if isinstance(ctx.get("last_action"), dict) else {}
     tabs = _ctx_list(ctx.get("opened_tabs"))
     text = str(ctx.get("editor_excerpt") or "").strip()
+    selected_text = str(ctx.get("selected_text") or "").strip()
     references = _ctx_list(current.get("references"))
     intents = _query_intents(question)
     scope = _extract_active_sop_scope(assistant_context)
     active_sop_ref = str(scope.get("active_sop_ref") or current.get("sop_number") or current.get("id") or "").strip()
     active_sop_id = str(scope.get("active_sop_id") or "").strip()
     open_sop_tabs = _extract_refs(tabs, ["docId", "label"], limit=10)
-    include_editor_excerpt = bool(text) and bool({"summary", "active_sop", "compare"} & intents)
+    include_editor_excerpt = bool(text) and bool({"summary", "active_sop", "compare", "compliance"} & intents)
     excerpt = text[:1200] if include_editor_excerpt else ""
+    selected_excerpt = selected_text[:1200] if selected_text and ({"summary", "compliance"} & intents or last_action) else ""
+    last_action_line = ""
+    if last_action:
+        last_action_line = (
+            f"- Last assistant action: action={last_action.get('action') or 'unknown'} | "
+            f"scope={last_action.get('target_scope') or 'unknown'} | "
+            f"section={last_action.get('section_name') or 'unknown'} | "
+            f"status={last_action.get('status') or 'unknown'}\n"
+        )
     focus_note = ""
     if "summary" in intents and active_sop_ref:
         focus_note = f"- Focus SOP for summary: {active_sop_ref}\n"
@@ -2687,7 +3332,17 @@ def _summarize_live_context(assistant_context: dict | None, question: str = "") 
             f"decisions={len(scope.get('linked_decision_ids') or [])}\n"
         )
         if not {"summary", "linked", "compare"} & intents:
-            return minimal + f"{focus_note}- Answer only what was asked; avoid unsolicited summaries."
+            return (
+                minimal
+                + last_action_line
+                + (
+                    f"- Selected section: {selected.get('name') or 'none'} | scope={selected.get('scope') or 'none'}\n"
+                    if selected or selected_excerpt
+                    else ""
+                )
+                + (f"- Selected text excerpt: {selected_excerpt}\n" if selected_excerpt else "")
+                + f"{focus_note}- Answer only what was asked; avoid unsolicited summaries."
+            )
 
         linked_devs = _extract_refs(_ctx_list(linked.get("deviations")), ["deviation_number", "ref_number", "id"])
         linked_capas = _extract_refs(_ctx_list(linked.get("capas")), ["capa_number", "ref_number", "id"])
@@ -2700,6 +3355,7 @@ def _summarize_live_context(assistant_context: dict | None, question: str = "") 
         related_sops = _extract_refs(_ctx_list(linked.get("related_sops")), ["sop_number", "ref_number", "id"])
         return (
             minimal
+            + last_action_line
             + f"- Linked deviations: {len(scope.get('linked_deviation_ids') or [])} ({', '.join(linked_devs) or 'none'})\n"
             + f"- Linked CAPAs: {len(scope.get('linked_capa_ids') or [])} ({', '.join(linked_capas) or 'none'})\n"
             + f"- Linked audits: {len(scope.get('linked_audit_ids') or [])} ({', '.join(linked_audits) or 'none'})\n"
@@ -2708,6 +3364,12 @@ def _summarize_live_context(assistant_context: dict | None, question: str = "") 
             + f"- Open tabs: {len(tabs)}\n"
             + f"{focus_note}"
             + f"- References in editor metadata: {', '.join(str(r) for r in references[:10]) or 'none'}\n"
+            + (
+                f"- Selected section: {selected.get('name') or 'none'} | scope={selected.get('scope') or 'none'}\n"
+                if selected or selected_excerpt
+                else ""
+            )
+            + (f"- Selected text excerpt: {selected_excerpt}\n" if selected_excerpt else "")
             + f"- Editor text excerpt: {excerpt if excerpt else 'not injected for this query intent'}"
         )
 
@@ -2722,18 +3384,25 @@ def _summarize_live_context(assistant_context: dict | None, question: str = "") 
     related_sops = _extract_refs(_ctx_list(linked.get("related_sops")), ["sop_number", "ref_number", "id"])
     return (
         "LIVE_ASSISTANT_CONTEXT\n"
-        f"- Active SOP: {current.get('sop_number') or current.get('id') or 'unknown'} | "
-        f"title={current.get('title') or 'unknown'} | version={current.get('version') or 'unknown'} | "
-        f"status={current.get('status') or 'unknown'}\n"
-        f"- Linked deviations: {len(_ctx_list(linked.get('deviations')))} ({', '.join(linked_devs) or 'none'})\n"
-        f"- Linked CAPAs: {len(_ctx_list(linked.get('capas')))} ({', '.join(linked_capas) or 'none'})\n"
-        f"- Linked audits: {len(_ctx_list(linked.get('audits')))} ({', '.join(linked_audits) or 'none'})\n"
-        f"- Linked decisions: {len(_ctx_list(linked.get('decisions')))} ({', '.join(linked_decisions) or 'none'})\n"
-        f"- Related SOPs: {len(_ctx_list(linked.get('related_sops')))} ({', '.join(related_sops) or 'none'})\n"
-        f"- Open tabs: {len(tabs)}\n"
-        f"{focus_note}"
-        f"- References in editor metadata: {', '.join(str(r) for r in references[:10]) or 'none'}\n"
-        f"- Editor text excerpt: {excerpt if excerpt else 'not injected for this query intent'}"
+        + f"- Active SOP: {current.get('sop_number') or current.get('id') or 'unknown'} | "
+        + f"title={current.get('title') or 'unknown'} | version={current.get('version') or 'unknown'} | "
+        + f"status={current.get('status') or 'unknown'}\n"
+        + f"{last_action_line}"
+        + (
+            f"- Selected section: {selected.get('name') or 'none'} | scope={selected.get('scope') or 'none'}\n"
+            if selected or selected_excerpt
+            else ""
+        )
+        + (f"- Selected text excerpt: {selected_excerpt}\n" if selected_excerpt else "")
+        + f"- Linked deviations: {len(_ctx_list(linked.get('deviations')))} ({', '.join(linked_devs) or 'none'})\n"
+        + f"- Linked CAPAs: {len(_ctx_list(linked.get('capas')))} ({', '.join(linked_capas) or 'none'})\n"
+        + f"- Linked audits: {len(_ctx_list(linked.get('audits')))} ({', '.join(linked_audits) or 'none'})\n"
+        + f"- Linked decisions: {len(_ctx_list(linked.get('decisions')))} ({', '.join(linked_decisions) or 'none'})\n"
+        + f"- Related SOPs: {len(_ctx_list(linked.get('related_sops')))} ({', '.join(related_sops) or 'none'})\n"
+        + f"- Open tabs: {len(tabs)}\n"
+        + f"{focus_note}"
+        + f"- References in editor metadata: {', '.join(str(r) for r in references[:10]) or 'none'}\n"
+        + f"- Editor text excerpt: {excerpt if excerpt else 'not injected for this query intent'}"
     )
 
 
@@ -2963,6 +3632,84 @@ async def perform_ai_action(payload: AIActionRequest):
                 structured_data=out.structured_data,
             )
             db.add(log_entry)
+            db.flush()
+            if action in {"rewrite", "improve"}:
+                sop_id = None
+                sop_version_id = None
+                profile_id = None
+                profile_version_id = None
+                if payload.sop_entity_id:
+                    try:
+                        sop_id = uuid.UUID(str(payload.sop_entity_id))
+                        sop_row = db.query(SOP).filter(SOP.id == sop_id).first()
+                        if sop_row:
+                            sop_version_id = sop_row.current_version_id
+                        detected = db.query(SOPDetectedParameters).filter(
+                            SOPDetectedParameters.sop_id == sop_id
+                        ).order_by(SOPDetectedParameters.created_at.desc()).first()
+                        if detected and detected.client_profile_id:
+                            profile_id = detected.client_profile_id
+                            profile = db.query(ClientProfile).filter(ClientProfile.id == profile_id).first()
+                            if profile:
+                                profile_version_id = profile.current_version_id
+                    except Exception as suggestion_ctx_exc:
+                        logger.warning("[ai-suggestion] failed to resolve context: %s", suggestion_ctx_exc)
+                if sop_id is None and payload.sop_title:
+                    sop_row = (
+                        db.query(SOP)
+                        .filter(or_(SOP.sop_number == payload.sop_title, SOP.title == payload.sop_title))
+                        .first()
+                    )
+                    if sop_row:
+                        sop_id = sop_row.id
+                        sop_version_id = sop_row.current_version_id
+                        detected = db.query(SOPDetectedParameters).filter(
+                            SOPDetectedParameters.sop_id == sop_id
+                        ).order_by(SOPDetectedParameters.created_at.desc()).first()
+                        if detected and detected.client_profile_id:
+                            profile_id = detected.client_profile_id
+                            profile = db.query(ClientProfile).filter(ClientProfile.id == profile_id).first()
+                            if profile:
+                                profile_version_id = profile.current_version_id
+                used_profile_id = None
+                if isinstance(out.structured_data, dict):
+                    used_profile_id = out.structured_data.get("used_profile_id")
+                if used_profile_id and str(profile_id or "") != str(used_profile_id):
+                    try:
+                        profile_id = uuid.UUID(str(used_profile_id))
+                        profile = db.query(ClientProfile).filter(ClientProfile.id == profile_id).first()
+                        if profile:
+                            profile_version_id = profile.current_version_id
+                    except Exception as profile_override_exc:
+                        logger.warning("[ai-suggestion] failed to apply used_profile_id override: %s", profile_override_exc)
+                suggestion = AISuggestion(
+                    action_log_id=log_entry.id,
+                    sop_id=sop_id,
+                    sop_version_id=sop_version_id,
+                    action=action,
+                    target_scope=edit_scope,
+                    original_text=payload.text,
+                    suggested_text=out.suggested_text or "",
+                    profile_id=profile_id,
+                    profile_version_id=profile_version_id,
+                    status="pending",
+                    metadata_json={
+                        "sop_title": payload.sop_title,
+                        "section_name": payload.section_name,
+                        "section_type": payload.section_type,
+                        "instruction": getattr(payload, "instruction", None),
+                        "learn_to_profile": bool(getattr(payload, "learn_to_profile", False)),
+                        "structured_data": out.structured_data,
+                    },
+                )
+                db.add(suggestion)
+                db.flush()
+                out.structured_data = dict(out.structured_data or {})
+                out.structured_data["suggestion_id"] = str(suggestion.id)
+                out.structured_data["suggestion_status"] = suggestion.status
+                out.structured_data["requires_user_acceptance"] = True
+                out.structured_data["learn_to_profile_on_accept"] = bool(getattr(payload, "learn_to_profile", False))
+                log_entry.structured_data = out.structured_data
             db.commit()
             logger.info("[ai-action-result] successfully logged to database table ai_action_logs")
         except Exception as log_exc:
@@ -3003,6 +3750,58 @@ async def perform_ai_action(payload: AIActionRequest):
     raise HTTPException(status_code=400, detail=f"Action '{payload.action}' is not supported.")
 
 
+@ai_router.get("/api/ai/suggestions/{suggestion_id}")
+async def get_ai_suggestion(suggestion_id: uuid.UUID):
+    db = SessionLocal()
+    try:
+        suggestion = db.query(AISuggestion).filter(AISuggestion.id == suggestion_id).first()
+        if not suggestion:
+            raise HTTPException(status_code=404, detail="AI suggestion not found")
+        return {
+            "id": str(suggestion.id),
+            "action": suggestion.action,
+            "status": suggestion.status,
+            "sop_id": str(suggestion.sop_id) if suggestion.sop_id else None,
+            "sop_version_id": str(suggestion.sop_version_id) if suggestion.sop_version_id else None,
+            "accepted_version_id": str(suggestion.accepted_version_id) if suggestion.accepted_version_id else None,
+            "target_scope": suggestion.target_scope,
+            "created_at": suggestion.created_at,
+            "accepted_at": suggestion.accepted_at,
+        }
+    finally:
+        db.close()
+
+
+@ai_router.post("/api/ai/suggestions/{suggestion_id}/status")
+async def update_ai_suggestion_status(suggestion_id: uuid.UUID, payload: dict):
+    status = str(payload.get("status") or "").strip().lower()
+    if status not in {"pending", "accepted", "rejected"}:
+        raise HTTPException(status_code=422, detail="status must be pending, accepted, or rejected")
+    db = SessionLocal()
+    try:
+        suggestion = db.query(AISuggestion).filter(AISuggestion.id == suggestion_id).first()
+        if not suggestion:
+            raise HTTPException(status_code=404, detail="AI suggestion not found")
+        suggestion.status = status
+        if status == "accepted":
+            suggestion.accepted_at = datetime.utcnow()
+            accepted_version_id = payload.get("accepted_version_id")
+            if accepted_version_id:
+                suggestion.accepted_version_id = uuid.UUID(str(accepted_version_id))
+        meta = dict(suggestion.metadata_json or {})
+        meta["status_change_reason"] = payload.get("reason")
+        suggestion.metadata_json = meta
+        db.commit()
+        db.refresh(suggestion)
+        return {
+            "id": str(suggestion.id),
+            "status": suggestion.status,
+            "accepted_version_id": str(suggestion.accepted_version_id) if suggestion.accepted_version_id else None,
+        }
+    finally:
+        db.close()
+
+
 @ai_router.post("/api/ai/classify-intent")
 async def classify_intent(payload: dict):
     """
@@ -3017,6 +3816,9 @@ async def classify_intent(payload: dict):
 
     ctx = payload.get("assistant_context") if isinstance(payload.get("assistant_context"), dict) else {}
     current_sop = ctx.get("current_sop") if isinstance(ctx.get("current_sop"), dict) else {}
+    last_action = ctx.get("last_action") if isinstance(ctx.get("last_action"), dict) else {}
+    selected_section = ctx.get("selected_section") if isinstance(ctx.get("selected_section"), dict) else {}
+    recent_messages = payload.get("recent_messages") if isinstance(payload.get("recent_messages"), list) else []
 
     has_active_sop = bool(payload.get("has_active_sop"))
     if not has_active_sop:
@@ -3024,6 +3826,239 @@ async def classify_intent(payload: dict):
             str(ctx.get("active_sop_id") or ctx.get("current_document_id") or "").strip()
             or str(current_sop.get("id") or "").strip()
         )
+
+    def _recent_message_texts() -> list[str]:
+        out: list[str] = []
+        for row in recent_messages[-8:]:
+            if not isinstance(row, dict):
+                continue
+            content = str(row.get("content") or "").strip()
+            if content:
+                out.append(content)
+        return out
+
+    def _infer_previous_action() -> dict[str, Any]:
+        if isinstance(last_action, dict) and last_action:
+            return {
+                "action": str(last_action.get("action") or "").strip(),
+                "target_scope": str(last_action.get("target_scope") or "").strip(),
+                "section_name": str(last_action.get("section_name") or "").strip(),
+                "request_prompt": str(last_action.get("request_prompt") or "").strip(),
+                "status": str(last_action.get("status") or "").strip(),
+            }
+        recent = _recent_message_texts()
+        for text in reversed(recent):
+            low = text.lower()
+            action = ""
+            if re.search(r"\bgap\s*check|lücken|compliance\b", low, re.IGNORECASE):
+                action = "gap_check"
+            elif re.search(r"\bsummarize|summary|shorter|shorten|smaller|smallier\b", low, re.IGNORECASE):
+                action = "summarize"
+            elif re.search(r"\bimprove|verbesser", low, re.IGNORECASE):
+                action = "improve"
+            elif re.search(r"\brewrite|umschreib|überarbeit|ueberarbeit", low, re.IGNORECASE):
+                action = "rewrite"
+            if action:
+                return {
+                    "action": action,
+                    "target_scope": "section",
+                    "section_name": str(selected_section.get("name") or "").strip(),
+                    "request_prompt": text[:400],
+                    "status": "inferred",
+                }
+        return {}
+
+    previous_action = _infer_previous_action()
+
+    def _extract_explicit_section_hint(text: str) -> str:
+        q = str(text or "").strip()
+        if not q:
+            return ""
+        patterns = [
+            r"\b(?:the\s+)?([A-Za-zÀ-ÿ][\wÀ-ÿ\s/&()-]{1,80}?)\s+section\b",
+            r"\bsection\s+([A-Za-zÀ-ÿ][\wÀ-ÿ\s/&()-]{1,80})\b",
+        ]
+        stop = {
+            "selected text",
+            "this",
+            "that",
+            "it",
+            "them",
+            "now",
+            "same",
+            "previous",
+            "suggestion",
+            "full sop",
+            "sop",
+        }
+        for pattern in patterns:
+            match = re.search(pattern, q, re.IGNORECASE)
+            if not match:
+                continue
+            candidate = re.sub(r"\s+", " ", match.group(1).strip(" .:-"))
+            candidate = re.sub(
+                r"^(?:ok(?:ay)?\s+|now\s+|then\s+|please\s+|make\s+(?:the\s+)?|rewrite\s+(?:the\s+)?|improve\s+(?:the\s+)?)",
+                "",
+                candidate,
+                flags=re.IGNORECASE,
+            ).strip(" .:-")
+            known_in_candidate = re.search(
+                r"\b(zweck|purpose|scope|geltungsbereich|procedure|verfahren|responsibilities|verantwortlichkeiten|approval|records|definitions)\b",
+                candidate,
+                re.IGNORECASE,
+            )
+            if known_in_candidate:
+                return known_in_candidate.group(1)
+            if candidate and candidate.lower() not in stop:
+                return candidate
+        known = re.search(
+            r"\b(zweck|purpose|scope|geltungsbereich|procedure|verfahren|responsibilities|verantwortlichkeiten|approval|records|definitions)\b",
+            q,
+            re.IGNORECASE,
+        )
+        return known.group(1) if known else ""
+
+    explicit_section_hint = _extract_explicit_section_hint(message)
+
+    def _is_context_dependent_followup(text: str) -> bool:
+        q = str(text or "").strip().lower()
+        if not q or not previous_action:
+            return False
+        explicit = re.search(
+            r"\b(previous|suggestion|shorter|shorten|keep the same|same tone|make it shorter|summarize it|improve that|that specific section|what is the gap check|same style|same company style)\b",
+            q,
+            re.IGNORECASE,
+        )
+        if explicit:
+            return True
+        if re.search(r"^(ok(?:ay)?|now|then|and now|next)\b", q, re.IGNORECASE):
+            return True
+        if re.search(r"\b(it|them|that|this version)\b", q, re.IGNORECASE):
+            return True
+        if re.fullmatch(r"(make it shorter|make it smaller|make it smallier|summarize it|improve it|rewrite it|improve them|rewrite them)", q, re.IGNORECASE):
+            return True
+        return False
+
+    lower_message = message.lower()
+    if has_active_sop and _is_context_dependent_followup(message) and not bool(payload.get("has_editor_selection")):
+        return {
+            "flow": "follow_up_action",
+            "action": (
+                "gap_check"
+                if re.search(r"\bgap\s*check|compliance\b", message, re.IGNORECASE)
+                else "summarize"
+                if re.search(r"\bsummarize|summary|shorter|shorten|smaller|smallier\b", message, re.IGNORECASE)
+                else "rewrite"
+                if re.search(r"\b(rewrite|re-?write)\b", message, re.IGNORECASE)
+                else str(previous_action.get("action") or "improve")
+            ),
+            "target_scope": "current_section" if explicit_section_hint else "previous_suggestion",
+            "section_hint": explicit_section_hint or str(previous_action.get("section_name") or selected_section.get("name") or "").strip() or None,
+            "requires_selection": False,
+            "requires_confirmation": True,
+            "confidence": 0.91,
+            "reason": "Follow-up request targets the previous assistant action and its target.",
+            "previous_action": previous_action,
+        }
+
+    if has_active_sop:
+        if re.search(r"\bgap[\s-]*check\b|lücken", lower_message, re.IGNORECASE):
+            return {
+                "flow": "editor_action",
+                "action": "gap_check",
+                "target_scope": "full_document",
+                "requires_selection": False,
+                "requires_confirmation": True,
+                "confidence": 0.95,
+                "reason": "Active SOP plus explicit gap-check request.",
+            }
+        if re.search(r"\b(compliance\s+gap|compliance\s+check|what\s+(?:is|are)\s+the\s+compliance|regulatory\s+gaps?|audit\s+readiness\s+gaps?)\b", lower_message, re.IGNORECASE):
+            return {
+                "flow": "editor_action",
+                "action": "gap_check",
+                "target_scope": "full_document" if re.search(r"\b(sop|document|full|whole|entire)\b", lower_message, re.IGNORECASE) else ("selection" if bool(payload.get("has_editor_selection")) else "current_section"),
+                "section_hint": explicit_section_hint or None,
+                "requires_selection": False,
+                "requires_confirmation": True,
+                "confidence": 0.95,
+                "reason": "Active SOP plus explicit compliance-gap request.",
+            }
+        if re.search(r"\b(summarize|summary|brief|gist|kurzfass|zusammenfass)\b", lower_message, re.IGNORECASE):
+            return {
+                "flow": "editor_action",
+                "action": "summarize",
+                "target_scope": "full_document" if re.search(r"\b(sop|document|full|whole|entire)\b", lower_message, re.IGNORECASE) else ("selection" if bool(payload.get("has_editor_selection")) else "current_section"),
+                "section_hint": explicit_section_hint or None,
+                "requires_selection": False,
+                "requires_confirmation": True,
+                "confidence": 0.94,
+                "reason": "Active SOP plus explicit summarize request.",
+            }
+        if re.search(r"\b(analy[sz]e|analysis|review\s+this\s+sop|explain\s+this\s+sop|read\s+this\s+sop|show\s+(?:me\s+)?this\s+sop|current\s+sop\s+content|what\s+does\s+this\s+sop\s+say)\b", lower_message, re.IGNORECASE):
+            return {
+                "flow": "editor_action",
+                "action": "analyze" if re.search(r"\b(analy[sz]e|analysis|review)\b", lower_message, re.IGNORECASE) else "read",
+                "target_scope": "full_document" if re.search(r"\b(sop|document|full|whole|entire)\b", lower_message, re.IGNORECASE) or not explicit_section_hint else "current_section",
+                "section_hint": explicit_section_hint or None,
+                "requires_selection": False,
+                "requires_confirmation": True,
+                "confidence": 0.9,
+                "reason": "Active SOP plus explicit read/analyze request.",
+            }
+        if re.search(r"\b(compliance|compliant|regulatory|gmp|qa|qms|control|audit\s+ready|audit\s+readiness)\b", lower_message, re.IGNORECASE):
+            return {
+                "flow": "editor_action",
+                "action": "analyze",
+                "target_scope": "full_document" if re.search(r"\b(sop|document|full|whole|entire)\b", lower_message, re.IGNORECASE) else ("selection" if bool(payload.get("has_editor_selection")) else "current_section"),
+                "section_hint": explicit_section_hint or None,
+                "requires_selection": False,
+                "requires_confirmation": True,
+                "confidence": 0.9,
+                "reason": "Active SOP plus explicit compliance review request.",
+            }
+        if re.search(r"\bimprove\b|\bverbesser", lower_message, re.IGNORECASE):
+            return {
+                "flow": "editor_action",
+                "action": "improve",
+                "target_scope": "selection" if bool(payload.get("has_editor_selection")) else "current_section",
+                "section_hint": explicit_section_hint or None,
+                "requires_selection": False,
+                "requires_confirmation": True,
+                "confidence": 0.93,
+                "reason": "Active SOP plus explicit improve request.",
+            }
+        if re.search(r"\brewrite\b|umschreib|überarbeit", lower_message, re.IGNORECASE):
+            return {
+                "flow": "editor_action",
+                "action": "rewrite",
+                "target_scope": "selection" if bool(payload.get("has_editor_selection")) else "current_section",
+                "section_hint": explicit_section_hint or None,
+                "requires_selection": False,
+                "requires_confirmation": True,
+                "confidence": 0.93,
+                "reason": "Active SOP plus explicit rewrite request.",
+            }
+
+    if has_active_sop and _is_context_dependent_followup(message) and not bool(payload.get("has_editor_selection")):
+        return {
+            "flow": "follow_up_action",
+            "action": (
+                "gap_check"
+                if re.search(r"\bgap\s*check|compliance\b", message, re.IGNORECASE)
+                else "summarize"
+                if re.search(r"\bsummarize|summary|smaller|smallier\b", message, re.IGNORECASE)
+                else "rewrite"
+                if re.search(r"\b(rewrite|shorter|shorten)\b", message, re.IGNORECASE)
+                else str(previous_action.get("action") or "improve")
+            ),
+            "target_scope": "current_section" if explicit_section_hint else "previous_suggestion",
+            "section_hint": explicit_section_hint or str(previous_action.get("section_name") or selected_section.get("name") or "").strip() or None,
+            "requires_selection": False,
+            "requires_confirmation": True,
+            "confidence": 0.86,
+            "reason": "Follow-up request targets the previous assistant rewrite/suggestion.",
+            "previous_action": previous_action,
+        }
 
     result = await asyncio.to_thread(
         classify_assistant_intent,
@@ -3146,6 +4181,27 @@ async def query_ai(
     intents = _query_intents(question)
     active_scope = _extract_active_sop_scope(assistant_context)
     context_summary = _summarize_live_context(assistant_context, question)
+    if assistant_mode == "query" and "sop_count" in intents and not ({"summary", "compare", "linked"} & intents):
+        response = _deterministic_sop_count_response(question, active_scope)
+        response["retrieval_stats"].update(
+            {
+                "provider": "deterministic",
+                "model": "postgresql_count",
+                "surface": surface,
+                "intents": sorted(intents),
+                "assistant_mode": assistant_mode,
+                "latency_ms_total": round((time.perf_counter() - t0) * 1000.0, 1),
+            }
+        )
+        response["elapsed_ms_total"] = round((time.perf_counter() - t0) * 1000.0, 1)
+        response["retrieval_stats"]["elapsed_ms_total"] = response["elapsed_ms_total"]
+        logger.info(
+            "[chatbot-response] source=deterministic_system_query routed_to=%s total=%s latency_ms=%.1f",
+            response.get("routed_to", ""),
+            response["citations"][0]["excerpt"] if response.get("citations") else "",
+            (time.perf_counter() - t0) * 1000.0,
+        )
+        return await _merge_persisted(response)
     action_plan = None
     if assistant_mode == "action":
         action_plan = _plan_sop_action(question, assistant_context)

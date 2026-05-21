@@ -1,6 +1,6 @@
 """Prompt builders for SOP editor actions.
-Language priority: German (de). All other languages are fully supported.
-The AI always detects the language of the input text and responds in the same language.
+Language follows the active SOP/profile context first, not the user's short chat command.
+German (de) and English (en) are the primary supported editorial output languages.
 
 **Canonical source** for `/api/ai/action` prompt text: this module only.
 ``action/prompts.py`` re-exports these symbols; do not duplicate prompt strings elsewhere.
@@ -23,7 +23,7 @@ IMPROVE_REWRITE_NO_RAG_CONTEXT = (
     "(No RAG.) Use only metadata + quoted text below."
 )
 
-_LANGUAGE_RULE = """LANGUAGE: Match the input language (German if input is German). Do not mix languages. Keep identifiers, codes, and abbreviations unchanged."""
+_LANGUAGE_RULE = """LANGUAGE: Follow the dominant document language visible in the provided text and metadata. Do not mix languages. Keep identifiers, codes, and abbreviations unchanged."""
 
 _SPEED_FIRST = """OUTPUT: Return exactly one valid JSON object. No markdown, no code fences, no explanation, no sources. Be concise."""
 
@@ -255,6 +255,144 @@ def _nlp_section(nlp_block: str) -> str:
     return f"\nNLP_STRUCTURE_AND_PARAMETERS:\n{nb}\n"
 
 
+def _normalize_language_code(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return ""
+    normalized = re.sub(r"[^a-z/-]+", " ", raw).strip()
+    if normalized in {"de", "de de", "german", "deutsch"}:
+        return "de"
+    if normalized in {"en", "en us", "en gb", "english"}:
+        return "en"
+    if normalized.startswith(("german", "deutsch", "de ")):
+        return "de"
+    if normalized.startswith(("english", "en ")):
+        return "en"
+    has_de = bool(re.search(r"\b(german|deutsch|de)\b", normalized))
+    has_en = bool(re.search(r"\b(english|en)\b", normalized))
+    if has_de and has_en:
+        return ""
+    if has_de:
+        return "de"
+    if has_en:
+        return "en"
+    return ""
+
+
+def _detect_text_language(text: str) -> str:
+    sample = str(text or "")[:3000]
+    if not sample.strip():
+        return ""
+    de_hits = len(
+        re.findall(
+            r"\b(und|die|der|das|ist|ein|eine|mit|von|bei|auf|werden|durch|oder|soll|sollen|muss|müssen|darf|dürfen)\b",
+            sample,
+            re.I,
+        )
+    )
+    en_hits = len(
+        re.findall(
+            r"\b(the|and|for|with|from|this|that|shall|must|will|which|when|where|should|may|can)\b",
+            sample,
+            re.I,
+        )
+    )
+    if de_hits == en_hits == 0:
+        return ""
+    return "de" if de_hits >= en_hits else "en"
+
+
+def _extract_detected_language(detected_nlp: dict | None) -> str:
+    if not isinstance(detected_nlp, dict):
+        return ""
+    direct = _normalize_language_code(
+        detected_nlp.get("language")
+        or detected_nlp.get("lang_code")
+        or detected_nlp.get("primary_language")
+        or detected_nlp.get("iso_code")
+    )
+    if direct:
+        return direct
+    for nested_key in ("language_detection", "language_profile"):
+        nested = detected_nlp.get(nested_key)
+        if isinstance(nested, dict):
+            direct = _normalize_language_code(
+                nested.get("language")
+                or nested.get("lang_code")
+                or nested.get("primary_language")
+                or nested.get("iso_code")
+            )
+            if direct:
+                return direct
+    return ""
+
+
+def _infer_output_language(
+    request: ActionRequest,
+    profile_json: dict | None = None,
+    detected_nlp: dict | None = None,
+    style_profile: dict | None = None,
+    profile_md: str = "",
+    context: str = "",
+) -> str:
+    profile_lang = _normalize_language_code((profile_json or {}).get("language"))
+    if profile_lang:
+        return profile_lang
+
+    detected_lang = _extract_detected_language(detected_nlp)
+    if detected_lang:
+        return detected_lang
+
+    style_lang = _normalize_language_code((style_profile or {}).get("language"))
+    if style_lang:
+        return style_lang
+
+    md_lang = _normalize_language_code(profile_md)
+    if md_lang:
+        return md_lang
+
+    text_lang = _detect_text_language(request.section_text or "")
+    if text_lang:
+        return text_lang
+
+    ctx_lang = _detect_text_language(context)
+    if ctx_lang:
+        return ctx_lang
+
+    return "en"
+
+
+def _build_language_rule(
+    request: ActionRequest,
+    profile_json: dict | None = None,
+    detected_nlp: dict | None = None,
+    style_profile: dict | None = None,
+    profile_md: str = "",
+    context: str = "",
+) -> str:
+    language = _infer_output_language(
+        request,
+        profile_json=profile_json,
+        detected_nlp=detected_nlp,
+        style_profile=style_profile,
+        profile_md=profile_md,
+        context=context,
+    )
+    if language == "de":
+        return (
+            "OUTPUT LANGUAGE: German (de). Write the full response, headings, SOP prose, gap findings, "
+            "and suggested edits in German. Follow the active SOP/profile/NLP language even if the user's "
+            "chat command is in English. Do not mix languages in narrative text. Keep identifiers, codes, "
+            "product names, abbreviations, and record IDs unchanged."
+        )
+    return (
+        "OUTPUT LANGUAGE: English (en). Write the full response, headings, SOP prose, gap findings, "
+        "and suggested edits in English. Follow the active SOP/profile/NLP language even if the user's "
+        "chat command is in German. Do not mix languages in narrative text. Keep identifiers, codes, "
+        "product names, abbreviations, and record IDs unchanged."
+    )
+
+
 def _format_nlp_profile_context(
     profile_md: str = "",
     profile_json: dict | None = None,
@@ -284,12 +422,21 @@ def build_improve_prompt(
     profile_md: str = "",
     profile_json: dict | None = None,
     detected_nlp: dict | None = None,
+    style_profile: dict | None = None,
 ) -> str:
     context_extra = _format_nlp_profile_context(profile_md, profile_json, detected_nlp)
+    language_rule = _build_language_rule(
+        request,
+        profile_json=profile_json,
+        detected_nlp=detected_nlp,
+        style_profile=style_profile,
+        profile_md=profile_md,
+        context=context,
+    )
     return f"""You are a senior GMP/QA SOP editor. TASK: light editorial polish — not a full-document rewrite.
 {_SPEED_FIRST}
 {_JSON_ESCAPING_RULE}
-{_LANGUAGE_RULE}
+{language_rule}
 {_doc_block(request, context)}
 {_scope_directive(request, "improve")}
 {_nlp_section(nlp_block)}
@@ -314,11 +461,27 @@ Return only:
 {{"improved_text":"..."}}"""
 
 
-def build_summarize_prompt(request: ActionRequest, context: str, nlp_block: str = "") -> str:
+def build_summarize_prompt(
+    request: ActionRequest,
+    context: str,
+    nlp_block: str = "",
+    profile_md: str = "",
+    profile_json: dict | None = None,
+    detected_nlp: dict | None = None,
+    style_profile: dict | None = None,
+) -> str:
+    language_rule = _build_language_rule(
+        request,
+        profile_json=profile_json,
+        detected_nlp=detected_nlp,
+        style_profile=style_profile,
+        profile_md=profile_md,
+        context=context,
+    )
     return f"""You are a senior GMP/QA communications lead. TASK: produce a concise executive summary of the SOP text (no full rewrite).
 {_SPEED_FIRST}
 {_JSON_ESCAPING_RULE}
-{_LANGUAGE_RULE}
+{language_rule}
 {_doc_block(request, context)}
 {_nlp_section(nlp_block)}
 {_META_USAGE}
@@ -336,11 +499,27 @@ Return only:
 {{"improved_text":"..."}}"""
 
 
-def build_analyze_prompt(request: ActionRequest, context: str, nlp_block: str = "") -> str:
+def build_analyze_prompt(
+    request: ActionRequest,
+    context: str,
+    nlp_block: str = "",
+    profile_md: str = "",
+    profile_json: dict | None = None,
+    detected_nlp: dict | None = None,
+    style_profile: dict | None = None,
+) -> str:
+    language_rule = _build_language_rule(
+        request,
+        profile_json=profile_json,
+        detected_nlp=detected_nlp,
+        style_profile=style_profile,
+        profile_md=profile_md,
+        context=context,
+    )
     return f"""You are a senior GMP/QA compliance reviewer. TASK: structured compliance analysis of the SOP excerpt (not a rewrite).
 {_SPEED_FIRST}
 {_JSON_ESCAPING_RULE}
-{_LANGUAGE_RULE}
+{language_rule}
 {_doc_block(request, context)}
 {_nlp_section(nlp_block)}
 {_META_USAGE}
@@ -364,12 +543,21 @@ def build_rewrite_prompt(
     profile_md: str = "",
     profile_json: dict | None = None,
     detected_nlp: dict | None = None,
+    style_profile: dict | None = None,
 ) -> str:
     scope = resolve_edit_scope(request)
+    language_rule = _build_language_rule(
+        request,
+        profile_json=profile_json,
+        detected_nlp=detected_nlp,
+        style_profile=style_profile,
+        profile_md=profile_md,
+        context=context,
+    )
     full_backbone = ""
     if scope == "full_document":
         full_backbone = """
-FULL SOP BACKBONE (add when missing from TEXT, in input language):
+FULL SOP BACKBONE (add when missing from TEXT, in the active SOP/profile language):
   Purpose/Zweck · Scope/Geltungsbereich · Responsibilities/Verantwortlichkeiten · Procedure/Verfahren ·
   Acceptance Criteria · Documentation/Records · Review/Approval/Lifecycle ·
   Training (if relevant) · Appendices/Traceability (if records present)
@@ -378,7 +566,7 @@ FULL SOP BACKBONE (add when missing from TEXT, in input language):
     return f"""You are a senior GMP/QA SOP architect. TASK: structural rewrite into industry-ready SOP language for the scope in EDIT_SCOPE.
 {_SPEED_FIRST}
 {_JSON_ESCAPING_RULE}
-{_LANGUAGE_RULE}
+{language_rule}
 {_doc_block(request, context)}
 {_scope_directive(request, "rewrite")}
 {_nlp_section(nlp_block)}
@@ -388,11 +576,15 @@ FULL SOP BACKBONE (add when missing from TEXT, in input language):
 {_THREE_C_REWRITE_STANDARD}
 {full_backbone}
 REWRITE RULES:
+- STRICT STRUCTURE LOCK: preserve the current SOP structure exactly as it appears in TEXT. Do not add, remove, rename, merge, split, or reorder headings, subheadings, numbered items, lists, tables, register blocks, or appendices.
+- STRICT MEANING LOCK: preserve the original factual meaning, scope, intent, and compliance context of the SOP. Rewrite wording only; do not change the operational meaning of requirements, controls, responsibilities, or records.
 - Follow EDIT_SCOPE strictly: SECTION_ONLY → never emit a full SOP; FULL_DOCUMENT → rewrite from the first line of TEXT through the end in document order.
 - Follow the Active Profile JSON, Markdown (profile.md), and current SOP detected NLP parameters. Strictly apply rewrite rules, terminology preferences, RACI patterns, tone guidelines, and workflow patterns.
+- When the active profile is German_Pharma_SOP_Profile or the profile describes German pharmaceutical SOPs, make the profile visible in the output: formal German controlled-SOP register, traceable section wording, and appropriate modal/control language such as "muss", "sollte", or "darf nicht" without inventing obligations.
 - Single section/heading (e.g. CAPAs, DEVIATIONS, Procedure): rewrite only lines in TEXT; never swap CAPAs for DEVIATIONS or vice versa.
 - Use bracketed placeholders only for missing controls clearly implied by TEXT inside that section.
 - Apply rewrite_improve_parameters from NLP_STRUCTURE_AND_PARAMETERS only for tone, formality, numbering, and domain vocabulary; never use them to change facts.
+- FULL_DOCUMENT default behavior: keep the same section set and same order as TEXT. Do not add standard SOP backbone sections unless the user explicitly asks to restructure the SOP.
 
 LANGUAGE & STYLE:
 - Active voice, named accountable roles, precise verbs, consistent controlled vocabulary.
@@ -422,7 +614,7 @@ def build_section_only_rewrite_retry_prompt(request: ActionRequest, context: str
     return f"""CRITICAL RETRY — previous answer was wrong (full SOP or heading-only).
 {_SPEED_FIRST}
 {_JSON_ESCAPING_RULE}
-{_LANGUAGE_RULE}
+{_build_language_rule(request, context=context)}
 {_doc_block(request, context)}
 EDIT_SCOPE: SECTION_ONLY — STRICT
 - Section: "{section}"
@@ -464,12 +656,21 @@ def build_gap_check_prompt(
     profile_md: str = "",
     profile_json: dict | None = None,
     detected_nlp: dict | None = None,
+    style_profile: dict | None = None,
 ) -> str:
     context_extra = _format_nlp_profile_context(profile_md, profile_json, detected_nlp)
+    language_rule = _build_language_rule(
+        request,
+        profile_json=profile_json,
+        detected_nlp=detected_nlp,
+        style_profile=style_profile,
+        profile_md=profile_md,
+        context=context,
+    )
     return f"""You are a senior GMP/QA compliance auditor. TASK: audit-grade gap check of the selected SOP text.
 {_SPEED_FIRST}
 {_JSON_ESCAPING_RULE}
-{_LANGUAGE_RULE}
+{language_rule}
 SOP: "{request.sop_title}" | Section: "{request.section_title}" ({request.section_type})
 edit_scope: {resolve_edit_scope(request)}
 
@@ -508,7 +709,7 @@ OUTPUT RULES:
 - Prioritize compliance gaps over style/grammar observations.
 - If no material gaps found, state clearly and list residual assumptions.
 - Do not propose a new SOP version, new status, or relocate DEV/CAPA/AUDIT logs unless TEXT already uses appendix structure.
-- Localize headings to input language. German → "Zusammenfassung", "RAG/NLP-Grundlage", "Festgestellte Lücken", "Empfohlene Korrekturen", "Vorgeschlagener SOP-Ergänzungstext", "Verbleibende Annahmen".
+- Localize headings to the active SOP/profile language. German → "Zusammenfassung", "RAG/NLP-Grundlage", "Festgestellte Lücken", "Empfohlene Korrekturen", "Vorgeschlagener SOP-Ergänzungstext", "Verbleibende Annahmen".
 
 TEXT:
 \"\"\"{request.section_text}\"\"\"

@@ -312,6 +312,8 @@ const EditorAIBridge = ({
         edit_scope: isFullDoc ? 'full_document' : 'section_only',
         sop_entity_id: documentIdRef.current || null,
         triggered_by: AI_ACTION_TRIGGERED_BY.KL_ASSISTANT,
+        instruction: actionPrompt || null,
+        learn_to_profile: Boolean(request?.learn_to_profile),
       })
 
       const safeSuggestedHtml = formatAiSuggestionForUi({

@@ -63,6 +63,7 @@ function normalizeForMatch(value) {
 function cleanLabel(raw) {
   return String(raw || '')
     .trim()
+    .replace(/^(?:ok(?:ay)?|now|then|please)\s+/i, '')
     .replace(/\s+section\s+only\s*$/i, '')
     .replace(/\s+only\s*$/i, '')
     .replace(/\s*section\s*$/i, '')
@@ -131,7 +132,13 @@ function extractLabelsFromPrompt(promptText) {
   }
   DOC_ID_PATTERN.lastIndex = 0
 
-  return [...new Set(labels.map((l) => l.trim()).filter((l) => l.length >= 2 && !wantsFullSopIntent(l)))]
+  return [
+    ...new Set(
+      labels
+        .map((l) => l.trim())
+        .filter((l) => l.length >= 2 && !wantsFullSopIntent(l) && !isGenericLabelToken(normalizeForMatch(l))),
+    ),
+  ]
 }
 
 function isRecordEntryLine(text) {

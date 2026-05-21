@@ -3,7 +3,7 @@ import { NavLink } from 'react-router-dom'
 import {
   Search, MessageCircle, LayoutDashboard,
   ClipboardList, AlertTriangle, Scale, FileText,
-  GitBranch, Settings, HelpCircle, LogOut, Bot, X
+  GitBranch, Settings, HelpCircle, LogOut, Bot, X, BookMarked
 } from 'lucide-react'
 import { useSidebarCounts } from '../../hooks/useSidebarCounts'
 import './Sidebar.css'
@@ -45,6 +45,10 @@ export default function Sidebar({ isOpen = false, onClose }) {
           <NavLink to="/knowledge" className="nav-link">
             <Search size={18} />
             <span className="nav-text">Wissenssuche</span>
+          </NavLink>
+          <NavLink to="/profiles" className="nav-link">
+            <BookMarked size={18} />
+            <span className="nav-text">Profile</span>
           </NavLink>
           <NavLink to="/chat" className="nav-link">
             <MessageCircle size={18} />

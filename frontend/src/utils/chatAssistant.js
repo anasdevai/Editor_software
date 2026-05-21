@@ -97,6 +97,16 @@ const ROUTE_CONFIG = {
       'Fasse den SOP-Inhalt zusammen',
     ],
   },
+  '/profiles': {
+    category: 'sops',
+    contextLabel: 'Kontext: Profile Workspace',
+    suggestions: [
+      'Welche Profilversion ist aktiv?',
+      'Wofuer wird dieses Profil verwendet?',
+      'Welche Aenderungen gab es im Profil?',
+      'Wie wirkt sich das Profil auf Rewrite aus?',
+    ],
+  },
 }
 
 const DEFAULT_CONFIG = {

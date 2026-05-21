@@ -14,7 +14,12 @@ import {
   getChatSessionMessages,
 } from '../../api/editorApi'
 import { htmlToPlainText, deriveSopTitleFromText, plainTextToTiptapDoc } from '../../utils/chatSopSave'
-import { getAssistantContextStorageKeys, resetAssistantStateOnce } from '../../utils/assistantContext'
+import {
+  getKLAssistantContext,
+  getAssistantContextStorageKeys,
+  resetAssistantStateOnce,
+  saveAssistantLastAction,
+} from '../../utils/assistantContext'
 import {
   EDITOR_AI_ACTIONS,
   EDITOR_AI_ACTION_STATUS,
@@ -235,11 +240,13 @@ function AIWidget() {
   const pendingBridgeRef = useRef(new Map())
   const suggestions = routeMeta.suggestions
   const [sopEditorActive, setSopEditorActive] = useState(() => hasActiveSopEditor(location.pathname))
+  const [liveAssistantContext, setLiveAssistantContext] = useState(() => getKLAssistantContext(location.pathname))
   const assistantMode = sopEditorActive ? 'action' : 'query'
 
   useEffect(() => {
     const syncEditorContext = () => {
       setSopEditorActive(hasActiveSopEditor(location.pathname))
+      setLiveAssistantContext(getKLAssistantContext(location.pathname))
     }
     syncEditorContext()
     window.addEventListener(SOP_EDITOR_CONTEXT_EVENT, syncEditorContext)
@@ -249,6 +256,29 @@ function AIWidget() {
       window.removeEventListener('storage', syncEditorContext)
     }
   }, [location.pathname])
+
+  const currentSop = liveAssistantContext?.current_sop || {}
+  const selectedSection = liveAssistantContext?.selected_section || {}
+  const currentSopLabel =
+    String(currentSop?.sop_number || currentSop?.title || '').trim() || ''
+  const selectedSectionLabel = String(selectedSection?.name || '').trim() || ''
+  const dynamicSuggestions = sopEditorActive
+    ? [
+        selectedSectionLabel
+          ? `Fasse den Abschnitt "${selectedSectionLabel}" zusammen`
+          : 'Fasse die aktuelle SOP kurz zusammen',
+        selectedSectionLabel
+          ? `Rewrite den Abschnitt "${selectedSectionLabel}" im aktuellen SOP-Stil`
+          : 'Rewrite diese SOP im aktuellen Unternehmensstil',
+        selectedSectionLabel
+          ? `Prüfe "${selectedSectionLabel}" auf Compliance-Lücken`
+          : 'Prüfe diese SOP auf Compliance-Lücken',
+        selectedSectionLabel
+          ? `Verbessere "${selectedSectionLabel}" ohne die SOP-Struktur zu ändern`
+          : 'Verbessere diese SOP ohne die Struktur zu ändern',
+      ]
+    : suggestions
+  const visibleSuggestions = dynamicSuggestions.filter(Boolean).slice(0, 4)
 
   useEffect(() => {
     if (assistantMode === 'query') setPendingDeleteAction(null)
@@ -338,6 +368,15 @@ function AIWidget() {
           ? { ...m, text: statusText, isError, _pendingBridge: false, time: nowTime() }
           : m
       )))
+      saveAssistantLastAction({
+        action: detail?.action || entry.action,
+        target_scope: detail?.applied_scope || 'selection',
+        section_name: detail?.section_name || '',
+        sop_id: detail?.sop_id || getActiveEditorDocumentId(),
+        suggested_text_excerpt: statusText,
+        status: detail?.status || '',
+        source: 'sidebar_bridge_result',
+      })
     })
     return () => {
       unsubscribe()
@@ -410,6 +449,17 @@ function AIWidget() {
             time: nowTime(),
           },
         ])
+        saveAssistantLastAction({
+          action: 'gap_check',
+          target_scope: target.isFullDoc ? 'full_document' : 'section',
+          section_name: target.sectionName || '',
+          request_prompt: text,
+          original_text_excerpt: target.text || '',
+          suggested_text_excerpt: plain || '',
+          status: 'suggested',
+          source: 'sidebar_gap_check',
+          sop_id: getActiveEditorDocumentId(),
+        })
         return true
       } catch (err) {
         setMessages((prev) => [
@@ -427,6 +477,15 @@ function AIWidget() {
     }
 
     if (plan.useInline) {
+      saveAssistantLastAction({
+        action: plan.inlineAction || intent,
+        target_scope: sectionHint ? 'section' : (targetScope || 'selection'),
+        section_name: sectionHint || '',
+        request_prompt: text,
+        status: 'requested',
+        source: 'sidebar_inline_action',
+        sop_id: getActiveEditorDocumentId(),
+      })
       setMessages((prev) => [
         ...prev,
         {
@@ -476,6 +535,15 @@ function AIWidget() {
 
     const requestId = makeEditorAiRequestId()
     pendingBridgeRef.current.set(requestId, { messageId: placeholderId, action: intent })
+    saveAssistantLastAction({
+      action: intent,
+      target_scope: targetScope || 'selection',
+      section_name: sectionHint || '',
+      request_prompt: text,
+      status: 'requested',
+      source: 'sidebar_bridge_action',
+      sop_id: activeDocumentId,
+    })
     dispatchEditorAiActionRequest({
       action: intent,
       prompt: actionPrompt,
@@ -511,6 +579,10 @@ function AIWidget() {
         const classification = await classifyAssistantMessage({
           message: trimmed,
           pathname: location.pathname,
+          recentMessages: messagesRef.current.map((msg) => ({
+            role: msg.role === 'ai' ? 'assistant' : 'user',
+            content: msg.text,
+          })),
         })
 
         if (classification.flow === 'clarify' && classification.clarification_question) {
@@ -526,7 +598,7 @@ function AIWidget() {
           return
         }
 
-        if (classification.flow === 'editor_action') {
+        if (classification.flow === 'editor_action' || classification.flow === 'follow_up_action') {
           const handled = await routeClassifiedEditorAction(trimmed, classification, opts)
           if (handled) return
         }
@@ -576,10 +648,32 @@ function AIWidget() {
         }
       }
       if (result?.session_id) {
+        if (assistantMode === 'action') {
+          saveAssistantLastAction({
+            action: result?.intent || result?.action || 'chat',
+            target_scope: 'chat',
+            sop_id: getActiveEditorDocumentId(),
+            request_prompt: trimmed,
+            suggested_text_excerpt: result.answer || result.text || result.response || '',
+            status: 'answered',
+            source: 'sidebar_query_response',
+          })
+        }
         writeSessionIdForPath(location.pathname, result.session_id)
         const rows = await getChatSessionMessages(result.session_id)
         setMessages(dbMessagesToWidget(rows))
       } else {
+        if (assistantMode === 'action') {
+          saveAssistantLastAction({
+            action: result?.intent || result?.action || 'chat',
+            target_scope: 'chat',
+            sop_id: getActiveEditorDocumentId(),
+            request_prompt: trimmed,
+            suggested_text_excerpt: result.answer || result.text || result.response || '',
+            status: 'answered',
+            source: 'sidebar_query_response',
+          })
+        }
         const aiMsg = {
           id: Date.now() + 1,
           role: 'ai',
@@ -697,6 +791,14 @@ function AIWidget() {
           <Zap size={14} className="ai-context-icon" />
           <span className="ai-context-label">{contextLabel}</span>
         </div>
+        {sopEditorActive && currentSopLabel ? (
+          <div className="ai-context-row" style={{ marginTop: 8 }}>
+            <span className="ai-context-label" style={{ fontSize: 12 }}>
+              Aktive SOP: {currentSopLabel}
+              {selectedSectionLabel ? ` • Abschnitt: ${selectedSectionLabel}` : ''}
+            </span>
+          </div>
+        ) : null}
       </div>
 
       <div className="ai-widget-divider" />
@@ -721,7 +823,7 @@ function AIWidget() {
           onSend={handleSend}
           sending={sending}
           sopEditorActive={sopEditorActive}
-          suggestions={suggestions}
+          suggestions={visibleSuggestions}
           onSuggestionClick={handleSuggestionClick}
         />
       </div>

@@ -8,9 +8,10 @@ from qdrant_client.http import models as qmodels
 import hashlib
 from .database import get_db, SessionLocal
 from .models import (
-    SOP, SOPVersion, Deviation, Capa, AuditFinding, Decision,
+    SOP, SOPVersion, Deviation, Capa, AuditFinding, Decision, ClientProfile,
     SopDeviationLink, DeviationCapaLink, CapaAuditLink, AuditDecisionLink, DecisionSopLink,
     AILinkSuggestion,
+    AISuggestion,
     EmbeddingJob,
 )
 from .schemas import (
@@ -63,6 +64,7 @@ from .services.semantic_jobs import schedule_semantic_reindex
 from .services.webhook_service import entities_for_link
 from .utils.tiptap_text import extract_plain_text_from_tiptap
 from .services.sop_profile_storage_service import analyze_and_store_sop_profile
+from .client_profile_routes import save_profile_version_from_accepted_suggestion
 
 # ==========================================
 # CONSTANTS
@@ -1505,6 +1507,63 @@ def create_version(
     db.refresh(version)
     db.refresh(sop)
 
+    accepted_suggestion = None
+    if payload.suggestion_id:
+        accepted_suggestion = (
+            db.query(AISuggestion)
+            .filter(AISuggestion.id == payload.suggestion_id, AISuggestion.sop_id == sop.id)
+            .first()
+        )
+    if accepted_suggestion is None and payload.change_justification:
+        lowered_note = payload.change_justification.lower()
+        if "accepted" in lowered_note and ("rewrite" in lowered_note or "improve" in lowered_note):
+            accepted_suggestion = (
+                db.query(AISuggestion)
+                .filter(
+                    AISuggestion.sop_id == sop.id,
+                    AISuggestion.status == "pending",
+                )
+                .order_by(AISuggestion.created_at.desc())
+                .first()
+            )
+            if accepted_suggestion is None:
+                accepted_suggestion = (
+                    db.query(AISuggestion)
+                    .filter(
+                        AISuggestion.sop_id.is_(None),
+                        AISuggestion.status == "pending",
+                    )
+                    .order_by(AISuggestion.created_at.desc())
+                    .first()
+                )
+    if accepted_suggestion is not None:
+        if accepted_suggestion.sop_id is None:
+            accepted_suggestion.sop_id = sop.id
+        if accepted_suggestion.sop_version_id is None:
+            accepted_suggestion.sop_version_id = version.id
+        accepted_suggestion.status = "accepted"
+        accepted_suggestion.accepted_version_id = version.id
+        accepted_suggestion.accepted_at = datetime.utcnow()
+        meta = dict(accepted_suggestion.metadata_json or {})
+        meta["accepted_change_justification"] = payload.change_justification
+        meta["accepted_sop_version"] = next_version
+        accepted_suggestion.metadata_json = meta
+        should_learn = bool((accepted_suggestion.metadata_json or {}).get("learn_to_profile"))
+        if should_learn and accepted_suggestion.profile_id:
+            profile = db.query(ClientProfile).filter(ClientProfile.id == accepted_suggestion.profile_id).first()
+            if profile:
+                profile_result = save_profile_version_from_accepted_suggestion(
+                    db,
+                    profile=profile,
+                    suggestion=accepted_suggestion,
+                    change_reason=f"Auto-learned from accepted {accepted_suggestion.action} suggestion",
+                )
+                meta["profile_auto_updated"] = True
+                meta["profile_auto_update_result"] = profile_result
+                accepted_suggestion.metadata_json = meta
+        db.commit()
+        db.refresh(accepted_suggestion)
+
     _schedule_semantic_job(background_tasks, "sop", sop.id, version.id)
     return _build_editor_version_response(version)
 
@@ -2127,12 +2186,13 @@ def import_dataset(payload: DatasetImportRequest, db: Session = Depends(get_db),
             for s in batch_sops:
                 sop_id = uuid.UUID(s["id"]) if s.get("id") else None
                 sop = find_existing(
-                    SOP,
+    AISuggestion,
+    SOP,
                     entity_id=sop_id,
                     external_id=s.get("external_id"),
                     lookup_field="sop_number",
                     lookup_value=s.get("sop_number"),
-                )
+)
                 if not sop:
                     sop_id = sop_id or uuid.uuid4()
                     sop = SOP(

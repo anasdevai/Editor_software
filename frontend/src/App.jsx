@@ -5,6 +5,7 @@ import DashboardPage from './pages/DashboardPage'
 import SOPsPage from './pages/SOPsPage'
 import KnowledgePage from './pages/KnowledgePage'
 import ChatPage from './pages/ChatPage'
+import ProfileWorkspacePage from './pages/ProfileWorkspacePage'
 
 import EntitiesPage from './pages/EntitiesPage'
 const EditorPage = lazy(() => import('./pages/EditorPage'))
@@ -35,6 +36,7 @@ function App() {
           <Route path="knowledge" element={<KnowledgePage />} />
           <Route path="chat" element={<ChatPage />} />
           <Route path="sops" element={<SOPsPage />} />
+          <Route path="profiles" element={<ProfileWorkspacePage />} />
 
           <Route path="deviations" element={<EntitiesPage type="deviations" />} />
           <Route path="capa" element={<EntitiesPage type="capas" />} />

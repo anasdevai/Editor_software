@@ -32,6 +32,7 @@ const INLINE_CONTENT_ACTIONS = new Set([
  * @property {string|null} section_hint
  * @property {string[]} linked_entity_types
  * @property {object} constraints
+ * @property {object|null} previous_action
  * @property {string|null} clarification_question
  * @property {number} confidence
  */
@@ -49,7 +50,7 @@ const INLINE_CONTENT_ACTIONS = new Set([
  * Call backend semantic intent classifier.
  * @returns {Promise<AssistantIntentClassification>}
  */
-export async function classifyAssistantMessage({ message, pathname = '/' }) {
+export async function classifyAssistantMessage({ message, pathname = '/', recentMessages = [] }) {
   const text = String(message || '').trim()
   const assistantContext = getKLAssistantContext(pathname)
   const hasActiveSop = hasActiveSopEditor(pathname)
@@ -69,6 +70,7 @@ export async function classifyAssistantMessage({ message, pathname = '/' }) {
       route: pathname,
       has_active_sop: hasActiveSop,
       has_editor_selection: hasEditorSelection,
+      recent_messages: Array.isArray(recentMessages) ? recentMessages.slice(-8) : [],
       assistant_context: assistantContext,
     })
     return normalizeClassification(result)
@@ -89,7 +91,8 @@ export async function classifyAssistantMessage({ message, pathname = '/' }) {
 }
 
 function normalizeClassification(raw) {
-  const flow = ['chat', 'editor_action', 'clarify'].includes(raw?.flow) ? raw.flow : 'chat'
+  const rawFlow = String(raw?.flow || '').trim().toLowerCase()
+  const flow = ['chat', 'editor_action', 'clarify', 'follow_up_action'].includes(rawFlow) ? rawFlow : 'chat'
   return {
     flow,
     action: raw?.action || null,
@@ -97,6 +100,7 @@ function normalizeClassification(raw) {
     section_hint: raw?.section_hint || null,
     linked_entity_types: Array.isArray(raw?.linked_entity_types) ? raw.linked_entity_types : [],
     constraints: raw?.constraints && typeof raw.constraints === 'object' ? raw.constraints : {},
+    previous_action: raw?.previous_action && typeof raw.previous_action === 'object' ? raw.previous_action : null,
     clarification_question: raw?.clarification_question || null,
     confidence: typeof raw?.confidence === 'number' ? raw.confidence : 0.5,
     reasoning: raw?.reasoning || null,
@@ -106,6 +110,7 @@ function normalizeClassification(raw) {
 /** Map classifier action id to editor bridge action constant. */
 export function mapClassificationToEditorAction(classification) {
   const key = String(classification?.action || '').trim().toLowerCase()
+  if (key === 'read') return null
   return ACTION_MAP[key] || null
 }
 
@@ -115,7 +120,11 @@ export function mapClassificationToEditorAction(classification) {
  */
 export function planEditorActionExecution(classification, opts = {}) {
   const intent = opts.explicitAction || mapClassificationToEditorAction(classification)
-  const scope = String(classification?.target_scope || '').toLowerCase()
+  const rawScope = String(classification?.target_scope || '').toLowerCase()
+  const scope =
+    rawScope === 'previous_suggestion' || rawScope === 'current_section'
+      ? 'section'
+      : rawScope
   const sectionHint = String(classification?.section_hint || '').trim()
   const snapshotOptions = {
     sectionHint,
@@ -181,6 +190,15 @@ export function buildEnrichedActionPrompt(message, classification = {}) {
     hints.push(
       'Apply to the complete section body under that heading (all paragraphs until the next section), not the heading line alone.',
     )
+  }
+  if (classification.previous_action && typeof classification.previous_action === 'object') {
+    const prev = classification.previous_action
+    if (prev.action) hints.push(`Previous assistant action: ${prev.action}`)
+    if (prev.section_name && !classification.section_hint) {
+      hints.push(`Continue working on the same target section: ${prev.section_name}`)
+    }
+    if (prev.target_scope) hints.push(`Previous target scope: ${prev.target_scope}`)
+    if (prev.request_prompt) hints.push(`Previous instruction: ${prev.request_prompt}`)
   }
   if (classification.target_scope === 'full_document') {
     hints.push('Apply to the entire SOP document.')

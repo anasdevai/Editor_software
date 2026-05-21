@@ -28,6 +28,7 @@ import { inferEditScope } from '../../utils/editScopeInference'
 import { wantsFullSopIntent } from '../../utils/sopActionIntent'
 import { runEditorGapCheck } from '../../utils/editorGapCheck'
 import { sanitizeRenderedHtml } from '../../utils/aiOutputFormatter'
+import { saveAssistantLastAction } from '../../utils/assistantContext'
 
 const ACTION_TEXT_WARNING_CHARS = 7000
 const INLINE_SHOWN_EVENT = 'editor-actions-inline-shown'
@@ -62,6 +63,16 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
     const instruction = String(instructionText || '').trim()
     const { target, result, normalized } = await runEditorGapCheck({ instruction })
     const report = buildGapCheckSidebarReport(result)
+    const plainReport = report.sections
+      .map((section) => {
+        const body = section.body ? `${section.title}\n${section.body}` : section.title
+        const gaps = (section.gapItems || [])
+          .map((gap) => `- ${gap.issue}${gap.recommendation ? ` -> ${gap.recommendation}` : ''}`)
+          .join('\n')
+        return [body, gaps].filter(Boolean).join('\n')
+      })
+      .filter(Boolean)
+      .join('\n\n')
 
     setPending({
       requestId: `gap-${Date.now().toString(36)}`,
@@ -72,6 +83,17 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
       previewHtml: normalized.suggestedHtml,
       range: { from: target.from, to: target.to },
       appendHtml: normalized.suggestedHtml,
+    })
+    saveAssistantLastAction({
+      action: 'gap_check',
+      target_scope: target.isFullDoc ? 'full_document' : 'section',
+      section_name: target.sectionName || '',
+      sop_id: getActiveEditorDocumentId(),
+      request_prompt: instruction,
+      original_text_excerpt: target.text || '',
+      suggested_text_excerpt: plainReport || normalized.suggestedPlain || '',
+      status: 'suggested',
+      source: 'editor_actions_tab',
     })
   }, [])
 
@@ -179,6 +201,17 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
       previewHtml: inlineHtml,
       range: { from: target.from, to: target.to },
     })
+    saveAssistantLastAction({
+      action,
+      target_scope: target.isFullDoc ? 'full_document' : 'section',
+      section_name: target.sectionName || '',
+      sop_id: documentId,
+      request_prompt: instruction,
+      original_text_excerpt: target.text || '',
+      suggested_text_excerpt: normalized.suggestedPlain || '',
+      status: 'suggested',
+      source: 'editor_actions_tab',
+    })
   }, [])
 
   const runAction = useCallback(async (action, instructionText = '', targetOptions = {}) => {
@@ -267,6 +300,15 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
   const handleAppendGap = useCallback(() => {
     if (!pending?.appendHtml) return
     appendGapFindingsToEditor(pending.appendHtml)
+    saveAssistantLastAction({
+      action: 'gap_check',
+      target_scope: pending?.isFullDoc ? 'full_document' : 'section',
+      section_name: pending?.sectionName || '',
+      sop_id: getActiveEditorDocumentId(),
+      suggested_text_excerpt: pending?.gapReport?.analysisPlain || '',
+      status: 'applied',
+      source: 'editor_actions_tab',
+    })
     setPending(null)
     setError('')
   }, [pending])
@@ -283,6 +325,15 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
         setError(message || 'Could not apply suggestion.')
         return
       }
+      saveAssistantLastAction({
+        action: pendingRef.current.action,
+        target_scope: pendingRef.current.isFullDoc ? 'full_document' : 'section',
+        section_name: pendingRef.current.sectionName || '',
+        sop_id: getActiveEditorDocumentId(),
+        suggested_text_excerpt: pendingRef.current.previewHtml || '',
+        status: 'applied',
+        source: 'editor_actions_tab',
+      })
       setPending(null)
       setError('')
     }
