@@ -1,0 +1,243 @@
+import React from 'react'
+import { createPortal } from 'react-dom'
+import { AlertTriangle, Check, Info, Sparkles, Wand2, X } from 'lucide-react'
+import './AIAssistantUI.css'
+import { formatAiSuggestionForUi } from '../../utils/aiOutputFormatter'
+
+const TITLES = {
+  gap_check: 'QA Gap Check',
+  rewrite: 'SOP Rewrite Preview',
+  improve: 'Improvement Preview',
+  summarize: 'Executive Summary Preview',
+  analyze: 'Compliance Analysis Preview',
+}
+
+const StructuredDetails = ({ action, structuredData, suggestedText }) => {
+  if (!structuredData || typeof structuredData !== 'object') return null
+
+  if (action === 'gap_check') {
+    const gaps = Array.isArray(structuredData.gaps) ? structuredData.gaps : []
+    const items = gaps.length > 0
+      ? gaps
+      : [{
+        issue: structuredData.issue,
+        explanation: structuredData.explanation,
+        recommendation: structuredData.recommendation,
+      }]
+
+    return (
+      <div className="ai-details ai-details--amber">
+        <div className="ai-details__title">
+          <AlertTriangle size={18} />
+          <span>Structured QA Findings</span>
+        </div>
+        <div className="ai-details__stack">
+          {items.map((gap, index) => (
+            <div key={`gap-${index}`} className="ai-details__item">
+              <p className="ai-details__label">Issue</p>
+              <p className="ai-details__value">{gap.issue}</p>
+              <p className="ai-details__label">Explanation</p>
+              <p className="ai-details__value">{gap.explanation}</p>
+              <p className="ai-details__label">Recommendation</p>
+              <p className="ai-details__value">{gap.recommendation}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+    )
+  }
+
+  if (action === 'rewrite') {
+    const rewriteMode = structuredData.rewrite_mode
+    const llmUsed = structuredData.llm_used
+    return (
+      <div className="ai-details ai-details--green">
+        <div className="ai-details__title">
+          <Wand2 size={18} />
+          <span>Rewrite Summary</span>
+        </div>
+        {rewriteMode ? (
+          <div className="ai-details__item">
+            <p className="ai-details__label">Rewrite Mode</p>
+            <p className="ai-details__value">{rewriteMode}</p>
+          </div>
+        ) : null}
+        {typeof llmUsed === 'boolean' ? (
+          <div className="ai-details__item">
+            <p className="ai-details__label">LLM Rewrite</p>
+            <p className="ai-details__value">{llmUsed ? 'Used configured LLM model' : 'Fallback scaffold used'}</p>
+          </div>
+        ) : null}
+        {structuredData.llm_error ? (
+          <div className="ai-details__item">
+            <p className="ai-details__label">LLM Detail</p>
+            <p className="ai-details__value">{structuredData.llm_error}</p>
+          </div>
+        ) : null}
+        {structuredData.structural_changes ? (
+          <div className="ai-details__item">
+            <p className="ai-details__label">Changes Made</p>
+            <p className="ai-details__value">{structuredData.structural_changes}</p>
+          </div>
+        ) : null}
+        {structuredData.rationale ? (
+          <div className="ai-details__item">
+            <p className="ai-details__label">Rationale</p>
+            <p className="ai-details__value">{structuredData.rationale}</p>
+          </div>
+        ) : null}
+      </div>
+    )
+  }
+
+  if (action === 'improve') {
+    return (
+      <div className="ai-details ai-details--violet">
+        <div className="ai-details__title">
+          <Sparkles size={18} />
+          <span>Improvement Summary</span>
+        </div>
+        <div className="ai-details__item">
+          <p className="ai-details__label">Improved Version</p>
+          <p className="ai-details__value">{structuredData.improved_text || structuredData.improved_version || suggestedText}</p>
+        </div>
+        {Array.isArray(structuredData.changes_made) && structuredData.changes_made.length > 0 ? (
+          <div className="ai-details__item">
+            <p className="ai-details__label">Changes Made</p>
+            <ol className="ai-details__list">
+              {structuredData.changes_made.map((item, index) => (
+                <li key={`change-${index}`}>{item}</li>
+              ))}
+            </ol>
+          </div>
+        ) : null}
+        <div className="ai-details__item">
+          <p className="ai-details__label">Compliance Note</p>
+          <p className="ai-details__value">{structuredData.compliance_note || structuredData.reason_for_improvement}</p>
+        </div>
+      </div>
+    )
+  }
+
+  return null
+}
+
+const AIComparisonModal = ({
+  isOpen,
+  onClose,
+  action,
+  originalText,
+  suggestedText,
+  onAccept,
+  explanation,
+  structuredData,
+  sectionName,
+  sopTitle,
+}) => {
+  if (!isOpen) return null
+  const safeOriginalText = typeof originalText === 'string' ? originalText : String(originalText || '')
+  const safeSuggestedHtml = formatAiSuggestionForUi({
+    action,
+    suggestedText,
+    structuredData,
+  })
+
+  const modal = (
+    <div className="ai-modal-overlay">
+      <div className="ai-modal">
+        <div className="ai-modal__header">
+          <div className="ai-modal__header-main">
+            <div className="ai-modal__icon-badge">
+              <SparkleIcon size={18} className="ai-modal__icon" />
+            </div>
+            <div>
+              <h3 className="ai-modal__title">{TITLES[action] || 'AI Suggestion Review'}</h3>
+              <p className="ai-modal__subtitle">
+                {sopTitle || 'Untitled SOP'}
+                {sectionName ? ` · ${sectionName}` : ''}
+              </p>
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="ai-modal__close"
+            aria-label="Close AI result dialog"
+          >
+            <X size={18} />
+          </button>
+        </div>
+
+        <div className="ai-modal__body">
+          {explanation && (
+            <div className="ai-notes">
+              <Info size={18} />
+              <div>
+                <p className="ai-notes__title">AI Notes</p>
+                <p className="ai-notes__text">{explanation}</p>
+              </div>
+            </div>
+          )}
+
+          <StructuredDetails action={action} structuredData={structuredData} suggestedText={suggestedText} />
+
+          <div className="ai-diff-grid">
+            <div className="ai-diff-card">
+              <div className="ai-diff-card__header">Before</div>
+              <div className="ai-diff-card__content ai-diff-card__content--before">
+                {safeOriginalText || 'No original text available.'}
+              </div>
+            </div>
+            <div className="ai-diff-card">
+              <div className="ai-diff-card__header ai-diff-card__header--after">After (AI Suggestion)</div>
+              <div
+                className="ai-diff-card__content ai-diff-card__content--after tiptap"
+                dangerouslySetInnerHTML={{ __html: safeSuggestedHtml }}
+              />
+            </div>
+          </div>
+        </div>
+
+        <div className="ai-modal__footer">
+          <button
+            onClick={onClose}
+            className="ai-modal__button ai-modal__button--ghost"
+          >
+            Reject
+          </button>
+          <button
+            onClick={onAccept}
+            className="ai-modal__button ai-modal__button--primary"
+          >
+            <Check size={16} />
+            <span>Accept and Insert</span>
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+
+  if (typeof document === 'undefined') return modal
+  return createPortal(modal, document.body)
+}
+
+const SparkleIcon = ({ size, className }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    className={className}
+  >
+    <path d="M12 3c1.912 4.97 5.03 8.088 10 10-4.97 1.912-8.088 5.03-10 10-1.912-4.97-5.03-8.088-10-10 4.97-1.912 8.088-5.03 10-10Z" />
+    <path d="M5 3a2 2 0 0 0 2 2" />
+    <path d="M19 3a2 2 0 0 1 2 2" />
+    <path d="M5 21a2 2 0 0 1 2-2" />
+    <path d="M19 21a2 2 0 0 0 2-2" />
+  </svg>
+)
+
+export default AIComparisonModal

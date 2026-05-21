@@ -1,0 +1,74 @@
+🔷 SOP-IT-003 – Notfallzugriff (Break-Glass-Verfahren)
+Version: 1.4 | Status: Effective | Department: IT/QA/Produktion
+
+1. Zweck
+
+Ermöglichung von Zugriffen auf OT-Systeme in kritischen Produktionsstillständen, wenn reguläre Zugänge nicht verfügbar sind.
+
+🔴 DEVIATIONS (zugehörig zu SOP-IT-003)
+DEV-IT-021 – Break-Glass ohne Dokumentation
+Datum: 2024-06-18 | Status: Closed
+Beschreibung: Notfallzugriff am 2024-06-15 nicht dokumentiert
+Ursache: Vergessen durch Produktionsleiter
+
+DEV-IT-022 – Notfall-Token Umschlag beschädigt
+Datum: 2024-07-25 | Status: Open
+Beschreibung: Umschlag im Tresor bereits geöffnet vorgefunden
+Ursache: Unbekannt – Untersuchung läuft
+
+DEV-IT-023 – Break-Glass für nicht-kritischen Fall
+Datum: 2024-08-05 | Status: Closed
+Beschreibung: Produktionsleiter nutzte Notfallzugriff für Routinewartung
+Ursache: Fehlinterpretation der Regeln
+
+DEV-IT-024 – Keine neuen Token nach Break-Glass
+Datum: 2024-09-12 | Status: Open
+Beschreibung: Nach Notfallzugriff am 2024-09-10 keine neuen Token erstellt
+Ursache: Kein automatischer Workflow
+
+DEV-IT-025 – Zwei-Umschläge-Prinzip umgangen
+Datum: 2024-10-20 | Status: Closed
+Beschreibung: Produktionsleiter nutzte beide Token allein
+Ursache: Zweiter Umschlag nicht im Tresor
+
+🟠 CAPAs (zugehörig zu SOP-IT-003)
+CAPA-IT-021 – Automatisches Ticket nach Break-Glass
+Linked DEV: DEV-IT-021 | Status: Effective | Fällig: 2024-07-31
+Aktion: Nach Notfallzugriff wird automatisch QMS-Ticket erstellt, Frist 24h
+Verantwortlich: IT
+
+CAPA-IT-022 – Physische Sicherheit der Umschläge
+Linked DEV: DEV-IT-022 | Status: Open | Fällig: 2024-08-31
+Aktion: Neue versiegelte Umschläge mit fortlaufender Nummer, wöchentliche Sichtkontrolle
+Verantwortlich: QA
+
+CAPA-IT-023 – Definition "kritischer Fall"
+Linked DEV: DEV-IT-023 | Status: Effective | Fällig: 2024-09-15
+Aktion: SOP-IT-003 überarbeitet, Beispielliste für Break-Glass-Fälle
+Verantwortlich: QA
+
+CAPA-IT-024 – Automatische Token-Nachbestellung
+Linked DEV: DEV-IT-024 | Status: Open | Fällig: 2024-10-31
+Aktion: Workflow: Nach Break-Glass automatische Bestellung neuer Token bei IT
+Verantwortlich: IT
+
+CAPA-IT-025 – Trennung der Umschläge
+Linked DEV: DEV-IT-025 | Status: Implemented | Fällig: 2024-11-15
+Aktion: Zweiter Umschlag in Safe der QA (getrennter Ort), Protokoll
+Verantwortlich: QA
+
+🔵 AUDIT FINDINGS (zugehörig zu SOP-IT-003)
+AUD-IT-013 – EMA Inspektion 2024-09-25
+Finding: Break-Glass ohne Dokumentation
+Linked CAPA: CAPA-IT-021 | Schweregrad: Major | Ergebnis: Accepted
+
+AUD-IT-014 – FDA Inspektion 2024-10-30
+Finding: Notfall-Token Umschlag beschädigt
+Linked CAPA: CAPA-IT-022 | Schweregrad: Minor | Ergebnis: Open
+
+⚫ DECISIONS (zugehörig zu SOP-IT-003)
+DEC-IT-010 – Notfall-Token Verfahren überarbeitet (2024-09-20)
+Verknüpfungen: DEV-IT-022, CAPA-IT-022
+Entscheidung: Neue Token mit Siegeln, wöchentliche Kontrolle durch QA
+Risiko: Niedrig
+Begründung: Umschlag beschädigt = potenzieller Missbrauch

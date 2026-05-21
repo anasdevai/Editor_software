@@ -1,0 +1,147 @@
+name: cybrain-qs
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: cybrain_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-admin123}
+      POSTGRES_DB: ${POSTGRES_DB:-editor_db}
+    expose:
+      - "5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - cybrain
+
+  qdrant:
+    image: qdrant/qdrant:v1.12.4
+    container_name: cybrain_qdrant
+    restart: unless-stopped
+    expose:
+      - "6333"
+      - "6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    environment:
+      QDRANT__SERVICE__GRPC_PORT: "6334"
+    networks:
+      - cybrain
+
+  backend:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: cybrain_backend
+    restart: unless-stopped
+    ports:
+      - "${BACKEND_HOST_PORT:-8001}:8001"
+    expose:
+      - "8001"
+    depends_on:
+      db:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    env_file:
+      - ./backend/.env
+    environment:
+      IS_DOCKER: "true"
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-admin123}
+      POSTGRES_DB: ${POSTGRES_DB:-editor_db}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-admin123}@db:5432/${POSTGRES_DB:-editor_db}
+      DATABASE_URL_DOCKER: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-admin123}@db:5432/${POSTGRES_DB:-editor_db}
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      # In-container API + webhook URLs (override host-only 127.0.0.1 values from backend/.env)
+      API_BASE_URL: http://backend:8001
+      WEBHOOK_ENDPOINT_SOPS: http://backend:8001/api/public/sops/full?status=all&page=1&page_size=50
+      WEBHOOK_ENDPOINT_DEVIATIONS: http://backend:8001/api/deviations
+      WEBHOOK_ENDPOINT_CAPAS: http://backend:8001/api/capas
+      WEBHOOK_ENDPOINT_DECISIONS: http://backend:8001/api/decisions
+      WEBHOOK_ENDPOINT_AUDITS: http://backend:8001/api/audits
+      HF_HOME: /app/.hf-cache
+      HUGGINGFACE_HUB_CACHE: /app/.hf-cache/hub
+      EMBEDDING_HF_CACHE_DIR: /app/.hf-cache
+      TESSERACT_CMD: /usr/bin/tesseract
+      POPPLER_PATH: ""
+    command: >
+      sh -c "uvicorn app.main:app --host 0.0.0.0 --port 8001 --workers 1"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8001/api/health >/dev/null || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 8
+      start_period: 120s
+    networks:
+      - cybrain
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: cybrain_frontend
+    restart: unless-stopped
+    ports:
+      - "80:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - cybrain
+
+  embedding-worker:
+    profiles: ["with-embedding-worker"]
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: cybrain_embedding_worker
+    restart: unless-stopped
+    env_file:
+      - ./backend/.env
+    environment:
+      IS_DOCKER: "true"
+      POSTGRES_HOST: db
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-admin123}
+      POSTGRES_DB: ${POSTGRES_DB:-editor_db}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-admin123}@db:5432/${POSTGRES_DB:-editor_db}
+      DATABASE_URL_DOCKER: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-admin123}@db:5432/${POSTGRES_DB:-editor_db}
+      QDRANT_URL: ${QDRANT_URL:-http://qdrant:6333}
+      QDRANT_API_KEY: ${QDRANT_API_KEY:-}
+      API_BASE_URL: http://backend:8001
+      WEBHOOK_ENDPOINT_SOPS: http://backend:8001/api/public/sops/full?status=all&page=1&page_size=50
+      WEBHOOK_ENDPOINT_DEVIATIONS: http://backend:8001/api/deviations
+      WEBHOOK_ENDPOINT_CAPAS: http://backend:8001/api/capas
+      WEBHOOK_ENDPOINT_DECISIONS: http://backend:8001/api/decisions
+      WEBHOOK_ENDPOINT_AUDITS: http://backend:8001/api/audits
+      HF_HOME: /app/.hf-cache
+      HUGGINGFACE_HUB_CACHE: /app/.hf-cache/hub
+      EMBEDDING_HF_CACHE_DIR: /app/.hf-cache
+    command: ["python", "run_embedding_worker.py"]
+    depends_on:
+      db:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+    networks:
+      - cybrain
+
+networks:
+  cybrain:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  qdrant_data:

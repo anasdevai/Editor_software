@@ -1,0 +1,95 @@
+# --- Dependencies & Build ---
+node_modules/
+node_modules_REDUNDANT/
+dist/
+dist-ssr/
+venv/
+.venv/
+**/venv/
+**/__pycache__/
+
+# --- Environment & Secrets ---
+.env
+*.local
+
+# --- Editor & IDE ---
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.DS_Store
+
+# --- Tooling & Cache ---
+.hf-cache/
+.kombai/
+.cursor/
+.claude/
+# Note: Do NOT ignore .git itself; git handles this automatically.
+
+# --- Project Specific Large Files ---
+*.rar
+*.zip
+*.7z
+Full-project-cybrian-qs.rar
+
+# --- Temp & Logs ---
+logs/
+**/logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+backend_start.log
+scratch/
+archive-unused/
+review-needed/
+tmp/
+temp/
+*.tmp
+*.temp
+
+# --- Tests (do not commit) ---
+tests/
+**/tests/
+test/
+**/test/
+__tests__/
+**/__tests__/
+test_*.py
+*_test.py
+*_tests.py
+*.spec.js
+*.spec.jsx
+*.spec.ts
+*.spec.tsx
+*.test.js
+*.test.jsx
+*.test.ts
+*.test.tsx
+pytest.ini
+.pytest_cache/
+**/.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage/
+**/coverage/
+**/test-results/
+**/test_reports/
+**/tests/reports/
+**/_debug*.txt
+**/tests/_debug*
+**/drop_test_sop.py
+**/scripts/drop_test_sop.py
+junit.xml
+pytest-report.xml
+
+# --- Python Compiled Files ---
+*.py[cod]
+*$py.class

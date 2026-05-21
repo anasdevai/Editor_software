@@ -1,0 +1,158 @@
+🔷 SOP-IT-002 – Netzwerksicherheit & Firewall (OT/IT-Trennung)
+Version: 2.2 | Status: Effective | Department: IT/OT
+
+1. Zweck
+
+Schutz des Produktionsnetzwerks vor unbefugten Zugriffen aus dem Büronetzwerk und dem Internet.
+
+🔴 DEVIATIONS (zugehörig zu SOP-IT-002)
+DEV-IT-011 – Firewall-Regel zu permissiv
+Datum: 2024-05-22 | Status: Closed
+Beschreibung: IT→OT auf Port 22 (SSH) für alle IT-Mitarbeiter, nicht nur Admins
+Ursache: Fehlerhafte Regel bei Einrichtung
+
+DEV-IT-012 – Keine Segmentierung Fermentation/Abfüllung
+Datum: 2024-06-30 | Status: Closed
+Beschreibung: Fermenter konnte direkt auf Abfüllmaschine zugreifen
+Ursache: Netzwerkplan falsch umgesetzt
+
+DEV-IT-013 – WLAN in Produktion unverschlüsselt
+Datum: 2024-07-08 | Status: Closed
+Beschreibung: WLAN-SSID "Production_Floor" ohne WPA2
+Ursache: Vergessen bei Einrichtung
+
+DEV-IT-014 – Kein Alarm bei Zugriff außerhalb Arbeitszeit
+Datum: 2024-08-20 | Status: Open
+Beschreibung: Zugriff um 23:15 Uhr (Dienstleister) – kein Alarm ausgelöst
+Ursache: SIEM-Regel fehlte
+
+DEV-IT-015 – Penetrationstest nicht durchgeführt
+Datum: 2024-09-01 | Status: Open
+Beschreibung: Halbjährlicher Penetrationstest Q2/2024 fehlt
+Ursache: Ressourcenmangel IT-Sicherheit
+
+DEV-IT-016 – Unbekanntes Gerät im OT-Netz
+Datum: 2024-10-15 | Status: In Review
+Beschreibung: IP 10.12.47.99 (nicht inventarisiert) für 2 Tage aktiv
+Ursache: Gast-Laptop eines Dienstleisters nicht autorisiert
+
+DEV-IT-017 – DNS-Exfiltration möglich
+Datum: 2024-03-01 | Status: Closed
+Beschreibung: OT→IT auf Port 53 ohne Einschränkung
+Ursache: Zu permissive Firewall-Regel
+
+DEV-IT-018 – Switch ohne Authentifizierung
+Datum: 2024-11-10 | Status: Open
+Beschreibung: Switch in Fermentation (Cisco) mit Standard-Passwort
+Ursache: Kein initiales Hardening
+
+DEV-IT-019 – VLAN nicht korrekt getrennt
+Datum: 2024-04-12 | Status: Closed
+Beschreibung: VLAN 10 (Fermentation) und VLAN 20 (Abfüllung) routbar
+Ursache: Fehlerhafte Switch-Konfiguration
+
+DEV-IT-020 – Remote-Zugriff ohne VPN
+Datum: 2024-12-01 | Status: In Review
+Beschreibung: Dienstleister nutzte TeamViewer statt VPN
+Ursache: Nicht autorisierte Software installiert
+
+🟠 CAPAs (zugehörig zu SOP-IT-002)
+CAPA-IT-011 – Firewall-Regel-Review
+Linked DEV: DEV-IT-011 | Status: Effective | Fällig: 2024-06-15
+Aktion: Vollständiger Review aller Firewall-Regeln, Least-Privilege-Prinzip
+Verantwortlich: IT-Sicherheit
+
+CAPA-IT-012 – Segmentierung nach IEC 62443
+Linked DEV: DEV-IT-012 | Status: Effective | Fällig: 2024-07-31
+Aktion: Netzwerkplan neu erstellt, VLANs strikt getrennt, ACLs implementiert
+Verantwortlich: IT
+
+CAPA-IT-013 – WPA3 für Produktions-WLAN
+Linked DEV: DEV-IT-013 | Status: Effective | Fällig: 2024-08-15
+Aktion: Upgrade auf WPA3-Enterprise, separate SSID mit 802.1X
+Verantwortlich: IT
+
+CAPA-IT-014 – SIEM-Regeln für Arbeitszeitüberschreitung
+Linked DEV: DEV-IT-014 | Status: Open | Fällig: 2024-10-31
+Aktion: Neue Alarme: Zugriff 20:00–06:00, Wochenende, Feiertage
+Verantwortlich: IT-Sicherheit
+
+CAPA-IT-015 – Penetrationstest extern beauftragt
+Linked DEV: DEV-IT-015 | Status: Open | Fällig: 2025-03-31
+Aktion: Auftrag an externe Firma (SEC Consult) für Q1/2025
+Verantwortlich: IT-Leiter
+
+CAPA-IT-016 – Inventarisierung aller OT-Geräte
+Linked DEV: DEV-IT-016 | Status: In Progress | Fällig: 2024-12-15
+Aktion: Asset-Management-System (Device42) für OT, wöchentlicher Abgleich
+Verantwortlich: IT
+
+CAPA-IT-017 – DNS-Filterung
+Linked DEV: DEV-IT-017 | Status: Effective | Fällig: 2024-04-15
+Aktion: OT→IT DNS nur für erlaubte Domains, Rest blockiert
+Verantwortlich: IT
+
+CAPA-IT-018 – Switch-Hardening
+Linked DEV: DEV-IT-018 | Status: Open | Fällig: 2024-12-31
+Aktion: Alle Switches: Passwort ändern, SNMPv3, SSH statt Telnet, AAA
+Verantwortlich: IT
+
+CAPA-IT-019 – VLAN-Routing überprüfen
+Linked DEV: DEV-IT-019 | Status: Effective | Fällig: 2024-05-15
+Aktion: Routing zwischen VLANs deaktiviert, nur definierte Gateways
+Verantwortlich: IT
+
+CAPA-IT-020 – Verbot nicht-autorisierter Remote-Tools
+Linked DEV: DEV-IT-020 | Status: In Progress | Fällig: 2025-01-31
+Aktion: AppLocker-Regeln: TeamViewer, AnyDesk blockiert; nur VPN erlaubt
+Verantwortlich: IT
+
+🔵 AUDIT FINDINGS (zugehörig zu SOP-IT-002)
+AUD-IT-007 – Internes Audit Q4 2024-10-01
+Finding: Firewall-Regeln zu permissiv (SSH für alle IT)
+Linked CAPA: CAPA-IT-011 | Schweregrad: Major | Ergebnis: Accepted
+
+AUD-IT-008 – EMA Inspektion 2024-11-05
+Finding: Keine Segmentierung Fermentation/Abfüllung
+Linked CAPA: CAPA-IT-012 | Schweregrad: Critical | Ergebnis: Accepted
+
+AUD-IT-009 – FDA Inspektion 2024-12-01
+Finding: WLAN in Produktion unverschlüsselt
+Linked CAPA: CAPA-IT-013 | Schweregrad: Major | Ergebnis: Accepted
+
+AUD-IT-010 – Internes Audit Q1 2025-01-10
+Finding: Kein Alarm bei Zugriff außerhalb Arbeitszeit
+Linked CAPA: CAPA-IT-014 | Schweregrad: Minor | Ergebnis: Open
+
+AUD-IT-011 – Zertifizierungsaudit (ISO 27001) 2024-08-20
+Finding: Penetrationstest nicht durchgeführt
+Linked CAPA: CAPA-IT-015 | Schweregrad: Major | Ergebnis: Open
+
+AUD-IT-012 – Internes Audit Q2 2024-06-15
+Finding: Unbekanntes Gerät im OT-Netz
+Linked CAPA: CAPA-IT-016 | Schweregrad: Major | Ergebnis: In Progress
+
+⚫ DECISIONS (zugehörig zu SOP-IT-002)
+DEC-IT-006 – Firewall-Komplett-Review (2024-06-16)
+Verknüpfungen: DEV-IT-011, CAPA-IT-011
+Entscheidung: Externer Dienstleister (IT-Security Consulting) beauftragt für Firewall-Review
+Risiko: Mittel
+Begründung: Interne Ressourcen nicht ausreichend
+
+DEC-IT-007 – Investition in SIEM (2024-10-15)
+Verknüpfungen: DEV-IT-014, CAPA-IT-014
+Entscheidung: 50.000 € Budget für SIEM-Upgrade (Splunk) freigegeben
+Risiko: Mittel
+Begründung: Bessere Alarmierung und Forensik
+
+DEC-IT-008 – Externer Penetrationstest (2024-08-25)
+Verknüpfungen: DEV-IT-015, CAPA-IT-015
+Entscheidung: 30.000 € Budget für externen Penetrationstest Q1/2025
+Risiko: Mittel
+Begründung: Interne Tests nicht ausreichend für FDA
+
+DEC-IT-009 – WPA3-Rollout beschleunigt (2024-12-01)
+Verknüpfungen: DEV-IT-013, CAPA-IT-013
+Entscheidung: WPA3 bis Ende Dezember auf allen Produktions-WLANs
+Risiko: Mittel
+Begründung: FDA-Finding erfordert schnelle Umsetzung

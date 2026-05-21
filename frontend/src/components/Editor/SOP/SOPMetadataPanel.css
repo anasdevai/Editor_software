@@ -1,0 +1,228 @@
+.sop-panel-card {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: #ffffff;
+  box-shadow: 0 4px 10px rgba(15, 23, 42, 0.04);
+  padding: 16px;
+  color: var(--text-main);
+  display: flex;
+  flex-direction: column;
+  overflow: visible;
+}
+
+.sop-panel-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 16px;
+  color: #1a1f2b;
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.sop-panel-title svg {
+  color: var(--success);
+  flex: 0 0 auto;
+}
+
+.sop-metadata-sections {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.sop-metadata-section {
+  min-width: 0;
+}
+
+.sop-metadata-section-title {
+  margin: 0 0 10px;
+  color: #7a8698;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  line-height: 1.1;
+  text-transform: uppercase;
+}
+
+.sop-metadata-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 12px;
+  min-width: 0;
+}
+
+.sop-field-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.sop-field-label {
+  color: #586273;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.25;
+}
+
+.sop-input,
+.sop-textarea {
+  width: 100%;
+  min-width: 0;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: #ffffff;
+  color: #233044;
+  outline: none;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
+}
+
+.sop-input {
+  height: 40px;
+  padding: 0 12px;
+  line-height: 40px;
+}
+
+.sop-textarea {
+  min-height: 104px;
+  padding: 12px;
+  line-height: 1.45;
+  resize: vertical;
+}
+
+.sop-input::placeholder,
+.sop-textarea::placeholder {
+  color: #98a2b3;
+}
+
+.sop-input:focus,
+.sop-textarea:focus {
+  border-color: #98b0a3;
+  background: #ffffff;
+  box-shadow: 0 0 0 4px rgba(11, 107, 67, 0.08);
+}
+
+.sop-input:disabled,
+.sop-textarea:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+  background: #f6f8fa;
+}
+
+.sop-input[type="date"] {
+  color-scheme: light;
+}
+
+.sop-field-title,
+.sop-field-regulatoryReferences {
+  grid-column: 1 / -1;
+}
+
+.error-text {
+  margin: 0;
+  color: var(--danger);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.figma-sidebar .sidebar-card {
+  border-color: var(--border);
+  background: #ffffff;
+  box-shadow: 0 4px 10px rgba(15, 23, 42, 0.04);
+  color: var(--text-main);
+}
+
+.figma-sidebar .sop-panel-card {
+  overflow: visible;
+}
+
+.figma-sidebar .sidebar-section-kicker {
+  color: #7a8698;
+}
+
+.figma-sidebar .sidebar-title {
+  color: #253041;
+}
+
+.figma-sidebar .sidebar-empty-text,
+.figma-sidebar .status-note {
+  color: #586273;
+}
+
+.figma-sidebar .sidebar-input,
+.figma-sidebar .sidebar-textarea {
+  border-color: var(--border);
+  background: #ffffff;
+  color: #233044;
+}
+
+.figma-sidebar .sidebar-input:focus,
+.figma-sidebar .sidebar-textarea:focus {
+  border-color: #98b0a3;
+  box-shadow: 0 0 0 4px rgba(11, 107, 67, 0.08);
+}
+
+.figma-sidebar .reference-row,
+.figma-sidebar .lifecycle-pill,
+.figma-sidebar .audit-item {
+  border-color: var(--border);
+  background: #f9fcfb;
+  color: #374151;
+}
+
+.figma-sidebar .lifecycle-pill.active {
+  border-color: rgba(11, 107, 67, 0.22);
+  background: #eaf6ef;
+  color: var(--success-dark);
+}
+
+.figma-sidebar .sidebar-mini-btn.success,
+.figma-sidebar .sidebar-primary-btn {
+  border: none;
+  background: var(--success);
+  color: #ffffff;
+  box-shadow: none;
+}
+
+.figma-sidebar .sidebar-mini-btn.success:hover,
+.figma-sidebar .sidebar-primary-btn:hover {
+  background: var(--success-dark);
+}
+
+@media (min-width: 1360px) {
+  .sop-metadata-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* Embedded same-screen editor: keep metadata body expanded and visible. */
+.figma-editor-page.editor-embedded .figma-sidebar .sop-panel-card > .sop-metadata-sections {
+  display: flex !important;
+  flex-direction: column !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+  height: auto !important;
+  max-height: none !important;
+  overflow: visible !important;
+}
+
+.figma-editor-page.editor-embedded .figma-sidebar .sop-panel-card .sop-metadata-section {
+  display: block !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+  height: auto !important;
+  max-height: none !important;
+}
+
+.figma-editor-page.editor-embedded .figma-sidebar .sop-panel-card .sop-field-group {
+  display: flex !important;
+  visibility: visible !important;
+  opacity: 1 !important;
+  height: auto !important;
+  max-height: none !important;
+}
