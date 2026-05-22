@@ -758,16 +758,45 @@ const EditorPage = ({
     [persistDocument]
   )
 
-  const handleAfterAiBridgeApply = useCallback(() => {
+  const handleAfterAiBridgeApply = useCallback((detail = {}) => {
     try {
       debouncedSave.flush()
     } catch {
       // ignore
     }
+    const suggestionId = String(detail?.suggestion_id || '').trim()
+    if (suggestionId && documentId && editor && isEditorMounted && !editor.isDestroyed) {
+      createVersion(documentId, {
+        doc_json: editor.getJSON(),
+        metadata_json: {
+          sopStatus: SOP_STATES.DRAFT,
+          sopMetadata: metadata,
+          auditTrail,
+          versionNote,
+        },
+        status: SOP_STATES.DRAFT,
+        suggestion_id: suggestionId,
+        change_justification: `Accepted ${detail?.action || 'AI'} suggestion from editor`,
+      })
+        .then(async (result) => {
+          if (result?.id) {
+            setCurrentVersionId(result.id)
+            setLatestVersionId(result.id)
+            await hydrateFromDocument(documentId)
+          }
+        })
+        .catch((err) => {
+          console.error('[kl-editor-action] create version after AI apply', err)
+          persistDocument({ showSavingIndicator: false }).catch((saveErr) => {
+            console.error('[kl-editor-action] persist after AI apply fallback', saveErr)
+          })
+        })
+      return
+    }
     persistDocument({ showSavingIndicator: false }).catch((err) => {
       console.error('[kl-editor-action] persist after AI apply', err)
     })
-  }, [debouncedSave, persistDocument])
+  }, [auditTrail, debouncedSave, documentId, editor, hydrateFromDocument, isEditorMounted, metadata, persistDocument, versionNote])
 
   useEffect(() => {
     if (!editor || !isEditorMounted || editor.isDestroyed) return

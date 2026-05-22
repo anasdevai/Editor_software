@@ -33,6 +33,7 @@ class ActionRequest(BaseModel):
     section_type: str = "Selected Text"
     section_text: str
     sop_entity_id: str | None = None
+    instruction: str | None = None
     # section_only = rewrite/improve only TEXT; full_document = entire SOP in TEXT
     edit_scope: Literal["section_only", "full_document"] | None = None
 

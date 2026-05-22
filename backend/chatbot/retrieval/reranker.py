@@ -43,16 +43,12 @@ class CrossEncoderReranker:
         if is_cached:
             print(f"[hf-cache] Cross-encoder loading from local cache: {cache_dir}", flush=True)
         else:
-            # Never attempt startup network calls in reranker path; caller can
-            # safely continue with a no-reranker fallback.
-            raise RuntimeError(
-                f"Reranker cache missing for {model_name} at {cache_dir}"
-            )
+            print(f"[hf-cache] Cross-encoder cache miss, attempting download into: {cache_dir}", flush=True)
         self.model = CrossEncoder(
             model_name,
             max_length=512,
             cache_folder=cache_dir,
-            local_files_only=True,
+            local_files_only=is_cached,
         )
         self.top_n = top_n
 

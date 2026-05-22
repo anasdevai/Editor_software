@@ -50,7 +50,14 @@ export function queryEditorHasNonEmptySelection(timeoutMs = 150) {
   })
 }
 
-export function requestEditorSnapshot({ prompt = '', sectionHint = '', targetScope = '' } = {}) {
+export function requestEditorSnapshot({
+  prompt = '',
+  userPrompt = '',
+  sectionHint = '',
+  targetScope = '',
+  lineNumber = null,
+  recordId = '',
+} = {}) {
   if (typeof window === 'undefined') {
     return Promise.reject(new Error('Editor snapshot is only available in the browser.'))
   }
@@ -81,8 +88,11 @@ export function requestEditorSnapshot({ prompt = '', sectionHint = '', targetSco
         detail: {
           requestId,
           prompt: String(prompt || ''),
+          userPrompt: String(userPrompt || '').trim(),
           sectionHint: String(sectionHint || '').trim(),
           targetScope: String(targetScope || '').trim().toLowerCase(),
+          lineNumber: lineNumber ?? null,
+          recordId: String(recordId || '').trim(),
         },
       }),
     )
@@ -116,15 +126,28 @@ export function applyEditorInlineSuggestion(requestId) {
   )
 }
 
-export function dispatchActionsTabRun({ action, prompt = '', sectionHint = '', targetScope = '' } = {}) {
+export function dispatchActionsTabRun({
+  action,
+  prompt = '',
+  userPrompt = '',
+  sectionHint = '',
+  targetScope = '',
+  lineNumber = null,
+  recordId = null,
+  sourceContentOverride = null,
+} = {}) {
   if (typeof window === 'undefined') return
   window.dispatchEvent(
     new CustomEvent(ACTIONS_TAB_RUN_EVENT, {
       detail: {
         action,
         prompt,
-        sectionHint: String(sectionHint || '').trim(),
+        userPrompt: String(userPrompt || '').trim(),
+        sectionHint: String(sectionHint || recordId || '').trim(),
         targetScope: String(targetScope || '').trim().toLowerCase(),
+        lineNumber: lineNumber ?? null,
+        recordId: recordId ? String(recordId).trim() : '',
+        sourceContentOverride: sourceContentOverride || null,
       },
     }),
   )

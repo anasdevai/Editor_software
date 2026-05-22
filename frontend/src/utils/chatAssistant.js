@@ -206,7 +206,7 @@ export function toHtml(text) {
 
   const sectionHeading = (line) =>
     /^(summary|details|status|cross-refs|cross refs|sources|references)\s*:/i.test(line)
-  const bulletLine = (line) => /^[-*•]\s+/.test(line) || /^\d+[\.\)]\s+/.test(line)
+  const bulletLine = (line) => /^[-*•]\s+/.test(line) || /^\d+[.)]\s+/.test(line)
 
   const parts = []
   let i = 0
@@ -223,7 +223,7 @@ export function toHtml(text) {
       let j = i + 1
       while (j < lines.length && !sectionHeading(lines[j])) {
         const row = lines[j]
-        if (bulletLine(row)) bullets.push(row.replace(/^([-*•]|\d+[\.\)])\s+/, '').trim())
+        if (bulletLine(row)) bullets.push(row.replace(/^([-*•]|\d+[.)])\s+/, '').trim())
         else paras.push(row)
         j += 1
       }
@@ -241,7 +241,7 @@ export function toHtml(text) {
       const bullets = []
       let j = i
       while (j < lines.length && bulletLine(lines[j])) {
-        bullets.push(lines[j].replace(/^([-*•]|\d+[\.\)])\s+/, '').trim())
+        bullets.push(lines[j].replace(/^([-*•]|\d+[.)])\s+/, '').trim())
         j += 1
       }
       parts.push(`<ul>${bullets.map((b) => `<li>${b}</li>`).join('')}</ul>`)
@@ -261,6 +261,73 @@ export function stripHtml(html) {
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<[^>]+>/g, '')
     .trim()
+}
+
+function normalizeHistoryRows(chatHistory = []) {
+  if (!Array.isArray(chatHistory)) return []
+  return chatHistory
+    .slice(-16)
+    .map((row) => ({
+      role: row?.role === 'assistant' || row?.role === 'ai' ? 'assistant' : 'user',
+      content: sanitizeAnswerForDisplay(String(row?.content || row?.text || '').slice(0, 2400)),
+    }))
+    .filter((row) => row.content)
+}
+
+function buildEditorContextContract({
+  sessionId,
+  visibleQuestion,
+  assistantContext,
+  chatHistory,
+}) {
+  const current = assistantContext?.current_sop || {}
+  const selected = assistantContext?.selected_section || {}
+  const last = assistantContext?.last_action || null
+  const focus = assistantContext?.last_focus || null
+  return {
+    session_id: sessionId || null,
+    user_message: visibleQuestion,
+    sop_context: {
+      sop_id: current.id || assistantContext?.active_sop_id || null,
+      title: current.title || '',
+      version: current.version || '',
+      owner: current.owner || '',
+      status: current.status || '',
+      created_at: current.created_at || null,
+      updated_at: current.updated_at || assistantContext?.context_updated_at || null,
+      tags: Array.isArray(current.tags) ? current.tags : [],
+      sections: Array.isArray(current.sections) ? current.sections : [],
+      full_text: current.full_text || assistantContext?.editor_excerpt || '',
+      word_count: current.word_count || 0,
+      compliance_standards: Array.isArray(current.compliance_standards) ? current.compliance_standards : [],
+    },
+    selected_section: {
+      id: selected.id || null,
+      label: selected.label || selected.name || null,
+      content: selected.content || selected.text_excerpt || null,
+    },
+    conversation_history: normalizeHistoryRows(chatHistory),
+    last_affected_scope: last
+      ? {
+          level: last.target_scope === 'full_document' ? 'full' : (last.target_scope || null),
+          target_id: last.sop_id || null,
+          target_label: last.section_name || last.sop_title || null,
+          line_number: null,
+        }
+      : focus
+        ? {
+            level: focus.target_scope === 'full_document' ? 'full' : (focus.target_scope || null),
+            target_id: focus.sop_id || null,
+            target_label: focus.section_name || focus.sop_title || null,
+            line_number: null,
+          }
+      : {
+          level: null,
+          target_id: null,
+          target_label: null,
+          line_number: null,
+        },
+  }
 }
 
 function matchRouteConfig(pathname = '/') {
@@ -296,6 +363,12 @@ export async function runUnifiedAssistantQuery({
   const routeMeta = matchRouteConfig(pathname)
   const visibleQuestion = String(question || '').trim()
   const assistantContext = getKLAssistantContext(pathname)
+  const editorContextContract = buildEditorContextContract({
+    sessionId,
+    visibleQuestion,
+    assistantContext,
+    chatHistory,
+  })
   const mode =
     assistantMode === 'query' || assistantMode === 'action'
       ? assistantMode
@@ -305,7 +378,10 @@ export async function runUnifiedAssistantQuery({
   return queryAI(visibleQuestion, {
     chat_history: chatHistory,
     category: routeMeta.category,
-    assistant_context: assistantContext,
+    assistant_context: {
+      ...assistantContext,
+      editor_context_contract: editorContextContract,
+    },
     assistant_action_confirmation: assistantActionConfirmation,
     surface,
     route: pathname,

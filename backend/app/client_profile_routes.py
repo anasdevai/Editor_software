@@ -1,5 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 from uuid import UUID
 from typing import List, Any, Dict
 from pydantic import BaseModel
@@ -151,6 +152,7 @@ def save_profile_version_from_accepted_suggestion(
         "changed_parameters": ["tone", "style", "terminology", "structure_pattern"],
     }
     suggestion.metadata_json = suggestion_meta
+    flag_modified(suggestion, "metadata_json")
 
     sop = db.query(SOP).filter(SOP.id == suggestion.sop_id).first() if suggestion.sop_id else None
     return {

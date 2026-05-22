@@ -749,6 +749,39 @@
   line-height: 1;
 }
 
+.ai-widget-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.ai-new-chat-btn {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid rgba(53, 120, 86, 0.22);
+  border-radius: 6px;
+  background: #ffffff;
+  color: #357856;
+  cursor: pointer;
+  padding: 0;
+  transition: background var(--transition-fast), border-color var(--transition-fast), color var(--transition-fast);
+}
+
+.ai-new-chat-btn:hover {
+  background: #eaf4ee;
+  border-color: rgba(53, 120, 86, 0.38);
+  color: #2d6545;
+}
+
+.ai-new-chat-btn:focus-visible {
+  outline: 2px solid rgba(53, 120, 86, 0.35);
+  outline-offset: 2px;
+}
+
 .ai-aktiv-badge {
   font-family: Inter, sans-serif;
   font-size: 8px;

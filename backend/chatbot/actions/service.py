@@ -77,6 +77,11 @@ class SOPActionService:
         retrieval_query: str | None = None,
     ) -> tuple[list[Document], list[float]]:
         query_text = (retrieval_query or section_text).strip()
+        sop_entity_id = str(getattr(self, "_current_sop_entity_id", "") or "").strip()
+        if sop_entity_id and hasattr(self.runtime.retriever, "metadata_filters"):
+            self.runtime.retriever.metadata_filters = {"allowed_entity_ids": [sop_entity_id]}
+        elif hasattr(self.runtime.retriever, "metadata_filters"):
+            self.runtime.retriever.metadata_filters = None
         raw_docs = self.runtime.retriever.invoke(query_text)
         audit_log.append(
             {
@@ -85,6 +90,7 @@ class SOPActionService:
                 "documents_retrieved": len(raw_docs),
                 "collection": self.runtime.collection_name,
                 "retrieval_query_preview": query_text[:220],
+                "scoped_sop_entity_id": sop_entity_id or None,
             }
         )
         reranked = self.runtime.reranker.rerank_top_n(query_text, raw_docs, 3)
@@ -145,11 +151,15 @@ class SOPActionService:
     ) -> ActionResponseEnvelope:
         audit_log: list[dict[str, Any]] = [{"event": "action_started", "timestamp": utc_now_iso(), "action": action_type}]
         retrieval_query = self._build_gap_check_retrieval_query(request) if action_type == "gap_check" else request.section_text
-        chunks, query_vector = self._retrieve_context(
-            request.section_text,
-            audit_log,
-            retrieval_query=retrieval_query,
-        )
+        self._current_sop_entity_id = str(getattr(request, "sop_entity_id", "") or "").strip() if action_type == "gap_check" else ""
+        try:
+            chunks, query_vector = self._retrieve_context(
+                request.section_text,
+                audit_log,
+                retrieval_query=retrieval_query,
+            )
+        finally:
+            self._current_sop_entity_id = ""
         related_documents = extract_source_titles(chunks)
         context = format_chunks(chunks)
         prompt = prompt_builder(request, context)

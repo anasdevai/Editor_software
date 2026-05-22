@@ -102,12 +102,25 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
     const instruction = String(instructionText || '').trim()
     const snapshot = await requestEditorSnapshot({
       prompt: instruction,
+      userPrompt: targetOptions.userPrompt || '',
       sectionHint: targetOptions.sectionHint || '',
       targetScope: targetOptions.targetScope || '',
+      lineNumber: targetOptions.lineNumber ?? null,
+      recordId: targetOptions.recordId || '',
     })
-    const target = snapshot.target
+    let target = snapshot.target
     if (target?.from == null || target?.to == null || !target?.text) {
       throw new Error(snapshot.error || 'Could not find that heading or paragraph in the open SOP.')
+    }
+
+    const override = targetOptions.sourceContentOverride
+    if (override?.enabled && override?.content) {
+      target = {
+        ...target,
+        text: String(override.content).trim(),
+        sectionName: target.sectionName || targetOptions.sectionHint || 'Refined section',
+        sectionType: 'Section',
+      }
     }
 
     if (selectionLooksLikeFormattedAiReport(target.text)) {
@@ -133,6 +146,7 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
       action,
       text: target.text,
       document_id: documentId,
+      instruction,
       section_id: `${target.from}-${target.to}`,
       sop_title: snapshot.sopTitle || 'Untitled SOP',
       section_name: target.sectionName || 'Selected text',
@@ -149,7 +163,8 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
             instruction,
           }),
       sop_entity_id: documentId,
-      triggered_by: AI_ACTION_TRIGGERED_BY.EDITOR_BUBBLE,
+      triggered_by: AI_ACTION_TRIGGERED_BY.KL_ASSISTANT,
+      learn_to_profile: /\b(?:learn|save|update)\b[\s\S]*\b(?:profile|style)\b/i.test(instruction),
     })
 
     const normalized = normalizeAiActionResult(action, result)
@@ -275,7 +290,16 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
   )
 
   useEffect(() => {
-    const unsubscribe = subscribeActionsTabRun(({ action, prompt: runPrompt, sectionHint, targetScope }) => {
+    const unsubscribe = subscribeActionsTabRun(({
+      action,
+      prompt: runPrompt,
+      userPrompt,
+      sectionHint,
+      targetScope,
+      lineNumber,
+      recordId,
+      sourceContentOverride,
+    }) => {
       const normalizedAction =
         action === 'gap_check'
           ? 'gap_check'
@@ -285,8 +309,12 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
               ? 'summarize'
               : 'rewrite'
       runActionWithTarget(normalizedAction, runPrompt || '', {
-        sectionHint: sectionHint || '',
+        userPrompt: userPrompt || '',
+        sectionHint: sectionHint || recordId || '',
         targetScope: targetScope || '',
+        lineNumber: lineNumber ?? null,
+        recordId: recordId || '',
+        sourceContentOverride: sourceContentOverride || null,
       })
     })
     return unsubscribe

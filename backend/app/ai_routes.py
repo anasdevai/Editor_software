@@ -1462,6 +1462,7 @@ def _build_action_request(payload: AIActionRequest) -> ActionRequest:
         section_type=section_type,
         section_text=payload.text,
         sop_entity_id=entity or None,
+        instruction=payload.instruction,
         edit_scope=edit_scope,
     )
 
@@ -1888,12 +1889,20 @@ def _get_nlp_and_profile_context(sop_ctx: dict) -> tuple[dict | None, dict | Non
     profile_md = None
 
     sop_id = sop_ctx.get("sop_id")
+    sop_version_id = sop_ctx.get("version_id") or sop_ctx.get("sop_version_id")
     if sop_id:
         db = SessionLocal()
         try:
-            detected_row = db.query(SOPDetectedParameters).filter(
+            detected_query = db.query(SOPDetectedParameters).filter(
                 SOPDetectedParameters.sop_id == uuid.UUID(str(sop_id))
-            ).first()
+            )
+            if sop_version_id:
+                scoped_row = detected_query.filter(
+                    SOPDetectedParameters.sop_version_id == uuid.UUID(str(sop_version_id))
+                ).order_by(SOPDetectedParameters.created_at.desc()).first()
+            else:
+                scoped_row = None
+            detected_row = scoped_row or detected_query.order_by(SOPDetectedParameters.created_at.desc()).first()
             if detected_row:
                 detected_nlp = {
                     "document_information": detected_row.document_information,
@@ -1914,8 +1923,10 @@ def _get_nlp_and_profile_context(sop_ctx: dict) -> tuple[dict | None, dict | Non
                         ClientProfile.id == profile_id
                     ).first()
                     if profile:
-                        profile_json = profile.active_profile_json
-                        profile_md = profile.active_profile_md
+                        profile_json, profile_md, profile_version, profile_id_str = _load_profile_payload(db, profile)
+                        if isinstance(profile_json, dict):
+                            profile_json["_profile_id"] = profile_id_str
+                            profile_json["_profile_version"] = profile_version
             
             # Fallback to load tenant profile if no profile was loaded yet
             if not profile_json:
@@ -1923,10 +1934,12 @@ def _get_nlp_and_profile_context(sop_ctx: dict) -> tuple[dict | None, dict | Non
                 if sop_row and sop_row.tenant_id:
                     profile = db.query(ClientProfile).filter(
                         ClientProfile.tenant_id == sop_row.tenant_id
-                    ).first()
+                    ).order_by(ClientProfile.updated_at.desc()).first()
                     if profile:
-                        profile_json = profile.active_profile_json
-                        profile_md = profile.active_profile_md
+                        profile_json, profile_md, profile_version, profile_id_str = _load_profile_payload(db, profile)
+                        if isinstance(profile_json, dict):
+                            profile_json["_profile_id"] = profile_id_str
+                            profile_json["_profile_version"] = profile_version
         except Exception as e:
             logger.warning("[ai-routes] Failed to load NLP / ClientProfile context: %s", e)
         finally:
@@ -1979,20 +1992,60 @@ def _normalize_language_code(value: Any) -> str:
     return ""
 
 
+def _levenshtein_distance(left: str, right: str) -> int:
+    a = str(left or "")
+    b = str(right or "")
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    previous = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        current = [i]
+        for j, cb in enumerate(b, start=1):
+            current.append(
+                min(
+                    previous[j] + 1,
+                    current[j - 1] + 1,
+                    previous[j - 1] + (0 if ca == cb else 1),
+                )
+            )
+        previous = current
+    return previous[-1]
+
+
 def _extract_explicit_style_reference(instruction: str | None) -> str | None:
     text = str(instruction or "").strip()
     if not text:
         return None
+    if re.search(r"\bgerman\s+(?:pharma|pharmaceutical)\s+(?:sop\s+)?profile\b", text, re.IGNORECASE):
+        return GERMAN_PROFILE_NAME
     patterns = [
         r'\b(?:in|on|using|use)\s+"([^"]+)"\s+style\b',
         r"\b(?:in|on|using|use)\s+'([^']+)'\s+style\b",
+        r"\b(?:in|on|using|use)\s+([a-z0-9._/-]+(?:\s+[a-z0-9._/-]+){0,4})\s+company\s+style\b",
+        r"\b(?:in|on|using|use)\s+([a-z0-9._/-]+(?:\s+[a-z0-9._/-]+){0,4})\s+profile\s+style\b",
         r"\b(?:in|on|using|use)\s+([a-z0-9._/-]+)\s+style\b",
+        r"\b([a-z0-9._/-]+(?:\s+[a-z0-9._/-]+){0,4})\s+company\s+style\b",
+        r"\b([a-z0-9._/-]+(?:\s+[a-z0-9._/-]+){0,4})\s+profile\s+style\b",
         r"\bstyle\s+of\s+([a-z0-9._/-]+)\b",
     ]
     for pattern in patterns:
         match = re.search(pattern, text, re.IGNORECASE)
         if match:
-            return match.group(1).strip()
+            ref = match.group(1).strip()
+            # Loose "ABC company style" matches can begin earlier in a full instruction.
+            # Keep the actual style reference after the last command/preposition marker.
+            ref = re.sub(
+                r"^(?:rewrite|improve|summarize|shorten|expand|change|update|make|this|the|sop|section|document)\b\s*",
+                "",
+                ref,
+                flags=re.IGNORECASE,
+            ).strip()
+            for marker in (" on ", " in ", " using ", " use "):
+                if marker in f" {ref.lower()} ":
+                    ref = re.split(rf"\b{marker.strip()}\b", ref, flags=re.IGNORECASE)[-1].strip()
+            return ref
     return None
 
 
@@ -2028,21 +2081,17 @@ def _resolve_explicit_style_override(instruction: str | None) -> dict[str, Any] 
             if _style_ref_matches(normalized_ref, candidate_tokens) or (
                 profile_md_token and normalized_ref in profile_md_token
             ):
-                current_version = (
-                    db.query(ProfileVersion).filter(ProfileVersion.id == profile.current_version_id).first()
-                    if profile.current_version_id
-                    else None
-                )
+                profile_json, profile_md, profile_version, profile_id_str = _load_profile_payload(db, profile)
                 return {
                     "matched_type": "profile",
                     "style_reference": ref,
                     "resolved_name": profile.name,
-                    "profile_id": str(profile.id),
-                    "profile_json": profile.active_profile_json,
-                    "profile_md": profile.active_profile_md,
-                    "profile_version": current_version.version_number if current_version else None,
+                    "profile_id": profile_id_str,
+                    "profile_json": profile_json,
+                    "profile_md": profile_md,
+                    "profile_version": profile_version,
                     "detected_nlp": None,
-                    "style_source_text": profile.active_profile_md or "",
+                    "style_source_text": profile_md or "",
                 }
 
         # 2) SOP/source-file match for explicit source SOP style.
@@ -2133,6 +2182,31 @@ def _resolve_explicit_style_override(instruction: str | None) -> dict[str, Any] 
 
 
 GERMAN_PROFILE_NAME = "German_Pharma_SOP_Profile"
+
+
+def _profile_display_name(profile_json: dict | None, fallback: str | None = None) -> str | None:
+    if isinstance(profile_json, dict):
+        for key in ("profile_name", "name", "client_name", "company_name"):
+            value = str(profile_json.get(key) or "").strip()
+            if value:
+                return value
+    return fallback
+
+
+def _load_profile_payload(db: Any, profile: ClientProfile | None) -> tuple[dict | None, str | None, int | None, str | None]:
+    if not profile:
+        return None, None, None, None
+    version = (
+        db.query(ProfileVersion).filter(ProfileVersion.id == profile.current_version_id).first()
+        if profile.current_version_id
+        else None
+    )
+    profile_json = dict(profile.active_profile_json or {}) if isinstance(profile.active_profile_json, dict) else {}
+    if profile.name and not profile_json.get("profile_name"):
+        profile_json["profile_name"] = profile.name
+    if profile.company_name and not profile_json.get("company_name"):
+        profile_json["company_name"] = profile.company_name
+    return profile_json or profile.active_profile_json, profile.active_profile_md, int(version.version_number) if version else None, str(profile.id)
 GERMAN_MODAL_PATTERN = re.compile(r"\b(muss|müssen|sollte|sollten|darf\s+nicht|dürfen\s+nicht)\b", re.IGNORECASE)
 
 
@@ -2157,6 +2231,16 @@ def _is_german_pharma_profile(profile_json: dict | None, profile_md: str | None,
 
 def _has_german_modal_language(text: str) -> bool:
     return bool(GERMAN_MODAL_PATTERN.search(text or ""))
+
+
+def _has_german_profile_register_signal(text: str) -> bool:
+    return bool(
+        re.search(
+            r"\b(Standardarbeitsanweisung|GxP|GMP|ICH\s*Q9|QA|Reviewer|Approver|Aufzeichnungen|Freigabe|Verfahren|Verantwortlich)\b",
+            text or "",
+            re.IGNORECASE,
+        )
+    )
 
 
 def _german_profile_quality_retry_prompt(request: ActionRequest, draft: str, action: str) -> str:
@@ -2195,13 +2279,15 @@ def _apply_german_profile_quality_guard(
     meta = {
         "german_profile_quality_guard": False,
         "modal_language_present": _has_german_modal_language(text),
+        "profile_register_signal_present": _has_german_profile_register_signal(text),
         "quality_retry_used": False,
         "deterministic_modal_sentence_added": False,
+        "deterministic_register_sentence_added": False,
     }
     if not _is_german_pharma_profile(profile_json, profile_md, style_profile):
         return text, meta
     meta["german_profile_quality_guard"] = True
-    if meta["modal_language_present"]:
+    if meta["modal_language_present"] and meta["profile_register_signal_present"]:
         return text, meta
 
     schema = RewriteResponse if action == "rewrite" else ImproveResponse
@@ -2221,6 +2307,7 @@ def _apply_german_profile_quality_guard(
             text = retried
             meta["quality_retry_used"] = True
             meta["modal_language_present"] = _has_german_modal_language(text)
+            meta["profile_register_signal_present"] = _has_german_profile_register_signal(text)
     except Exception as exc:
         logger.warning("[german-profile-quality] retry failed action=%s err=%s", action, exc)
 
@@ -2231,6 +2318,13 @@ def _apply_german_profile_quality_guard(
         )
         meta["deterministic_modal_sentence_added"] = True
         meta["modal_language_present"] = True
+    if not meta["profile_register_signal_present"]:
+        text = (
+            text.rstrip()
+            + "\n\nRegisterhinweis: Die Umsetzung ist im Rahmen dieser Standardarbeitsanweisung nachvollziehbar zu dokumentieren."
+        )
+        meta["deterministic_register_sentence_added"] = True
+        meta["profile_register_signal_present"] = True
     return text.strip(), meta
 
 
@@ -2505,15 +2599,13 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
         )
     style_context_meta = {
         "used_instruction": str(getattr(payload, "instruction", "") or "").strip() or None,
-        "used_profile": (profile_json or {}).get("profile_name")
-        if isinstance(profile_json, dict)
-        else None,
+        "used_profile": _profile_display_name(profile_json) if isinstance(profile_json, dict) else None,
         "used_profile_id": explicit_style_override.get("profile_id")
         if explicit_style_override
-        else None,
+        else ((profile_json or {}).get("_profile_id") if isinstance(profile_json, dict) else None),
         "used_profile_version": explicit_style_override.get("profile_version")
         if explicit_style_override
-        else None,
+        else ((profile_json or {}).get("_profile_version") if isinstance(profile_json, dict) else None),
         "used_style_reference": explicit_style_override.get("style_reference")
         if explicit_style_override
         else None,
@@ -2537,14 +2629,29 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
 
     if action == "gap_check":
         retrieval_query = _build_gap_check_retrieval_query(request)
+        if getattr(request, "sop_entity_id", None):
+            runtime.retriever.metadata_filters = {"allowed_entity_ids": [str(request.sop_entity_id)]}
+        else:
+            runtime.retriever.metadata_filters = None
         raw_docs = runtime.retriever.invoke(retrieval_query)
         reranked = runtime.reranker.rerank_top_n(retrieval_query, raw_docs, 3)
         context = f"{format_chunks(reranked)}\n\n{style_block}\n\n{sop_context_block}".strip()
+        gap_retrieval_meta = {
+            "retrieval_mode": "hybrid_dense_bm25_rerank",
+            "collection": getattr(runtime, "collection_name", None),
+            "raw_docs": len(raw_docs),
+            "reranked_docs": len(reranked),
+            "scoped_sop_entity_id": str(request.sop_entity_id) if getattr(request, "sop_entity_id", None) else None,
+            "dense_weight": getattr(runtime.retriever, "dense_weight", None),
+            "bm25_weight": getattr(runtime.retriever, "bm25_weight", None),
+            "reranker": type(runtime.reranker).__name__,
+        }
         print(
             f"[nlp-action] action=gap_check retrieval_docs={len(raw_docs)} reranked_docs={len(reranked)}",
             flush=True,
         )
     else:
+        gap_retrieval_meta = None
         context = _build_improve_rewrite_context(request, style_block, sop_context_block)
 
     logger.info(
@@ -2826,6 +2933,7 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
                 "analysis": parsed.analysis,
                 "style_profile": style_profile,
                 "nlp_action_summary": nlp_summary,
+                "retrieval": gap_retrieval_meta,
                 **style_context_meta,
             },
         )
@@ -3230,6 +3338,8 @@ def _query_intents(question: str) -> set[str]:
         intents.add("sop_list")
     if re.search(r"\b(summarize|summary|brief|gist)\b", q):
         intents.add("summary")
+    if re.search(r"\b(explain|easy wording|easy words|simple words|what does this mean|tell me about|describe)\b", q):
+        intents.add("explain")
     if re.search(r"\b(compliance|compliant|regulatory|gmp|qa|qms|control|audit readiness|audit-ready)\b", q):
         intents.add("compliance")
     if re.search(r"\b(compare|difference|vs|versus)\b", q):
@@ -3240,7 +3350,290 @@ def _query_intents(question: str) -> set[str]:
         intents.add("active_sop")
     if re.search(r"\b(which|what)\b.*\b(sop)\b.*\b(currently open|open now|opened|active)\b", q):
         intents.add("active_sop")
+    if re.search(r"\b(who owns|owner|what version|version|status|tags?|word count|how many words|created|updated|standards?|compliance standards?)\b", q):
+        intents.add("metadata")
     return intents
+
+
+def _deterministic_active_sop_metadata_response(question: str, assistant_context: dict | None) -> dict[str, Any] | None:
+    ctx = assistant_context or {}
+    current = ctx.get("current_sop") if isinstance(ctx.get("current_sop"), dict) else {}
+    active_id = str(ctx.get("active_sop_id") or ctx.get("current_document_id") or current.get("id") or "").strip()
+    if not active_id and not current:
+        return None
+
+    q = (question or "").lower()
+    fields: list[tuple[str, Any]] = []
+    if re.search(r"\b(who owns|owner)\b", q):
+        fields.append(("Owner", current.get("owner") or current.get("metadata", {}).get("owner") or current.get("metadata", {}).get("author") or "Not provided"))
+    if "version" in q:
+        fields.append(("Version", current.get("version") or "Not provided"))
+    if "status" in q:
+        fields.append(("Status", current.get("status") or "Not provided"))
+    if re.search(r"\btags?\b", q):
+        tags = current.get("tags") if isinstance(current.get("tags"), list) else []
+        fields.append(("Tags", ", ".join(str(t) for t in tags) if tags else "Not provided"))
+    if re.search(r"\b(word count|how many words)\b", q):
+        fields.append(("Word count", current.get("word_count") or "Not provided"))
+    if "created" in q:
+        fields.append(("Created at", current.get("created_at") or "Not provided"))
+    if "updated" in q:
+        fields.append(("Updated at", current.get("updated_at") or ctx.get("context_updated_at") or "Not provided"))
+    if re.search(r"\b(standards?|compliance standards?)\b", q):
+        standards = current.get("compliance_standards") if isinstance(current.get("compliance_standards"), list) else []
+        fields.append(("Compliance standards", ", ".join(str(s) for s in standards) if standards else "Not provided"))
+    if not fields:
+        fields = [
+            ("Title", current.get("title") or "Not provided"),
+            ("Version", current.get("version") or "Not provided"),
+            ("Owner", current.get("owner") or current.get("metadata", {}).get("author") or "Not provided"),
+            ("Status", current.get("status") or "Not provided"),
+        ]
+
+    title = current.get("title") or current.get("sop_number") or active_id
+    answer = f"From the active SOP context ({title}):\n" + "\n".join(f"- {label}: {value}" for label, value in fields)
+    return {
+        "answer": answer,
+        "sources": [{"id": "live_sop_context", "type": "metadata", "label": "Active SOP metadata"}],
+        "citations": [
+            {
+                "ref": "live_sop_context",
+                "title": "Active SOP metadata",
+                "type": "metadata",
+                "excerpt": "Answered from the live editor assistant context.",
+                "score": 1.0,
+            }
+        ],
+        "retrieval_debug": [],
+        "suggestions": ["Summarize this SOP", "Check this SOP for gaps", "Show related SOPs"],
+        "retrieval_stats": {
+            "total_docs": 1,
+            "source": "live_sop_metadata",
+            "strict_mode": "active_sop_metadata",
+        },
+        "routed_to": "live_sop_metadata",
+        "assistant_action": None,
+    }
+
+
+def _deterministic_last_action_response(question: str, assistant_context: dict | None) -> dict[str, Any] | None:
+    ctx = assistant_context or {}
+    last = ctx.get("last_action") if isinstance(ctx.get("last_action"), dict) else {}
+    if not last:
+        return None
+    q = str(question or "").strip().lower()
+    asks = bool(re.search(r"\b(what|which|how|why|tell me|explain|show me|describe|list)\b", q, re.IGNORECASE))
+    about_change = bool(re.search(r"\b(upgrad(?:e|ed)|chang(?:e|ed)|improv(?:e|ed|ement)|rewrit(?:e|ten)|rewrite|modified|different|difference|diff|did you do|was done)\b", q, re.IGNORECASE))
+    if not (asks and about_change):
+        return None
+
+    action = str(last.get("action") or "AI action").strip()
+    section = str(last.get("section_name") or "the last target").strip()
+    status = str(last.get("status") or "").strip()
+    original = str(last.get("original_text_excerpt") or "").strip()
+    suggested = str(last.get("suggested_text_excerpt") or "").strip()
+    if not suggested:
+        suggested = "The last action did not store a preview excerpt yet."
+
+    answer = (
+        f"The last editor action was **{action}** on **{section}**"
+        + (f" (status: {status})." if status else ".")
+        + "\n\nWhat changed / was upgraded:\n"
+    )
+    if original:
+        answer += "- It used the original section text as the source, preserving the same target scope.\n"
+    answer += (
+        "- It produced a rewritten/improved preview rather than changing unrelated SOP sections.\n"
+        "- The preview is available for Accept/Reject in the editor; accepting it creates the persisted SOP change/version path.\n\n"
+        "Latest preview excerpt:\n"
+        f"{suggested[:1200]}"
+    )
+    return {
+        "answer": answer,
+        "sources": [{"id": "last_editor_action", "type": "assistant_memory", "label": "Last editor action"}],
+        "citations": [
+            {
+                "ref": "last_editor_action",
+                "title": "Last editor action",
+                "type": "assistant_memory",
+                "excerpt": f"action={action}; section={section}; status={status or 'unknown'}",
+                "score": 1.0,
+            }
+        ],
+        "retrieval_debug": [],
+        "suggestions": ["Make the rewrite shorter", "Explain this section in simple words", "Accept or reject the inline preview"],
+        "retrieval_stats": {
+            "total_docs": 1,
+            "source": "assistant_last_action",
+            "strict_mode": "last_action_memory",
+        },
+        "routed_to": "assistant_last_action",
+        "assistant_action": None,
+    }
+
+
+def _live_section_label_norm(value: object) -> str:
+    text = re.sub(r"\s+", " ", str(value or "").strip()).lower()
+    text = re.sub(r"^\d+(?:\.\d+)*[.)\]:-]?\s*", "", text).strip()
+    return re.sub(r"[^a-z0-9À-ÿäöüÄÖÜß]+", " ", text, flags=re.IGNORECASE).strip()
+
+
+def _extract_section_hint_for_live_answer(question: str, assistant_context: dict | None) -> str:
+    q = str(question or "")
+    patterns = [
+        r"\b(?:the\s+)?([A-Za-zÀ-ÿ][\wÀ-ÿ\s/&()-]{1,80}?)\s+section\b",
+        r"\bsection\s+([A-Za-zÀ-ÿ][\wÀ-ÿ\s/&()-]{1,80})\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, q, re.IGNORECASE)
+        if not match:
+            continue
+        candidate = re.sub(
+            r"^(?:ok(?:ay)?\s+|now\s+|then\s+|please\s+|summarize\s+(?:the\s+)?|explain\s+(?:the\s+)?|what'?s\s+inside\s+(?:the\s+)?)",
+            "",
+            match.group(1).strip(" .:-"),
+            flags=re.IGNORECASE,
+        ).strip(" .:-")
+        if candidate.lower() not in {"this", "that", "it", "them", "same", "current", "previous"}:
+            return candidate
+    known = re.search(
+        r"\b(zweck|sweck|purpose|scope|geltungsbereich|procedure|verfahren|responsibilities|responsibility|verantwortlichkeiten|capas?|approval|records|definitions)\b",
+        q,
+        re.IGNORECASE,
+    )
+    if known:
+        return known.group(1)
+    ctx = assistant_context or {}
+    focus = ctx.get("last_focus") if isinstance(ctx.get("last_focus"), dict) else {}
+    last = ctx.get("last_action") if isinstance(ctx.get("last_action"), dict) else {}
+    selected = ctx.get("selected_section") if isinstance(ctx.get("selected_section"), dict) else {}
+    for source in (focus, last, selected):
+        value = str(source.get("section_name") or source.get("label") or source.get("name") or "").strip()
+        if value and value.lower() not in {"selected text", "selection", "full sop", "full document"}:
+            return value
+    return ""
+
+
+def _section_heading_level(label: str) -> int | None:
+    match = re.match(r"^\s*(\d+(?:\.\d+)*)[.)\]:-]?\s+\S", str(label or ""))
+    if not match:
+        return None
+    return len([part for part in match.group(1).split(".") if part])
+
+
+def _resolve_live_section_for_answer(assistant_context: dict | None, question: str) -> dict[str, str] | None:
+    ctx = assistant_context or {}
+    current = ctx.get("current_sop") if isinstance(ctx.get("current_sop"), dict) else {}
+    selected = ctx.get("selected_section") if isinstance(ctx.get("selected_section"), dict) else {}
+    hint = _extract_section_hint_for_live_answer(question, assistant_context)
+    hint_norm = _live_section_label_norm(hint)
+
+    selected_label = str(selected.get("label") or selected.get("name") or "").strip()
+    selected_content = str(selected.get("content") or selected.get("text_excerpt") or "").strip()
+    if selected_content and (not hint_norm or hint_norm in _live_section_label_norm(selected_label) or _live_section_label_norm(selected_label) in hint_norm):
+        return {"label": selected_label or hint or "Selected section", "content": selected_content}
+
+    sections = current.get("sections") if isinstance(current.get("sections"), list) else []
+    best: tuple[int, dict[str, Any]] | None = None
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        label = str(section.get("label") or "").strip()
+        label_norm = _live_section_label_norm(label)
+        if not label_norm:
+            continue
+        score = 0
+        if hint_norm and hint_norm == label_norm:
+            score = 100
+        elif hint_norm and (hint_norm in label_norm or label_norm in hint_norm):
+            score = 85
+        elif hint_norm and abs(len(hint_norm) - len(label_norm)) <= 2 and _levenshtein_distance(hint_norm, label_norm) <= 2:
+            score = 75
+        if score and (best is None or score > best[0]):
+            best = (score, section)
+
+    if best:
+        label = str(best[1].get("label") or hint or "Section").strip()
+        content = str(best[1].get("content") or "").strip()
+        full_text = str(current.get("full_text") or ctx.get("editor_excerpt") or "").strip()
+        if full_text and label:
+            lines = [line.rstrip() for line in re.split(r"\r?\n", full_text)]
+            start = -1
+            label_norm = _live_section_label_norm(label)
+            for idx, line in enumerate(lines):
+                if _live_section_label_norm(line) == label_norm:
+                    start = idx
+                    break
+            if start >= 0:
+                start_level = _section_heading_level(lines[start])
+                end = len(lines)
+                for idx in range(start + 1, len(lines)):
+                    level = _section_heading_level(lines[idx])
+                    if start_level is not None and level is not None and level <= start_level:
+                        end = idx
+                        break
+                    if start_level is None and idx > start and _section_heading_level(lines[idx]) == 1:
+                        end = idx
+                        break
+                content = "\n".join(line for line in lines[start:end] if line.strip()).strip() or content
+        if content:
+            return {"label": label, "content": content}
+
+    full_text = str(current.get("full_text") or ctx.get("editor_excerpt") or "").strip()
+    if full_text and re.search(r"\b(full|whole|entire|complete|sop|document)\b", question or "", re.IGNORECASE):
+        return {"label": current.get("title") or current.get("sop_number") or "Full SOP", "content": full_text}
+    return None
+
+
+def _simple_live_summary(content: str, *, max_items: int = 5) -> list[str]:
+    lines = [re.sub(r"\s+", " ", line).strip(" -•\t") for line in re.split(r"\r?\n+", str(content or "")) if line.strip()]
+    useful = [
+        line for line in lines
+        if len(line) > 12 and not re.match(r"^\d+(?:\.\d+)*[.)\]:-]?\s+[A-Za-zÀ-ÿ\s/&()-]{1,80}$", line)
+    ]
+    if not useful:
+        useful = [part.strip() for part in re.split(r"(?<=[.!?])\s+", re.sub(r"\s+", " ", content or "")) if len(part.strip()) > 12]
+    return useful[:max_items]
+
+
+def _deterministic_live_section_response(question: str, assistant_context: dict | None) -> dict[str, Any] | None:
+    intents = _query_intents(question)
+    if not ({"summary", "explain"} & intents):
+        return None
+    target = _resolve_live_section_for_answer(assistant_context, question)
+    if not target:
+        return None
+    content = target["content"]
+    label = target["label"]
+    items = _simple_live_summary(content)
+    if "summary" in intents:
+        answer = f"Summary of **{label}**:\n" + "\n".join(f"- {item}" for item in items)
+    else:
+        answer = f"**{label}** explains:\n" + "\n".join(f"- {item}" for item in items)
+    if not items:
+        answer = f"I found **{label}**, but there is not enough readable section text in the live editor context to summarize it."
+    return {
+        "answer": answer,
+        "sources": [{"id": "live_editor_section", "type": "editor_context", "label": label}],
+        "citations": [
+            {
+                "ref": "live_editor_section",
+                "title": label,
+                "type": "editor_context",
+                "excerpt": content[:500],
+                "score": 1.0,
+            }
+        ],
+        "retrieval_debug": [],
+        "suggestions": ["Rewrite this section", "Explain this in simple words", "Find gaps in this section"],
+        "retrieval_stats": {
+            "total_docs": 1,
+            "source": "live_editor_section",
+            "strict_mode": "active_editor_section",
+        },
+        "routed_to": "live_editor_section",
+        "assistant_action": None,
+    }
 
 
 def _deterministic_sop_count_response(question: str, active_scope: dict | None = None) -> dict[str, Any]:
@@ -3295,16 +3688,41 @@ def _summarize_live_context(assistant_context: dict | None, question: str = "") 
     tabs = _ctx_list(ctx.get("opened_tabs"))
     text = str(ctx.get("editor_excerpt") or "").strip()
     selected_text = str(ctx.get("selected_text") or "").strip()
+    selected_section_content = str(selected.get("content") or selected.get("text_excerpt") or "").strip()
     references = _ctx_list(current.get("references"))
     intents = _query_intents(question)
     scope = _extract_active_sop_scope(assistant_context)
     active_sop_ref = str(scope.get("active_sop_ref") or current.get("sop_number") or current.get("id") or "").strip()
     active_sop_id = str(scope.get("active_sop_id") or "").strip()
     open_sop_tabs = _extract_refs(tabs, ["docId", "label"], limit=10)
-    include_editor_excerpt = bool(text) and bool({"summary", "active_sop", "compare", "compliance"} & intents)
-    excerpt = text[:1200] if include_editor_excerpt else ""
-    selected_excerpt = selected_text[:1200] if selected_text and ({"summary", "compliance"} & intents or last_action) else ""
+    include_editor_excerpt = bool(text) and bool({"summary", "active_sop", "compare", "compliance", "explain"} & intents)
+    active_full_sop_request = bool(
+        re.search(r"\b(full|whole|entire|complete)\s+(?:sop|document|doc)\b", question or "", re.IGNORECASE)
+        or re.search(r"\b(?:summarize|summary|explain|tell\s+me\s+about)\s+(?:this\s+|the\s+|current\s+|active\s+)?sop\b", question or "", re.IGNORECASE)
+        or re.search(r"\bwhat\s+is\s+(?:this\s+|the\s+|current\s+|active\s+)?sop\s+about\b", question or "", re.IGNORECASE)
+    )
+    excerpt_limit = 6000 if active_full_sop_request else 1800
+    excerpt = text[:excerpt_limit] if include_editor_excerpt else ""
+    selected_source = selected_text or selected_section_content
+    selected_excerpt = (
+        selected_source[:1200]
+        if selected_source and not active_full_sop_request and ({"summary", "compliance", "explain"} & intents or last_action)
+        else ""
+    )
+    requested_section_context = ""
+    if not active_full_sop_request and {"summary", "explain", "compliance"} & intents:
+        try:
+            target = _resolve_live_section_for_answer(assistant_context, question)
+        except Exception as exc:
+            logger.debug("[live-context] target section resolution failed: %s", exc)
+            target = None
+        if target:
+            requested_section_context = (
+                f"- Requested section: {target.get('label') or 'section'}\n"
+                f"- Requested section text excerpt: {str(target.get('content') or '')[:4200]}\n"
+            )
     last_action_line = ""
+    last_action_context = ""
     if last_action:
         last_action_line = (
             f"- Last assistant action: action={last_action.get('action') or 'unknown'} | "
@@ -3312,6 +3730,16 @@ def _summarize_live_context(assistant_context: dict | None, question: str = "") 
             f"section={last_action.get('section_name') or 'unknown'} | "
             f"status={last_action.get('status') or 'unknown'}\n"
         )
+        original_excerpt = str(last_action.get("original_text_excerpt") or "").strip()
+        suggested_excerpt = str(last_action.get("suggested_text_excerpt") or "").strip()
+        context_lines = [
+            "- Follow-up scope rule: if the user says this/it/that section, use the last assistant action target unless a new target is named.",
+        ]
+        if original_excerpt:
+            context_lines.append(f"- Last target source excerpt: {original_excerpt[:1400]}")
+        if suggested_excerpt:
+            context_lines.append(f"- Last assistant output excerpt: {suggested_excerpt[:1400]}")
+        last_action_context = "\n".join(context_lines) + "\n"
     focus_note = ""
     if "summary" in intents and active_sop_ref:
         focus_note = f"- Focus SOP for summary: {active_sop_ref}\n"
@@ -3335,6 +3763,8 @@ def _summarize_live_context(assistant_context: dict | None, question: str = "") 
             return (
                 minimal
                 + last_action_line
+                + last_action_context
+                + requested_section_context
                 + (
                     f"- Selected section: {selected.get('name') or 'none'} | scope={selected.get('scope') or 'none'}\n"
                     if selected or selected_excerpt
@@ -3356,6 +3786,8 @@ def _summarize_live_context(assistant_context: dict | None, question: str = "") 
         return (
             minimal
             + last_action_line
+            + last_action_context
+            + requested_section_context
             + f"- Linked deviations: {len(scope.get('linked_deviation_ids') or [])} ({', '.join(linked_devs) or 'none'})\n"
             + f"- Linked CAPAs: {len(scope.get('linked_capa_ids') or [])} ({', '.join(linked_capas) or 'none'})\n"
             + f"- Linked audits: {len(scope.get('linked_audit_ids') or [])} ({', '.join(linked_audits) or 'none'})\n"
@@ -3388,6 +3820,8 @@ def _summarize_live_context(assistant_context: dict | None, question: str = "") 
         + f"title={current.get('title') or 'unknown'} | version={current.get('version') or 'unknown'} | "
         + f"status={current.get('status') or 'unknown'}\n"
         + f"{last_action_line}"
+        + f"{last_action_context}"
+        + f"{requested_section_context}"
         + (
             f"- Selected section: {selected.get('name') or 'none'} | scope={selected.get('scope') or 'none'}\n"
             if selected or selected_excerpt
@@ -3808,16 +4242,36 @@ async def classify_intent(payload: dict):
     Semantic intent routing for the unified KL/KI Assistant chat panel.
     Returns flow (chat | editor_action | clarify), action, target scope, and constraints.
     """
+    from chatbot.assistant.context_intelligence import (
+        finalize_classify_response,
+        prepare_message_context,
+    )
     from chatbot.assistant.intent_classifier import classify_assistant_intent
 
     message = (payload.get("message") or payload.get("question") or "").strip()
     if not message:
         raise HTTPException(status_code=422, detail="message is required")
 
+    prep = prepare_message_context(payload)
+    if prep.get("early_response"):
+        return finalize_classify_response(prep["early_response"], prep, user_message=message)
+
+    def _classify_return(raw: dict) -> dict:
+        return finalize_classify_response(raw, prep, user_message=message)
+
+    resolved_scope = prep.get("resolved_scope") if isinstance(prep.get("resolved_scope"), dict) else {}
+    alias_resolved_label = (
+        str(resolved_scope.get("section_label") or "").strip()
+        if resolved_scope.get("resolved_from") in {"ALIAS_MATCH", "SUB_SECTION", "RECORD_ID"}
+        else ""
+    )
+
     ctx = payload.get("assistant_context") if isinstance(payload.get("assistant_context"), dict) else {}
     current_sop = ctx.get("current_sop") if isinstance(ctx.get("current_sop"), dict) else {}
     last_action = ctx.get("last_action") if isinstance(ctx.get("last_action"), dict) else {}
+    last_focus = ctx.get("last_focus") if isinstance(ctx.get("last_focus"), dict) else {}
     selected_section = ctx.get("selected_section") if isinstance(ctx.get("selected_section"), dict) else {}
+    editor_contract = ctx.get("editor_context_contract") if isinstance(ctx.get("editor_context_contract"), dict) else {}
     recent_messages = payload.get("recent_messages") if isinstance(payload.get("recent_messages"), list) else []
 
     has_active_sop = bool(payload.get("has_active_sop"))
@@ -3870,9 +4324,129 @@ async def classify_intent(payload: dict):
 
     previous_action = _infer_previous_action()
 
+    def _compact_text(value: object, limit: int = 700) -> str:
+        text = re.sub(r"\s+", " ", str(value or "").strip())
+        return text[:limit]
+
+    def _selected_section_summary() -> str:
+        contract_selected = editor_contract.get("selected_section") if isinstance(editor_contract.get("selected_section"), dict) else {}
+        label = (
+            selected_section.get("label")
+            or selected_section.get("name")
+            or contract_selected.get("label")
+            or ""
+        )
+        content = (
+            selected_section.get("content")
+            or selected_section.get("text_excerpt")
+            or contract_selected.get("content")
+            or ""
+        )
+        return _compact_text(f"{label or 'none'} :: {content or ''}", 900)
+
+    def _available_sections_summary() -> str:
+        sections = current_sop.get("sections")
+        if not isinstance(sections, list):
+            sop_ctx = editor_contract.get("sop_context") if isinstance(editor_contract.get("sop_context"), dict) else {}
+            sections = sop_ctx.get("sections") if isinstance(sop_ctx.get("sections"), list) else []
+        labels = []
+        for section in sections[:30]:
+            if isinstance(section, dict):
+                label = str(section.get("label") or "").strip()
+                if label:
+                    labels.append(label)
+        return _compact_text(", ".join(labels), 1000)
+
+    def _available_section_labels() -> list[str]:
+        sections = current_sop.get("sections")
+        if not isinstance(sections, list):
+            sop_ctx = editor_contract.get("sop_context") if isinstance(editor_contract.get("sop_context"), dict) else {}
+            sections = sop_ctx.get("sections") if isinstance(sop_ctx.get("sections"), list) else []
+        labels: list[str] = []
+        for section in sections[:80]:
+            if not isinstance(section, dict):
+                continue
+            label = str(section.get("label") or section.get("name") or "").strip()
+            if label:
+                labels.append(label)
+        return labels
+
+    def _normalize_section_label(value: object) -> str:
+        text = re.sub(r"\s+", " ", str(value or "").strip()).lower()
+        text = re.sub(r"^\d+(?:\.\d+)*[.)\]:-]?\s*", "", text).strip()
+        return text
+
+    def _canonical_section_hint(value: object) -> str:
+        raw = re.sub(r"\s+", " ", str(value or "").strip())
+        if not raw:
+            return ""
+        raw_norm = _normalize_section_label(raw)
+        for label in _available_section_labels():
+            label_norm = _normalize_section_label(label)
+            if raw.lower() == label.lower() or (raw_norm and raw_norm == label_norm):
+                return label
+        for label in _available_section_labels():
+            label_norm = _normalize_section_label(label)
+            if raw_norm and (raw_norm in label_norm or label_norm in raw_norm):
+                return label
+        close_match = ""
+        close_distance = 999
+        for label in _available_section_labels():
+            label_norm = _normalize_section_label(label)
+            if not raw_norm or not label_norm or abs(len(raw_norm) - len(label_norm)) > 2:
+                continue
+            distance = _levenshtein_distance(raw_norm, label_norm)
+            if distance < close_distance:
+                close_distance = distance
+                close_match = label
+        if close_match and close_distance <= 2:
+            return close_match
+        return raw
+
+    def _previous_action_summary() -> str:
+        if not previous_action:
+            if isinstance(last_focus, dict) and last_focus:
+                return _compact_text(
+                    " | ".join(
+                        [
+                            "focus=section",
+                            f"scope={last_focus.get('target_scope') or ''}",
+                            f"section={last_focus.get('section_name') or ''}",
+                            f"source={last_focus.get('source') or ''}",
+                        ]
+                    ),
+                    900,
+                )
+            return ""
+        return _compact_text(
+            " | ".join(
+                [
+                    f"action={previous_action.get('action') or ''}",
+                    f"scope={previous_action.get('target_scope') or ''}",
+                    f"section={previous_action.get('section_name') or ''}",
+                    f"prompt={previous_action.get('request_prompt') or ''}",
+                    f"status={previous_action.get('status') or ''}",
+                ]
+            ),
+            900,
+        )
+
+    def _recent_conversation_summary() -> str:
+        rows = []
+        for row in recent_messages[-8:]:
+            if not isinstance(row, dict):
+                continue
+            role = str(row.get("role") or "").strip() or "unknown"
+            content = _compact_text(row.get("content"), 260)
+            if content:
+                rows.append(f"{role}: {content}")
+        return "\n".join(rows)
+
     def _extract_explicit_section_hint(text: str) -> str:
         q = str(text or "").strip()
         if not q:
+            return ""
+        if re.search(r"\b(current|this|selected)(?:\s+\w+){0,2}\s+(?:section|paragraph|table\s+row|row|text)\b", q, re.IGNORECASE):
             return ""
         patterns = [
             r"\b(?:the\s+)?([A-Za-zÀ-ÿ][\wÀ-ÿ\s/&()-]{1,80}?)\s+section\b",
@@ -3888,22 +4462,42 @@ async def classify_intent(payload: dict):
             "same",
             "previous",
             "suggestion",
+            "summarize this",
+            "explain this",
+            "rewrite this",
+            "improve this",
+            "this section",
+            "that section",
             "full sop",
             "sop",
+            "current",
+            "current section",
+            "open sop",
         }
         for pattern in patterns:
             match = re.search(pattern, q, re.IGNORECASE)
             if not match:
                 continue
             candidate = re.sub(r"\s+", " ", match.group(1).strip(" .:-"))
+            if re.match(r"^(?:in|with|using|according|based|same|the\s+same)\b", candidate, re.IGNORECASE):
+                continue
             candidate = re.sub(
                 r"^(?:ok(?:ay)?\s+|now\s+|then\s+|please\s+|make\s+(?:the\s+)?|rewrite\s+(?:the\s+)?|improve\s+(?:the\s+)?)",
                 "",
                 candidate,
                 flags=re.IGNORECASE,
             ).strip(" .:-")
+            lowered_candidate = candidate.lower()
+            if re.match(r"^(?:according|using|with|based|but|and|for|to)\b", lowered_candidate):
+                continue
+            if re.search(r"\b(this|that|it|them)\b", lowered_candidate) and not re.search(
+                r"\b(zweck|zwect|sweck|purpose|scope|geltungsbereich|procedure|verfahren|responsibilities|responsibility|verantwortlichkeiten|capas?|capa|decisions?|entscheidungen?|audits?|deviations?|approval|records|definitions)\b",
+                lowered_candidate,
+                re.IGNORECASE,
+            ):
+                continue
             known_in_candidate = re.search(
-                r"\b(zweck|purpose|scope|geltungsbereich|procedure|verfahren|responsibilities|verantwortlichkeiten|approval|records|definitions)\b",
+                r"\b(zweck|zwect|sweck|purpose|scope|geltungsbereich|procedure|verfahren|responsibilities|responsibility|verantwortlichkeiten|capas?|capa|decisions?|entscheidungen?|audits?|deviations?|approval|records|definitions)\b",
                 candidate,
                 re.IGNORECASE,
             )
@@ -3912,20 +4506,55 @@ async def classify_intent(payload: dict):
             if candidate and candidate.lower() not in stop:
                 return candidate
         known = re.search(
-            r"\b(zweck|purpose|scope|geltungsbereich|procedure|verfahren|responsibilities|verantwortlichkeiten|approval|records|definitions)\b",
+            r"\b(zweck|zwect|sweck|purpose|scope|geltungsbereich|procedure|verfahren|responsibilities|responsibility|verantwortlichkeiten|capas?|capa|decisions?|entscheidungen?|audits?|deviations?|approval|records|definitions)\b",
             q,
             re.IGNORECASE,
         )
         return known.group(1) if known else ""
 
-    explicit_section_hint = _extract_explicit_section_hint(message)
+    explicit_section_hint = _canonical_section_hint(_extract_explicit_section_hint(message))
+
+    def _content_target_scope(default_scope: str = "current_section") -> str:
+        if explicit_section_hint:
+            return "section"
+        if bool(payload.get("has_editor_selection")):
+            return "selection"
+        return default_scope
+
+    def _usable_followup_section_hint() -> str:
+        for candidate in [
+            explicit_section_hint,
+            previous_action.get("section_name") if isinstance(previous_action, dict) else "",
+            last_focus.get("section_name") if isinstance(last_focus, dict) else "",
+            selected_section.get("label"),
+            selected_section.get("name"),
+        ]:
+            value = str(candidate or "").strip()
+            if value and value.lower() not in {"selected text", "selection", "previous suggestion", "full sop", "full document"}:
+                return _canonical_section_hint(value)
+        return ""
+
+    def _is_contextual_target_ref(text: str) -> bool:
+        q = str(text or "").strip().lower()
+        return bool(re.search(r"\b(this|that|it|same|current|previous)\s*(?:section|part|block|text|one)?\b", q, re.IGNORECASE))
+
+    def _section_hint_for_action() -> str:
+        if alias_resolved_label:
+            return alias_resolved_label
+        if re.search(r"\bselected\s+(?:paragraph|table\s+row|row|text)\b", message, re.IGNORECASE):
+            return ""
+        if explicit_section_hint:
+            return explicit_section_hint
+        if _is_contextual_target_ref(message):
+            return _usable_followup_section_hint()
+        return ""
 
     def _is_context_dependent_followup(text: str) -> bool:
         q = str(text or "").strip().lower()
         if not q or not previous_action:
             return False
         explicit = re.search(
-            r"\b(previous|suggestion|shorter|shorten|keep the same|same tone|make it shorter|summarize it|improve that|that specific section|what is the gap check|same style|same company style)\b",
+            r"\b(previous|suggestion|i\s+told\s+you|too\s+long|still\s+too\s+long|shorter|shoter|shorten|smaller|smallier|keep the same|same tone|make it shorter|make it shoter|summarize it|improve that|that specific section|what is the gap check|same style|same company style)\b",
             q,
             re.IGNORECASE,
         )
@@ -3933,37 +4562,176 @@ async def classify_intent(payload: dict):
             return True
         if re.search(r"^(ok(?:ay)?|now|then|and now|next)\b", q, re.IGNORECASE):
             return True
-        if re.search(r"\b(it|them|that|this version)\b", q, re.IGNORECASE):
+        if re.search(
+            r"\b(?:make|rewrite|re-?write|improve|summarize|shorten|expand|redo|try)\s+(?:it|them|that|this version)\b",
+            q,
+            re.IGNORECASE,
+        ):
             return True
-        if re.fullmatch(r"(make it shorter|make it smaller|make it smallier|summarize it|improve it|rewrite it|improve them|rewrite them)", q, re.IGNORECASE):
+        if re.search(
+            r"\b(?:it|them|that|this version)\s+(?:again|shorter|shoter|smaller|smallier|better|more\s+formal|more\s+clear|clearer)\b",
+            q,
+            re.IGNORECASE,
+        ):
+            return True
+        if re.fullmatch(r"(make it shorter|make it shoter|make it smaller|make it smallier|summarize it|improve it|rewrite it|improve them|rewrite them)", q, re.IGNORECASE):
             return True
         return False
 
+    def _is_explicit_selection_reference(text: str) -> bool:
+        return bool(
+            re.search(
+                r"\b(?:selected|highlighted)\s+(?:text|paragraph|table\s+row|row|sentence|line|content)\b",
+                str(text or ""),
+                re.IGNORECASE,
+            )
+        )
+
+    def _is_read_only_followup_about_action(text: str) -> bool:
+        q = str(text or "").strip().lower()
+        if not q:
+            return False
+        if re.search(r"\b(rewrite|improve|shorten|expand|change|update|fix)\b", q, re.IGNORECASE):
+            return False
+        asks = bool(re.search(r"\b(what|which|how|why|tell me|explain|show me|describe|list)\b", q, re.IGNORECASE))
+        about_change = bool(re.search(r"\b(upgrad(?:e|ed)|chang(?:e|ed)|improv(?:e|ed|ement)|rewrit(?:e|ten)|rewrite|modified|different|difference|diff|did you do|was done)\b", q, re.IGNORECASE))
+        imperative_edit = bool(re.search(r"^(?:ok(?:ay)?\s+)?(?:rewrite|improve|summarize|shorten|expand|change|update|make)\b", q, re.IGNORECASE))
+        return asks and about_change and not imperative_edit
+
+    def _is_read_only_explain_request(text: str) -> bool:
+        q = str(text or "").strip().lower()
+        if not q:
+            return False
+        if re.search(r"^(?:ok(?:ay)?\s+)?(?:rewrite|improve|shorten|expand|change|update|make|fix|delete|remove|add)\b", q, re.IGNORECASE):
+            return False
+        if re.search(r"\b(rewrite|improve|shorten|expand|change|update|fix|make\s+.+\baudit[-\s]?ready)\b", q, re.IGNORECASE):
+            return False
+        return bool(
+            re.search(
+                r"\b(summarize|summary|zusammenfass|kurzfassung|explain|easy wording|easy words|simple words|what\s+(?:is|are|'s|does)|what'?s\s+inside|tell\s+me\s+about|describe|read|show\s+(?:me\s+)?)\b",
+                q,
+                re.IGNORECASE,
+            )
+        )
+
     lower_message = message.lower()
-    if has_active_sop and _is_context_dependent_followup(message) and not bool(payload.get("has_editor_selection")):
-        return {
+    full_sop_read_request = bool(
+        re.search(r"\b(full|whole|entire|complete)\s+(?:sop|document|doc)\b", lower_message, re.IGNORECASE)
+        or re.search(r"\bopen\s+sop\b", lower_message, re.IGNORECASE)
+        or re.search(r"\b(?:this|current|active)\s+sop\b", lower_message, re.IGNORECASE)
+        or re.search(r"\btell\s+me\s+about\s+this\s+sop\b", lower_message, re.IGNORECASE)
+    )
+    if has_active_sop and re.search(r"\bcompare\b[\s\S]*\b(SOP-[A-Z0-9-]+)\b[\s\S]*\b(missing|fehlt|lacks?|gap)\b|\b(missing|fehlt|lacks?|gap)\b[\s\S]*\bcompare\b", message, re.IGNORECASE):
+        return _classify_return({
+            "flow": "chat",
+            "action": None,
+            "target_scope": None,
+            "section_hint": _usable_followup_section_hint() or None,
+            "linked_entity_types": ["related_sops"],
+            "requires_selection": False,
+            "requires_confirmation": False,
+            "confidence": 0.94,
+            "reason": "Read-only comparison against another SOP; answer in chat using RAG/live context.",
+            "previous_action": previous_action,
+        })
+    if has_active_sop and _is_read_only_explain_request(message):
+        return _classify_return({
+            "flow": "chat",
+            "action": None,
+            "target_scope": None,
+            "section_hint": None if full_sop_read_request else (_usable_followup_section_hint() or None),
+            "requires_selection": False,
+            "requires_confirmation": False,
+            "confidence": 0.94,
+            "reason": "Read-only explanation/question about SOP context; answer in chat, do not mutate the editor.",
+            "previous_action": previous_action,
+        })
+
+    if has_active_sop and _is_read_only_followup_about_action(message):
+        return _classify_return({
+            "flow": "chat",
+            "action": None,
+            "target_scope": None,
+            "section_hint": _usable_followup_section_hint() or None,
+            "requires_selection": False,
+            "requires_confirmation": False,
+            "confidence": 0.96,
+            "reason": "Read-only question about the previous editor action; answer in chat, do not run another edit.",
+            "previous_action": previous_action,
+        })
+
+    if has_active_sop and _is_context_dependent_followup(message) and not _is_explicit_selection_reference(message):
+        followup_section_hint = _usable_followup_section_hint() or alias_resolved_label
+        frustration = prep.get("frustration_signal") or {}
+        constraints: dict[str, Any] = {
+            "length": "shorter"
+            if re.search(r"\b(shorter|shoter|shorten|smaller|smallier|too\s+long|i\s+told\s+you)\b", message, re.IGNORECASE)
+            else None
+        }
+        if frustration.get("detected") and frustration.get("target_word_count"):
+            constraints["length"] = "shorter"
+            constraints["word_count"] = frustration["target_word_count"]
+        return _classify_return({
             "flow": "follow_up_action",
             "action": (
                 "gap_check"
                 if re.search(r"\bgap\s*check|compliance\b", message, re.IGNORECASE)
-                else "summarize"
-                if re.search(r"\bsummarize|summary|shorter|shorten|smaller|smallier\b", message, re.IGNORECASE)
+                else "improve"
+                if re.search(r"\b(better|improve|verbesser)\b", message, re.IGNORECASE)
                 else "rewrite"
-                if re.search(r"\b(rewrite|re-?write)\b", message, re.IGNORECASE)
+                if re.search(r"\b(rewrite|re-?write|shorter|shoter|shorten|smaller|smallier|too\s+long|i\s+told\s+you)\b", message, re.IGNORECASE)
+                else "summarize"
+                if re.search(r"\bsummarize\s+(?:it|this|that)\b", message, re.IGNORECASE)
                 else str(previous_action.get("action") or "improve")
             ),
-            "target_scope": "current_section" if explicit_section_hint else "previous_suggestion",
-            "section_hint": explicit_section_hint or str(previous_action.get("section_name") or selected_section.get("name") or "").strip() or None,
+            "target_scope": "section" if followup_section_hint else "previous_suggestion",
+            "section_hint": followup_section_hint or None,
+            "constraints": constraints,
             "requires_selection": False,
             "requires_confirmation": True,
             "confidence": 0.91,
             "reason": "Follow-up request targets the previous assistant action and its target.",
             "previous_action": previous_action,
-        }
+        })
 
     if has_active_sop:
+        action_section_hint = _section_hint_for_action()
+        if action_section_hint.lower() in {"audit"} and re.search(r"\baudit[-\s]?ready\b", lower_message, re.IGNORECASE):
+            action_section_hint = str(
+                selected_section.get("label")
+                or selected_section.get("name")
+                or (last_focus.get("section_name") if isinstance(last_focus, dict) else "")
+                or ""
+            ).strip()
+        if re.search(r"\blinked\b[\s\S]*\b(deviations?|capas?|qa)\b|\b(deviations?|capas?)\b[\s\S]*\blinked\b", lower_message, re.IGNORECASE):
+            return _classify_return({
+                "flow": "chat",
+                "action": None,
+                "target_scope": None,
+                "section_hint": None,
+                "linked_entity_types": ["deviations", "capas"],
+                "requires_selection": False,
+                "requires_confirmation": False,
+                "confidence": 0.94,
+                "reason": "Read-only linked QA context question; answer in chat using linked deviations/CAPAs only.",
+                "previous_action": previous_action,
+            })
+        if re.search(r"\bmake\b[\s\S]*\baudit[-\s]?ready\b", lower_message, re.IGNORECASE):
+            return _classify_return({
+                "flow": "editor_action",
+                "action": "improve",
+                "target_scope": "full_document" if re.search(r"\b(full|whole|entire|complete)\s+(?:sop|document|doc)\b|\b(?:this|current|open|active)\s+sop\b", lower_message, re.IGNORECASE) else ("section" if action_section_hint else _content_target_scope()),
+                "section_hint": action_section_hint or None,
+                "constraints": {
+                    "detail_level": "audit-ready; do not add unsupported requirements"
+                },
+                "requires_selection": False,
+                "requires_confirmation": True,
+                "confidence": 0.94,
+                "reason": "Active SOP plus request to make text audit-ready; run an improve action with support-only constraint.",
+            })
         if re.search(r"\bgap[\s-]*check\b|lücken", lower_message, re.IGNORECASE):
-            return {
+            return _classify_return({
                 "flow": "editor_action",
                 "action": "gap_check",
                 "target_scope": "full_document",
@@ -3971,94 +4739,89 @@ async def classify_intent(payload: dict):
                 "requires_confirmation": True,
                 "confidence": 0.95,
                 "reason": "Active SOP plus explicit gap-check request.",
-            }
+            })
         if re.search(r"\b(compliance\s+gap|compliance\s+check|what\s+(?:is|are)\s+the\s+compliance|regulatory\s+gaps?|audit\s+readiness\s+gaps?)\b", lower_message, re.IGNORECASE):
-            return {
+            return _classify_return({
                 "flow": "editor_action",
                 "action": "gap_check",
-                "target_scope": "full_document" if re.search(r"\b(sop|document|full|whole|entire)\b", lower_message, re.IGNORECASE) else ("selection" if bool(payload.get("has_editor_selection")) else "current_section"),
-                "section_hint": explicit_section_hint or None,
+                "target_scope": "full_document" if re.search(r"\b(sop|document|full|whole|entire)\b", lower_message, re.IGNORECASE) else ("section" if action_section_hint else _content_target_scope()),
+                "section_hint": action_section_hint or None,
                 "requires_selection": False,
                 "requires_confirmation": True,
                 "confidence": 0.95,
                 "reason": "Active SOP plus explicit compliance-gap request.",
-            }
-        if re.search(r"\b(summarize|summary|brief|gist|kurzfass|zusammenfass)\b", lower_message, re.IGNORECASE):
-            return {
+            })
+        if re.search(r"\bmissing\b[\s\S]*\b(roles?|acceptance criteria|records?|escalation|approval steps?)\b|\b(roles?|acceptance criteria|records?|escalation|approval steps?)\b[\s\S]*\bmissing\b", lower_message, re.IGNORECASE):
+            missing_scope = "full_document" if re.search(r"\b(sop|document|full|whole|entire)\b", lower_message, re.IGNORECASE) else ("section" if action_section_hint else _content_target_scope("full_document"))
+            return _classify_return({
                 "flow": "editor_action",
-                "action": "summarize",
-                "target_scope": "full_document" if re.search(r"\b(sop|document|full|whole|entire)\b", lower_message, re.IGNORECASE) else ("selection" if bool(payload.get("has_editor_selection")) else "current_section"),
-                "section_hint": explicit_section_hint or None,
+                "action": "gap_check",
+                "target_scope": missing_scope,
+                "section_hint": action_section_hint if missing_scope == "section" else None,
                 "requires_selection": False,
                 "requires_confirmation": True,
                 "confidence": 0.94,
-                "reason": "Active SOP plus explicit summarize request.",
-            }
-        if re.search(r"\b(analy[sz]e|analysis|review\s+this\s+sop|explain\s+this\s+sop|read\s+this\s+sop|show\s+(?:me\s+)?this\s+sop|current\s+sop\s+content|what\s+does\s+this\s+sop\s+say)\b", lower_message, re.IGNORECASE):
-            return {
+                "reason": "Checklist of missing SOP controls should run as a gap check.",
+            })
+        if re.search(r"\b(summarize|summary|brief|gist|kurzfass|zusammenfass)\b", lower_message, re.IGNORECASE):
+            return _classify_return({
+                "flow": "chat",
+                "action": None,
+                "target_scope": None,
+                "section_hint": action_section_hint or None,
+                "requires_selection": False,
+                "requires_confirmation": False,
+                "confidence": 0.94,
+                "reason": "Summarize is read-only in the sidebar; do not open inline editor suggestions.",
+            })
+        if re.search(r"\b(explain|what\s+does|tell\s+me\s+about|read\s+this\s+sop|show\s+(?:me\s+)?this\s+sop|current\s+sop\s+content)\b", lower_message, re.IGNORECASE):
+            # These are read-only explanation requests. Keep them in chat so the
+            # sidebar answers from live SOP/RAG context without opening an edit flow.
+            pass
+        elif re.search(r"\b(analy[sz]e|analysis|review\s+this\s+sop)\b", lower_message, re.IGNORECASE):
+            return _classify_return({
                 "flow": "editor_action",
-                "action": "analyze" if re.search(r"\b(analy[sz]e|analysis|review)\b", lower_message, re.IGNORECASE) else "read",
-                "target_scope": "full_document" if re.search(r"\b(sop|document|full|whole|entire)\b", lower_message, re.IGNORECASE) or not explicit_section_hint else "current_section",
-                "section_hint": explicit_section_hint or None,
+                "action": "analyze",
+                "target_scope": "full_document" if re.search(r"\b(sop|document|full|whole|entire)\b", lower_message, re.IGNORECASE) or not action_section_hint else "section",
+                "section_hint": action_section_hint or None,
                 "requires_selection": False,
                 "requires_confirmation": True,
                 "confidence": 0.9,
-                "reason": "Active SOP plus explicit read/analyze request.",
-            }
+                "reason": "Active SOP plus explicit analyze/review request.",
+            })
         if re.search(r"\b(compliance|compliant|regulatory|gmp|qa|qms|control|audit\s+ready|audit\s+readiness)\b", lower_message, re.IGNORECASE):
-            return {
+            return _classify_return({
                 "flow": "editor_action",
                 "action": "analyze",
-                "target_scope": "full_document" if re.search(r"\b(sop|document|full|whole|entire)\b", lower_message, re.IGNORECASE) else ("selection" if bool(payload.get("has_editor_selection")) else "current_section"),
-                "section_hint": explicit_section_hint or None,
+                "target_scope": "full_document" if re.search(r"\b(sop|document|full|whole|entire)\b", lower_message, re.IGNORECASE) else ("section" if action_section_hint else _content_target_scope()),
+                "section_hint": action_section_hint or None,
                 "requires_selection": False,
                 "requires_confirmation": True,
                 "confidence": 0.9,
                 "reason": "Active SOP plus explicit compliance review request.",
-            }
+            })
         if re.search(r"\bimprove\b|\bverbesser", lower_message, re.IGNORECASE):
-            return {
+            return _classify_return({
                 "flow": "editor_action",
                 "action": "improve",
-                "target_scope": "selection" if bool(payload.get("has_editor_selection")) else "current_section",
-                "section_hint": explicit_section_hint or None,
+                "target_scope": "full_document" if re.search(r"\b(full|whole|entire|complete)\s+(?:sop|document|doc)\b|\b(?:this|current|open|active)\s+sop\b", lower_message, re.IGNORECASE) else ("section" if action_section_hint else _content_target_scope()),
+                "section_hint": action_section_hint or None,
                 "requires_selection": False,
                 "requires_confirmation": True,
                 "confidence": 0.93,
                 "reason": "Active SOP plus explicit improve request.",
-            }
+            })
         if re.search(r"\brewrite\b|umschreib|überarbeit", lower_message, re.IGNORECASE):
-            return {
+            return _classify_return({
                 "flow": "editor_action",
                 "action": "rewrite",
-                "target_scope": "selection" if bool(payload.get("has_editor_selection")) else "current_section",
-                "section_hint": explicit_section_hint or None,
+                "target_scope": "full_document" if re.search(r"\b(full|whole|entire|complete)\s+(?:sop|document|doc)\b|\b(?:this|current|open|active)\s+sop\b", lower_message, re.IGNORECASE) else ("section" if action_section_hint else _content_target_scope()),
+                "section_hint": action_section_hint or None,
                 "requires_selection": False,
                 "requires_confirmation": True,
                 "confidence": 0.93,
                 "reason": "Active SOP plus explicit rewrite request.",
-            }
-
-    if has_active_sop and _is_context_dependent_followup(message) and not bool(payload.get("has_editor_selection")):
-        return {
-            "flow": "follow_up_action",
-            "action": (
-                "gap_check"
-                if re.search(r"\bgap\s*check|compliance\b", message, re.IGNORECASE)
-                else "summarize"
-                if re.search(r"\bsummarize|summary|smaller|smallier\b", message, re.IGNORECASE)
-                else "rewrite"
-                if re.search(r"\b(rewrite|shorter|shorten)\b", message, re.IGNORECASE)
-                else str(previous_action.get("action") or "improve")
-            ),
-            "target_scope": "current_section" if explicit_section_hint else "previous_suggestion",
-            "section_hint": explicit_section_hint or str(previous_action.get("section_name") or selected_section.get("name") or "").strip() or None,
-            "requires_selection": False,
-            "requires_confirmation": True,
-            "confidence": 0.86,
-            "reason": "Follow-up request targets the previous assistant rewrite/suggestion.",
-            "previous_action": previous_action,
-        }
+            })
 
     result = await asyncio.to_thread(
         classify_assistant_intent,
@@ -4068,8 +4831,17 @@ async def classify_intent(payload: dict):
         route=str(payload.get("route") or ctx.get("route") or "").strip(),
         active_sop_title=str(current_sop.get("title") or "").strip(),
         active_sop_number=str(current_sop.get("sop_number") or current_sop.get("documentId") or "").strip(),
+        selected_section_summary=_selected_section_summary(),
+        available_sections=_available_sections_summary(),
+        previous_action_summary=_previous_action_summary(),
+        recent_conversation=_recent_conversation_summary(),
+        active_scope=prep.get("active_scope"),
+        instruction_memory=prep.get("instruction_memory"),
+        frustration_signal=prep.get("frustration_signal"),
+        repetition_detected=bool(prep.get("repetition_detected")),
+        repetition_instruction=prep.get("repetition_instruction"),
     )
-    return result.model_dump()
+    return _classify_return(result.model_dump())
 
 
 @ai_router.get("/api/ai/llm-health")
@@ -4181,6 +4953,22 @@ async def query_ai(
     intents = _query_intents(question)
     active_scope = _extract_active_sop_scope(assistant_context)
     context_summary = _summarize_live_context(assistant_context, question)
+    last_action_response = _deterministic_last_action_response(question, assistant_context)
+    if last_action_response:
+        last_action_response["retrieval_stats"].update(
+            {
+                "provider": "deterministic",
+                "model": "assistant_memory",
+                "surface": surface,
+                "intents": sorted(intents),
+                "assistant_mode": assistant_mode,
+                "latency_ms_total": round((time.perf_counter() - t0) * 1000.0, 1),
+            }
+        )
+        last_action_response["elapsed_ms_total"] = round((time.perf_counter() - t0) * 1000.0, 1)
+        last_action_response["retrieval_stats"]["elapsed_ms_total"] = last_action_response["elapsed_ms_total"]
+        logger.info("[chatbot-response] source=assistant_last_action latency_ms=%.1f", (time.perf_counter() - t0) * 1000.0)
+        return await _merge_persisted(last_action_response)
     if assistant_mode == "query" and "sop_count" in intents and not ({"summary", "compare", "linked"} & intents):
         response = _deterministic_sop_count_response(question, active_scope)
         response["retrieval_stats"].update(
@@ -4202,6 +4990,23 @@ async def query_ai(
             (time.perf_counter() - t0) * 1000.0,
         )
         return await _merge_persisted(response)
+    if "metadata" in intents and active_scope.get("active_sop_id") and not ({"summary", "compare", "linked", "sop_count", "sop_list"} & intents):
+        response = _deterministic_active_sop_metadata_response(question, assistant_context)
+        if response:
+            response["retrieval_stats"].update(
+                {
+                    "provider": "deterministic",
+                    "model": "live_editor_context",
+                    "surface": surface,
+                    "intents": sorted(intents),
+                    "assistant_mode": assistant_mode,
+                    "latency_ms_total": round((time.perf_counter() - t0) * 1000.0, 1),
+                }
+            )
+            response["elapsed_ms_total"] = round((time.perf_counter() - t0) * 1000.0, 1)
+            response["retrieval_stats"]["elapsed_ms_total"] = response["elapsed_ms_total"]
+            logger.info("[chatbot-response] source=live_sop_metadata latency_ms=%.1f", (time.perf_counter() - t0) * 1000.0)
+            return await _merge_persisted(response)
     action_plan = None
     if assistant_mode == "action":
         action_plan = _plan_sop_action(question, assistant_context)
@@ -4266,7 +5071,12 @@ async def query_ai(
     live_block = (context_summary or "").strip()
     live_ctx_chars = len(live_block)
     if live_ctx_chars > 60:
-        question_for_rag = f"{question_for_rag}\n\n{live_block[:3200]}"
+        live_limit = 7000 if re.search(
+            r"\b(full|whole|entire|complete)\s+(?:sop|document|doc)\b|\b(?:summarize|summary|explain|tell\s+me\s+about)\s+(?:this\s+|the\s+|current\s+|active\s+)?sop\b",
+            question,
+            re.IGNORECASE,
+        ) else 3600
+        question_for_rag = f"{question_for_rag}\n\n{live_block[:live_limit]}"
 
     if action_plan:
         question_for_rag = (

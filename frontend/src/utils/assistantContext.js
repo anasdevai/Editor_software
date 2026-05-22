@@ -47,6 +47,132 @@ function sanitizeObjectStrings(input, maxLen = 240) {
   return out
 }
 
+function deriveLineRows(text) {
+  return String(text || '')
+    .split(/\r?\n/)
+    .map((line, index) => ({
+      line_id: `ln_${index + 1}`,
+      text: sanitizeText(line, 600),
+      line_number: index + 1,
+    }))
+    .filter((row) => row.text)
+}
+
+const SECTION_ALIAS_MAP = {
+  purpose: ['Zweck', 'Ziel', '1. Purpose', 'objective'],
+  scope: ['Geltungsbereich', 'Anwendungsbereich', 'applicability'],
+  responsibilities: ['Verantwortlichkeiten', 'roles', 'who is responsible'],
+  definitions: ['Definitionen', 'glossary', 'terms', 'begriffe'],
+  deviations: ['Abweichungen', 'DEV', 'nonconformance'],
+  capas: ['Korrekturmaßnahmen', 'corrective actions', 'CAPA', 'CAPAs'],
+  audits: ['Auditbericht', 'audit', 'findings', 'Audit Findings'],
+  references: ['Referenzen', 'related documents', 'see also'],
+  zweck: ['Purpose', 'Objective', 'Ziel', '1. Zweck'],
+  geltungsbereich: ['Scope', 'applicability', 'Geltungsbereich'],
+  abweichungen: ['Deviations', 'DEV', 'Abweichungen'],
+  korrekturmaßnahmen: ['CAPAs', 'CAPA', 'corrective actions', 'Korrekturmaßnahmen'],
+}
+
+function traceabilityKindFromLabel(label = '') {
+  const low = String(label || '').toLowerCase()
+  if (/\bcapas?\b|korrektur/.test(low)) return 'capa'
+  if (/\b(?:deviations?|abweichungen?)\b/.test(low)) return 'deviation'
+  if (/\b(?:audits?|audit\s+findings?)\b/.test(low)) return 'audit'
+  if (/\b(?:decisions?|entscheidungen?)\b/.test(low)) return 'decision'
+  return null
+}
+
+const TRACEABILITY_KIND_ALIASES = {
+  capa: ['capa', 'capas', 'Korrekturmaßnahmen', 'corrective actions', 'CAPA', 'CAPAs'],
+  deviation: ['deviation', 'deviations', 'Abweichungen', 'DEV', 'devs'],
+  audit: ['audit', 'audits', 'Audit Findings', 'auditbericht', 'findings'],
+  decision: ['decision', 'decisions', 'Entscheidungen', 'DEC'],
+}
+
+function labelAliasesForSection(label = '') {
+  const normalized = String(label || '')
+    .replace(/^\s*\d+(?:\.\d+)*[.)\]:-]?\s*/, '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+  const aliases = [...(SECTION_ALIAS_MAP[normalized] || [])]
+  if (SECTION_ALIAS_MAP[normalized]) {
+    aliases.push(normalized, normalized.charAt(0).toUpperCase() + normalized.slice(1))
+  }
+  const kind = traceabilityKindFromLabel(label)
+  if (kind && TRACEABILITY_KIND_ALIASES[kind]) {
+    aliases.push(...TRACEABILITY_KIND_ALIASES[kind])
+  }
+  if (label) aliases.push(label)
+  return [...new Set(aliases.filter(Boolean))]
+}
+
+function deriveSopSections(text) {
+  const rows = deriveLineRows(text)
+  if (!rows.length) return []
+
+  const isHeading = (value) => {
+    const line = String(value || '').trim()
+    const cleanLine = line.replace(/^[^\p{L}\p{N}]+/u, '').trim()
+    if (!line) return false
+    if (/^(deviations?|abweichungen?|capas?|capa|audits?|audit findings?|entscheidungen?|decisions?)\b/i.test(cleanLine)) return true
+    if (/\bzugeh(?:ö|oe|Ã¶)rig\s+zu\s+SOP-/i.test(cleanLine)) return true
+    if (/^\d+(?:\.\d+)*[)\].:-]?\s+\S/u.test(line) && line.length < 180) return true
+    if (/^(purpose|scope|procedure|responsibilities|definitions|approval|revision history|zweck|geltungsbereich|verfahren|verantwortlichkeiten)\b/i.test(line)) return true
+    if (/^[A-ZÄÖÜ][A-ZÄÖÜ0-9\s/&()-]{4,}$/u.test(line) && line.length < 120) return true
+    return false
+  }
+
+  const sections = []
+  let current = null
+  rows.forEach((row) => {
+    if (isHeading(row.text)) {
+      if (current) sections.push(current)
+      current = {
+        id: `sec_${sections.length + 1}`,
+        label: row.text,
+        order: sections.length + 1,
+        content: row.text,
+        lines: [row],
+      }
+      return
+    }
+    if (!current) {
+      current = {
+        id: 'sec_1',
+        label: 'Document',
+        order: 1,
+        content: '',
+        lines: [],
+      }
+    }
+    current.lines.push(row)
+    current.content = `${current.content ? `${current.content}\n` : ''}${row.text}`.trim()
+  })
+  if (current) sections.push(current)
+  return sections.slice(0, 30).map((section) => ({
+    ...section,
+    content: sanitizeText(section.content, 2400),
+    lines: section.lines.slice(0, 80),
+    label_aliases: labelAliasesForSection(section.label),
+  }))
+}
+
+function buildSelectedSectionPayload(editorState, sections) {
+  const selected = editorState?.selected_section || {}
+  const selectedName = sanitizeText(selected?.name || editorState?.selected_section_name || '', 160)
+  const selectedText = sanitizeText(editorState?.selected_text || '', 2400)
+  const matched = selectedName
+    ? sections.find((section) => section.label.toLowerCase() === selectedName.toLowerCase())
+    : null
+  const content = selectedText || sanitizeText(matched?.content || selected?.text_excerpt || '', 2400)
+  return {
+    id: matched?.id || null,
+    label: selectedName || matched?.label || null,
+    content: content || null,
+  }
+}
+
 function trimEntityList(items, limit = 6) {
   if (!Array.isArray(items)) return []
   return items.slice(0, limit).map((entry) => {
@@ -76,6 +202,11 @@ export function getKLAssistantContext(pathname = '/') {
   const onEditorSurface =
     pathname.startsWith('/editor') ||
     ((pathname === '/sops' || pathname.startsWith('/sops/')) && workspaceEditorTabActive)
+  const editorText = sanitizeText(editorState?.editor_text, 9000)
+  const sections = deriveSopSections(editorText)
+  const selectedSectionPayload = buildSelectedSectionPayload(editorState, sections)
+  const metadata = sanitizeObjectStrings(editorState?.sop?.metadata || {}, 220)
+  const metadataJson = sanitizeObjectStrings(editorState?.sop?.metadata_json || {}, 220)
 
   return {
     route: pathname,
@@ -87,11 +218,19 @@ export function getKLAssistantContext(pathname = '/') {
       sop_number: editorState?.sop?.sop_number || editorState?.sop?.documentId || '',
       title: editorState?.sop?.title || '',
       version: editorState?.sop?.version || '',
+      owner: metadata?.owner || metadata?.author || metadata?.department || '',
       current_version_id: editorState?.sop?.current_version_id || '',
       status: editorState?.sop?.status || '',
+      created_at: metadata?.createdAt || metadata?.created_at || null,
+      updated_at: editorState?.updated_at || null,
+      tags: Array.isArray(metadata?.tags) ? metadata.tags : [],
+      compliance_standards: Array.isArray(metadata?.regulatoryReferences) ? metadata.regulatoryReferences : [],
       references: Array.isArray(editorState?.sop?.references) ? editorState.sop.references : [],
-      metadata: sanitizeObjectStrings(editorState?.sop?.metadata || {}, 220),
-      metadata_json: sanitizeObjectStrings(editorState?.sop?.metadata_json || {}, 220),
+      metadata,
+      metadata_json: metadataJson,
+      sections,
+      full_text: editorText,
+      word_count: editorText ? editorText.split(/\s+/).filter(Boolean).length : 0,
     },
     selected_text: sanitizeText(editorState?.selected_text || '', 2400),
     selected_range:
@@ -103,12 +242,15 @@ export function getKLAssistantContext(pathname = '/') {
           }
         : null,
     selected_section: {
+      id: selectedSectionPayload.id,
       name: sanitizeText(
         editorState?.selected_section?.name
         || editorState?.selected_section_name
         || '',
         160,
       ),
+      label: selectedSectionPayload.label,
+      content: selectedSectionPayload.content,
       type: sanitizeText(editorState?.selected_section?.type || '', 80),
       scope: sanitizeText(editorState?.selected_section?.scope || '', 80),
       text_excerpt: sanitizeText(editorState?.selected_section?.text_excerpt || '', 1200),
@@ -141,6 +283,28 @@ export function getKLAssistantContext(pathname = '/') {
             updated_at: actionMemory.last_action.updated_at || null,
           }
         : null,
+    last_focus:
+      actionMemory?.last_focus && typeof actionMemory.last_focus === 'object'
+        ? {
+            target_scope: sanitizeText(actionMemory.last_focus.target_scope || '', 80),
+            section_name: sanitizeText(actionMemory.last_focus.section_name || '', 160),
+            sop_id: sanitizeText(actionMemory.last_focus.sop_id || '', 80),
+            sop_number: sanitizeText(actionMemory.last_focus.sop_number || '', 80),
+            sop_title: sanitizeText(actionMemory.last_focus.sop_title || '', 180),
+            source: sanitizeText(actionMemory.last_focus.source || '', 60),
+            updated_at: actionMemory.last_focus.updated_at || null,
+          }
+        : null,
+    active_scope:
+      actionMemory?.active_scope && typeof actionMemory.active_scope === 'object'
+        ? actionMemory.active_scope
+        : null,
+    instruction_memory: Array.isArray(actionMemory?.instruction_memory)
+      ? actionMemory.instruction_memory.slice(-12)
+      : [],
+    conversation_history: Array.isArray(actionMemory?.conversation_history)
+      ? actionMemory.conversation_history.slice(-24)
+      : [],
     context_updated_at: editorState?.updated_at || workspaceState?.updated_at || null,
   }
 }
@@ -164,13 +328,35 @@ export function resetAssistantStateOnce() {
   }
 }
 
+export function saveAssistantSessionSnapshot(snapshot = {}) {
+  if (typeof window === 'undefined' || !snapshot || typeof snapshot !== 'object') return
+  const existing = readLocalJson(KL_ASSISTANT_ACTION_MEMORY_KEY, {})
+  try {
+    localStorage.setItem(
+      KL_ASSISTANT_ACTION_MEMORY_KEY,
+      JSON.stringify({
+        ...existing,
+        updated_at: new Date().toISOString(),
+        active_scope: snapshot.active_scope || existing.active_scope || null,
+        instruction_memory: snapshot.instruction_memory || existing.instruction_memory || [],
+        conversation_history: snapshot.conversation_history || existing.conversation_history || [],
+      }),
+    )
+    window.dispatchEvent(new CustomEvent('sop-editor-context-changed'))
+  } catch {
+    // ignore
+  }
+}
+
 export function saveAssistantLastAction(action) {
   if (typeof window === 'undefined' || !action || typeof action !== 'object') return
+  const existing = readLocalJson(KL_ASSISTANT_ACTION_MEMORY_KEY, {})
   const safe = {
     updated_at: new Date().toISOString(),
     action: sanitizeText(action.action || '', 60),
     target_scope: sanitizeText(action.target_scope || '', 80),
     section_name: sanitizeText(action.section_name || '', 160),
+    section_id: sanitizeText(action.section_id || action.section_name || '', 160),
     sop_id: sanitizeText(action.sop_id || '', 80),
     sop_number: sanitizeText(action.sop_number || '', 80),
     sop_title: sanitizeText(action.sop_title || '', 180),
@@ -180,14 +366,56 @@ export function saveAssistantLastAction(action) {
     status: sanitizeText(action.status || '', 60),
     source: sanitizeText(action.source || '', 60),
   }
+  const activeScope = {
+    section_id: safe.section_id || existing?.active_scope?.section_id || null,
+    section_label: safe.section_name || existing?.active_scope?.section_label || null,
+    last_action: safe.action || null,
+    last_result: safe.suggested_text_excerpt || existing?.active_scope?.last_result || null,
+    last_result_length: safe.suggested_text_excerpt
+      ? safe.suggested_text_excerpt.split(/\s+/).filter(Boolean).length
+      : Number(existing?.active_scope?.last_result_length || 0),
+  }
   try {
     localStorage.setItem(
       KL_ASSISTANT_ACTION_MEMORY_KEY,
       JSON.stringify({
         updated_at: safe.updated_at,
+        last_focus: existing?.last_focus || null,
         last_action: safe,
+        active_scope: activeScope,
+        instruction_memory: existing?.instruction_memory || [],
+        conversation_history: existing?.conversation_history || [],
       }),
     )
+    window.dispatchEvent(new CustomEvent('sop-editor-context-changed'))
+  } catch {
+    // Ignore storage errors.
+  }
+}
+
+export function saveAssistantLastFocus(focus) {
+  if (typeof window === 'undefined' || !focus || typeof focus !== 'object') return
+  const existing = readLocalJson(KL_ASSISTANT_ACTION_MEMORY_KEY, {})
+  const safe = {
+    updated_at: new Date().toISOString(),
+    target_scope: sanitizeText(focus.target_scope || '', 80),
+    section_name: sanitizeText(focus.section_name || '', 160),
+    sop_id: sanitizeText(focus.sop_id || '', 80),
+    sop_number: sanitizeText(focus.sop_number || '', 80),
+    sop_title: sanitizeText(focus.sop_title || '', 180),
+    source: sanitizeText(focus.source || '', 60),
+  }
+  if (!safe.section_name && safe.target_scope !== 'full_document') return
+  try {
+    localStorage.setItem(
+      KL_ASSISTANT_ACTION_MEMORY_KEY,
+      JSON.stringify({
+        updated_at: safe.updated_at,
+        last_action: existing?.last_action || null,
+        last_focus: safe,
+      }),
+    )
+    window.dispatchEvent(new CustomEvent('sop-editor-context-changed'))
   } catch {
     // Ignore storage errors.
   }
@@ -197,6 +425,7 @@ export function clearAssistantLastAction() {
   if (typeof window === 'undefined') return
   try {
     localStorage.removeItem(KL_ASSISTANT_ACTION_MEMORY_KEY)
+    window.dispatchEvent(new CustomEvent('sop-editor-context-changed'))
   } catch {
     // Ignore storage errors.
   }

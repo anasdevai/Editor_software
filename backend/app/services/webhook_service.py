@@ -157,21 +157,31 @@ def handle_entity_event(
     if normalized not in ENTITY_TYPES:
         raise ValueError(f"Unsupported entity_type: {entity_type}")
 
-    ev = event.strip().lower()
-    if ev == "deleted":
+    ev = event.strip().lower().replace("-", "_")
+    delete_events = {"deleted", "delete", "removed", "remove", "archived", "deactivated"}
+    update_events = {"created", "create", "updated", "update", "upserted", "upsert", "linked", "link", "imported", "import"}
+    if ev in delete_events:
         SemanticPipelineService.purge_entity_artifacts(normalized, entity_id)
         from .rag_cache import invalidate_runtime_rag_cache
 
         invalidate_runtime_rag_cache()
         return {"status": "purged", "entity_type": normalized, "entity_id": str(entity_id)}
 
-    if ev in ("created", "updated", "linked", "imported"):
+    if ev in update_events:
+        canonical_event = {
+            "create": "created",
+            "upsert": "updated",
+            "upserted": "updated",
+            "update": "updated",
+            "link": "linked",
+            "import": "imported",
+        }.get(ev, ev)
         job_id = schedule_semantic_reindex(
             normalized,
             entity_id,
             version_id,
-            job_type=f"webhook_{ev}",
-            skip_unchanged_import=(ev != "updated"),
+            job_type=f"webhook_{canonical_event}",
+            skip_unchanged_import=(canonical_event != "updated"),
         )
         return {
             "status": "queued" if job_id else "skipped",

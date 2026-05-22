@@ -379,6 +379,28 @@ class HybridRetriever(BaseRetriever):
             if not corpus_docs:
                 return []
             bm25 = BM25Okapi([d.page_content.lower().split() for d in corpus_docs])
+
+        if self.metadata_filters and isinstance(self.metadata_filters, dict):
+            allowed = self.metadata_filters.get("allowed_entity_ids")
+            if isinstance(allowed, list):
+                allowed_set = {str(v).strip().lower() for v in allowed if str(v).strip()}
+                if not allowed_set:
+                    return []
+                corpus_docs = [
+                    d
+                    for d in corpus_docs
+                    if str(
+                        (d.metadata or {}).get("entity_id")
+                        or (d.metadata or {}).get("source_id")
+                        or (d.metadata or {}).get("metadata", {}).get("entity_id")
+                        or (d.metadata or {}).get("metadata", {}).get("source_id")
+                        or ""
+                    ).strip().lower()
+                    in allowed_set
+                ]
+                if not corpus_docs:
+                    return []
+                bm25 = BM25Okapi([d.page_content.lower().split() for d in corpus_docs])
              
         bm25_scores = bm25.get_scores(query.lower().split())
         top_bm25_idx = np.argsort(bm25_scores)[::-1][:self.bm25_top_k]
@@ -424,6 +446,15 @@ class HybridRetriever(BaseRetriever):
             if not doc.metadata:
                 doc.metadata = {}
             doc.metadata["hybrid_score"] = float(r["score"])
+            doc.metadata["retrieval_mode"] = "hybrid_dense_bm25"
+            doc.metadata["dense_hits"] = len(dense_results)
+            doc.metadata["bm25_hits"] = len(bm25_results)
+            doc.metadata["fusion_weights"] = {
+                "dense": float(self.dense_weight),
+                "bm25": float(self.bm25_weight),
+            }
+            doc.metadata["dense_top_k"] = int(self.dense_top_k)
+            doc.metadata["bm25_top_k"] = int(self.bm25_top_k)
         result = [r["doc"] for r in ranked[: self.final_top_k]]
         if RAG_DEBUG_RETRIEVAL:
             logger.debug(

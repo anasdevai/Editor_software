@@ -38,8 +38,16 @@ def _is_model_cached(cache_dir: str, model_name: str) -> bool:
     ]
     for root in candidate_roots:
         snapshots_dir = root / "snapshots"
-        if snapshots_dir.exists() and any(p.is_dir() for p in snapshots_dir.iterdir()):
-            return True
+        if not snapshots_dir.exists():
+            continue
+        for snapshot in snapshots_dir.iterdir():
+            if not snapshot.is_dir():
+                continue
+            modules_file = snapshot / "modules.json"
+            model_file = snapshot / "config.json"
+            pooling_file = snapshot / "1_Pooling" / "config.json"
+            if modules_file.exists() and model_file.exists() and pooling_file.exists():
+                return True
     return False
 
 def get_embedder() -> HuggingFaceEmbeddings:

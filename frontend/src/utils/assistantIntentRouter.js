@@ -5,8 +5,9 @@
 
 import { classifyAssistantIntent } from '../api/editorApi'
 import { queryEditorHasNonEmptySelection } from './editorActionsBridge'
-import { getKLAssistantContext } from './assistantContext'
+import { getKLAssistantContext, saveAssistantSessionSnapshot } from './assistantContext'
 import { EDITOR_AI_ACTIONS, hasActiveSopEditor } from './editorAiBridge'
+import { wantsSectionScopeIntent } from './editorTargetResolver.js'
 
 const ACTION_MAP = {
   rewrite: EDITOR_AI_ACTIONS.REWRITE,
@@ -73,7 +74,17 @@ export async function classifyAssistantMessage({ message, pathname = '/', recent
       recent_messages: Array.isArray(recentMessages) ? recentMessages.slice(-8) : [],
       assistant_context: assistantContext,
     })
-    return normalizeClassification(result)
+    const normalized = normalizeClassification(result)
+    if (result?.session_snapshot) {
+      saveAssistantSessionSnapshot(result.session_snapshot)
+    } else if (result?.active_scope) {
+      saveAssistantSessionSnapshot({
+        active_scope: result.active_scope,
+        instruction_memory: result.instruction_memory || [],
+        conversation_history: result.conversation_history || [],
+      })
+    }
+    return normalized
   } catch (err) {
     console.warn('[assistant-intent] classification failed, defaulting to chat', err)
     return {
@@ -93,17 +104,31 @@ export async function classifyAssistantMessage({ message, pathname = '/', recent
 function normalizeClassification(raw) {
   const rawFlow = String(raw?.flow || '').trim().toLowerCase()
   const flow = ['chat', 'editor_action', 'clarify', 'follow_up_action'].includes(rawFlow) ? rawFlow : 'chat'
+  const resolved = raw?.resolved_scope && typeof raw.resolved_scope === 'object' ? raw.resolved_scope : null
+  let targetScope = raw?.target_scope || null
+  let sectionHint = raw?.section_hint || null
+  if (resolved?.target_scope) targetScope = resolved.target_scope
+  if (resolved?.section_label && !sectionHint) sectionHint = resolved.section_label
+  if (targetScope === 'previous_suggestion') targetScope = 'section'
   return {
     flow,
     action: raw?.action || null,
-    target_scope: raw?.target_scope || null,
-    section_hint: raw?.section_hint || null,
+    target_scope: targetScope,
+    section_hint: sectionHint,
+    line_number: raw?.line_number || resolved?.line_number || null,
+    record_id: raw?.record_id || resolved?.record_id || null,
     linked_entity_types: Array.isArray(raw?.linked_entity_types) ? raw.linked_entity_types : [],
     constraints: raw?.constraints && typeof raw.constraints === 'object' ? raw.constraints : {},
     previous_action: raw?.previous_action && typeof raw.previous_action === 'object' ? raw.previous_action : null,
     clarification_question: raw?.clarification_question || null,
     confidence: typeof raw?.confidence === 'number' ? raw.confidence : 0.5,
-    reasoning: raw?.reasoning || null,
+    reasoning: raw?.reasoning || raw?.reason || null,
+    frustration_signal: raw?.frustration_signal && typeof raw.frustration_signal === 'object' ? raw.frustration_signal : null,
+    source_content_override: raw?.source_content_override && typeof raw.source_content_override === 'object'
+      ? raw.source_content_override
+      : null,
+    repetition_instruction: raw?.repetition_instruction || null,
+    updated_active_scope: raw?.updated_active_scope || raw?.active_scope || null,
   }
 }
 
@@ -121,11 +146,20 @@ export function mapClassificationToEditorAction(classification) {
 export function planEditorActionExecution(classification, opts = {}) {
   const intent = opts.explicitAction || mapClassificationToEditorAction(classification)
   const rawScope = String(classification?.target_scope || '').toLowerCase()
+  const sectionHint = String(
+    classification?.section_hint || classification?.record_id || '',
+  ).trim()
+  const userMessage = String(opts.userMessage || '').trim()
   const scope =
-    rawScope === 'previous_suggestion' || rawScope === 'current_section'
+    rawScope === 'full_document'
+      ? 'full_document'
+      : sectionHint || classification?.record_id
+      ? 'section'
+      : wantsSectionScopeIntent(userMessage)
+      ? 'section'
+      : rawScope === 'previous_suggestion' || rawScope === 'current_section'
       ? 'section'
       : rawScope
-  const sectionHint = String(classification?.section_hint || '').trim()
   const snapshotOptions = {
     sectionHint,
     targetScope: scope,
@@ -143,9 +177,7 @@ export function planEditorActionExecution(classification, opts = {}) {
 
   const c = classification?.constraints || {}
   let inlineAction = intent
-  if (intent === EDITOR_AI_ACTIONS.REWRITE && (c.length === 'shorter' || c.word_count || c.line_count)) {
-    inlineAction = EDITOR_AI_ACTIONS.SUMMARIZE
-  } else if (intent === EDITOR_AI_ACTIONS.REWRITE && (c.tone === 'formal' || c.detail_level)) {
+  if (intent === EDITOR_AI_ACTIONS.REWRITE && (c.tone === 'formal' || c.detail_level)) {
     inlineAction = EDITOR_AI_ACTIONS.IMPROVE
   }
 
@@ -176,6 +208,7 @@ export function buildEnrichedActionPrompt(message, classification = {}) {
   const hints = []
   const c = classification.constraints || {}
 
+  hints.push('Output language: keep the same language as the target SOP text/profile unless the user explicitly requests another language.')
   if (c.tone) hints.push(`Tone: ${c.tone}`)
   if (c.word_count) hints.push(`Target length: about ${c.word_count} words`)
   if (c.line_count) hints.push(`Keep the answer to roughly ${c.line_count} lines (short lines / bullets acceptable).`)
@@ -205,6 +238,24 @@ export function buildEnrichedActionPrompt(message, classification = {}) {
   }
   if (classification.target_scope === 'selection') {
     hints.push('Apply only to the current editor selection.')
+  }
+  if (classification.line_number) {
+    hints.push(`Target line number: ${classification.line_number}`)
+  }
+  if (classification.record_id) {
+    hints.push(`Target record entry: ${classification.record_id}`)
+  }
+  if (classification.source_content_override?.enabled && classification.source_content_override?.content) {
+    hints.push('Operate on the previous assistant output for this section, not the original SOP source.')
+  }
+  if (classification.repetition_instruction) {
+    hints.push(classification.repetition_instruction)
+  }
+  if (classification.frustration_signal?.detected) {
+    if (classification.frustration_signal.target_word_count) {
+      hints.push(`Target word count: about ${classification.frustration_signal.target_word_count} words`)
+    }
+    hints.push('User is refining the previous result — keep the same section target.')
   }
   if (classification.target_scope === 'linked_context' && classification.linked_entity_types?.length) {
     hints.push(`Focus on linked records: ${classification.linked_entity_types.join(', ')}`)

@@ -45,7 +45,7 @@ export function getTraceabilitySectionKind(text = '') {
   const raw = String(text || '').trim()
   if (REGISTER_FIELD_LINE_RE.test(raw)) return null
   const t = raw.replace(/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/gu, ' ').toLowerCase()
-  const hasCapa = /\bcapas?\b/.test(t)
+  const hasCapa = /\b(?:capas?|caps)\b/.test(t)
   const hasDev = /\bdeviations?\b|\babweichungen?\b/.test(t)
   const hasDec = /\bdecisions?\b|\bentscheidungen?\b/.test(t)
   const hasAud = /\baudit\s+findings?\b/.test(t) || (/\baudit\b/.test(t) && !hasCapa && !hasDev)

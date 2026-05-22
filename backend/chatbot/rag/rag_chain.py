@@ -1351,17 +1351,19 @@ class SmartRAGChain:
         """
         filters = {}
         q = query.upper()
-        
-        # 1. Department pattern (e.g. IT/sops, HR documents)
-        dept_match = re.search(r'\b(IT|HR|FINANCE|QUALITY|COMPLIANCE|SECURITY|OPS|LEGAL)\b', q)
-        if dept_match:
-            filters["department"] = dept_match.group(1)
-            
-        # 2. Document ID pattern (e.g. SOP-xxx, DEV-xxx)
+
+        # 1. Document ID pattern (e.g. SOP-xxx, DEV-xxx). Exact IDs must not
+        # also create accidental department filters such as SOP-IT-002 -> IT.
         id_match = re.search(r'\b(SOP|DEV|CAPA|AUDIT|DEC)-[A-Z0-9-]+\b', q)
         if id_match:
             filters["ref_number"] = id_match.group(0)
-            
+            return filters
+
+        # 2. Department pattern (e.g. IT/sops, HR documents)
+        dept_match = re.search(r'\b(IT|HR|FINANCE|QUALITY|COMPLIANCE|SECURITY|OPS|LEGAL)\b', q)
+        if dept_match:
+            filters["department"] = dept_match.group(1)
+
         return filters
 
     def _find_active_doc_id(self, chat_history: List[Dict]) -> str:
@@ -1958,6 +1960,10 @@ class SmartRAGChain:
             "retrieval_debug": _build_retrieval_debug_rows(all_docs),
             "suggestions": suggestions,
             "retrieval_stats": {
+                "retrieval_mode": "hybrid_dense_bm25_rerank",
+                "dense_enabled": True,
+                "bm25_enabled": True,
+                "rerank_enabled": type(self.federated.reranker).__name__ != "NoopReranker",
                 "searched":     target_sections,
                 "per_section":  per_section_counts,
                 "total_docs":   len(all_docs),

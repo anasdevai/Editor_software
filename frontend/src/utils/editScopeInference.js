@@ -2,11 +2,17 @@
  * Infer edit_scope for /api/ai/action (section_only vs full_document).
  */
 
-import { wantsFullSopIntent } from './sopActionIntent'
+import { resolveTargetInEditor } from './editorTargetResolver.js'
+import { getTraceabilitySectionKind, wantsFullSopIntent } from './sopActionIntent.js'
 
 const RECORD_ID_RE = /\b(?:DEV|CAPA|AUD|DEC)-[A-Z0-9]+-\d+\b/gi
 const BACKBONE_RE =
   /(?:^|\n)\s*(?:#{1,6}\s*)?(?:1\.|2\.|3\.|4\.|5\.)\s*(?:ZWECK|PURPOSE|GELTUNGSBEREICH|SCOPE|VERANTWORTLICH|VERFAHREN|PROCEDURE)/im
+const NUMBERED_SECTION_HEADING_RE =
+  /^\s*(?:#{1,6}\s*)?\d+(?:\.\d+)*[.)]?\s+[\p{L}\p{N}][\p{L}\p{N}\s/&()|:.,-]{1,120}$/iu
+const NAMED_SECTION_HEADING_RE =
+  /^\s*(?:#{1,6}\s*)?(?:zweck|purpose|ziel|scope|geltungsbereich|anwendungsbereich|responsibilit(?:y|ies)|verantwortlich(?:keiten)?|procedure|verfahren|definitions?|definitionen|deviations?|abweichungen|capas?|caps|capa|audit(?:\s+findings?)?|entscheidungen|decisions?)\b/iu
+const REGISTER_ID_HEADING_RE = /^\s*(?:DEV|CAPA|AUD|DEC)-[A-Z0-9]+-\d+\b/i
 
 export function isTraceabilityRegisterSelection(text = '') {
   const t = String(text || '').trim()
@@ -30,6 +36,53 @@ export function inferEditScope({ text = '', from = 0, to = 0, docSize = 0, instr
     return 'full_document'
   }
   return 'section_only'
+}
+
+function expansionHintForSelection(text = '') {
+  const t = String(text || '').trim()
+  const traceabilityKind = getTraceabilitySectionKind(t)
+  if (traceabilityKind) return traceabilityKind
+  const recordPrefix = (t.match(REGISTER_ID_HEADING_RE)?.[0] || '').slice(0, 4).toUpperCase()
+  if (recordPrefix === 'CAPA') return 'capas'
+  if (recordPrefix === 'DEV-') return 'deviations'
+  if (recordPrefix === 'AUD-') return 'audit'
+  if (recordPrefix === 'DEC-') return 'decisions'
+  return t.replace(/\s+/g, ' ').trim()
+}
+
+function isExpandableSectionCue(text = '') {
+  const t = String(text || '').trim()
+  if (!t || t.length > 180) return false
+  const lines = t.split(/\r?\n/).map((line) => line.trim()).filter(Boolean)
+  if (lines.length > 2) return false
+  if (getTraceabilitySectionKind(t)) return true
+  if (REGISTER_ID_HEADING_RE.test(t)) return true
+  if (NUMBERED_SECTION_HEADING_RE.test(t)) return true
+  if (NAMED_SECTION_HEADING_RE.test(t)) return true
+  return false
+}
+
+function expandHeadingSelectionToSection(editor, { from, to, text } = {}) {
+  if (!isExpandableSectionCue(text)) return null
+  const sectionHint = expansionHintForSelection(text)
+  if (!sectionHint) return null
+  try {
+    const target = resolveTargetInEditor(editor, {
+      prompt: `rewrite ${sectionHint} section`,
+      userPrompt: `rewrite ${sectionHint} section`,
+      sectionHint,
+      targetScope: 'section',
+    })
+    if (!target?.text) return null
+    const expandedFrom = Number(target.from)
+    const expandedTo = Number(target.to)
+    if (!Number.isFinite(expandedFrom) || !Number.isFinite(expandedTo)) return null
+    if (expandedFrom > from || expandedTo < to) return null
+    if (target.text.trim().length <= String(text || '').trim().length) return null
+    return target
+  } catch {
+    return null
+  }
 }
 
 /**
@@ -58,6 +111,14 @@ export function captureEditorSelectionForAction(editor) {
     to = docSize
     text = state.doc.textBetween(from, to, '\n').trim()
     selectedFraction = 1
+  } else {
+    const expanded = expandHeadingSelectionToSection(editor, { from, to, text })
+    if (expanded) {
+      from = expanded.from
+      to = expanded.to
+      text = expanded.text.trim()
+      selectedFraction = Math.abs(to - from) / Math.max(1, docSize)
+    }
   }
 
   const editScope = nearFullSpan

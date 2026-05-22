@@ -11,7 +11,7 @@ const FULL_SOP_PATTERNS = [
 ]
 
 const SECTION_INTENT_PATTERNS = [
-  /\b(?:rewrite|improve|enhance|polish|optimi[sz]e|refine|verbessere?n?)\s+(?:the\s+)?(.+?)\s+section\b/i,
+  /\b(?:rewrite|improve|enhance|polish|optimi[sz]e|refine|verbessere?n?)\s+(?:the\s+)?(.+?)\s+sections?\b/i,
   /\b(?:rewrite|improve)\s+(?:the\s+)?(.+?)\s+(?:teil|abschnitt)\b/i,
   /\b(?:section|abschnitt)\s+["']?(.+?)["']?\s+(?:rewrite|improve)\b/i,
 ]
@@ -32,6 +32,39 @@ const LABEL_BEFORE_VERB_PATTERNS = [
 
 function escapeRegExp(value) {
   return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function normalizeForAlias(value) {
+  return String(value || '')
+    .replace(/^\s*\d+(?:\.\d+)*[.)\]:-]?\s*/, '')
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
+}
+
+const SECTION_ALIAS_MAP = {
+  purpose: ['purpose', 'zweck', 'ziel', 'aim', 'objective', 'sweck', 'zwect', 'zwek'],
+  scope: ['scope', 'geltungsbereich', 'anwendungsbereich', 'bereich'],
+  responsibilities: ['responsibilities', 'responsibility', 'verantwortlichkeiten', 'verantwortung', 'roles'],
+  definitions: ['definitions', 'definitionen', 'begriffe', 'abkuerzungen', 'abkürzungen'],
+  procedure: ['procedure', 'verfahren', 'prozess', 'process', 'steps', 'vorgehen'],
+  deviations: ['deviations', 'deviation', 'abweichungen', 'abweichung', 'dev'],
+  capas: ['capas', 'capa', 'corrective actions', 'corrective and preventive actions', 'korrekturmaßnahmen', 'korrekturmassnahmen'],
+  audits: ['audits', 'audit', 'audit findings', 'auditbericht', 'auditberichte'],
+}
+
+function aliasCandidates(label) {
+  const norm = normalizeForAlias(label)
+  const out = new Set([label, norm])
+  Object.entries(SECTION_ALIAS_MAP).forEach(([canonical, aliases]) => {
+    const normalizedAliases = aliases.map(normalizeForAlias)
+    if (norm === canonical || normalizedAliases.includes(norm)) {
+      out.add(canonical)
+      normalizedAliases.forEach((a) => out.add(a))
+    }
+  })
+  return [...out].filter((v) => String(v || '').trim())
 }
 
 export function extractDocumentRefsFromPrompt(prompt) {
@@ -56,7 +89,7 @@ function extractLabelsFromPrompt(promptText) {
       labels.push(
         match[1]
           .trim()
-          .replace(/\s*section\s*$/i, '')
+          .replace(/\s*sections?\s*$/i, '')
           .replace(/[.!?]+$/, '')
           .trim(),
       )
@@ -68,7 +101,7 @@ function extractLabelsFromPrompt(promptText) {
     labels.push(
       afterVerb[1]
         .trim()
-        .replace(/\s*section\s*$/i, '')
+        .replace(/\s*sections?\s*$/i, '')
         .replace(/[.!?]+$/, '')
         .trim(),
     )
@@ -98,6 +131,7 @@ export function findSectionRangeInPlainText(fullText, sectionLabel) {
     label.replace(/\s*\([^)]*\)\s*/g, ' ').replace(/\s+/g, ' ').trim(),
     label.split('(')[0].trim(),
     label.split(/\s+/)[0].trim(),
+    ...aliasCandidates(label),
   ].filter((c, i, arr) => c && c.length >= 3 && arr.indexOf(c) === i)
 
   for (const candidate of candidates) {

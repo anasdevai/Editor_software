@@ -232,7 +232,10 @@ const EditorAIBridge = ({
       try {
         const resolved = resolveTargetInEditor(liveEditor, {
           prompt: actionPrompt,
+          userPrompt: String(request?.userPrompt || ''),
           selection: selectionPayload,
+          sectionHint: String(request?.sectionHint || ''),
+          targetScope: String(request?.targetScope || ''),
         })
         if (resolved?.text && resolved.from != null && resolved.to != null) {
           from = resolved.from
@@ -435,7 +438,15 @@ const EditorAIBridge = ({
   }, [])
 
   useEffect(() => {
-    const unsubSnapshot = subscribeEditorSnapshotRequest(({ requestId, prompt, sectionHint, targetScope }) => {
+    const unsubSnapshot = subscribeEditorSnapshotRequest(({
+      requestId,
+      prompt,
+      userPrompt,
+      sectionHint,
+      targetScope,
+      lineNumber,
+      recordId,
+    }) => {
       const liveEditor = editorRef.current
       if (!liveEditor || liveEditor.isDestroyed || !isEditableRef.current) {
         dispatchEditorSnapshotResponse({
@@ -460,9 +471,12 @@ const EditorAIBridge = ({
       try {
         const target = resolveTargetInEditor(liveEditor, {
           prompt: String(prompt || ''),
+          userPrompt: String(userPrompt || ''),
           selection: selectionPayload,
           sectionHint: String(sectionHint || ''),
           targetScope: String(targetScope || ''),
+          lineNumber: lineNumber ?? null,
+          recordId: String(recordId || ''),
         })
         if (!target?.text || target.from == null || target.to == null) {
           dispatchEditorSnapshotResponse({
@@ -581,6 +595,7 @@ const EditorAIBridge = ({
           acceptedContent,
           isFullDoc,
           action,
+          structuredData,
         } = pending
         const insertPayload =
           acceptedContent
@@ -604,6 +619,7 @@ const EditorAIBridge = ({
             action,
             applied_scope: isFullDoc ? 'full_document' : 'selection',
             source: 'actions_tab',
+            suggestion_id: structuredData?.suggestion_id || null,
           })
         }
       } catch (err) {
@@ -749,7 +765,11 @@ const EditorAIBridge = ({
 
       if (typeof onAfterApply === 'function') {
         try {
-          onAfterApply({ action, applied_scope: isFullDocRef.current ? 'full_document' : 'selection' })
+          onAfterApply({
+            action,
+            applied_scope: isFullDocRef.current ? 'full_document' : 'selection',
+            suggestion_id: structuredData?.suggestion_id || null,
+          })
         } catch (err) {
           console.error('[editor-ai-bridge] onAfterApply failed', err)
         }

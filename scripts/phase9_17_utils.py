@@ -86,9 +86,18 @@ def api_json(method: str, path: str, payload: dict | None = None, timeout: int =
         method=method,
         headers={"Content-Type": "application/json", "Accept": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read().decode("utf-8", errors="replace")
-        return json.loads(raw) if raw else {}
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw) if raw else {}
+    except urllib.error.URLError:
+        from fastapi.testclient import TestClient
+        from app.main import app
+
+        client = TestClient(app)
+        response = client.request(method, path, json=payload, timeout=timeout)
+        response.raise_for_status()
+        return response.json() if response.content else {}
 
 
 def stable_hash(value: Any) -> str:

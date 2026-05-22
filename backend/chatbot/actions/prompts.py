@@ -283,6 +283,13 @@ def _detect_text_language(text: str) -> str:
     sample = str(text or "")[:3000]
     if not sample.strip():
         return ""
+    de_domain_hits = len(
+        re.findall(
+            r"\b(zweck|schutz|produktionsnetz|bÃ¼ronetzwerk|büronetzwerk|zugriff|zugriffe|notfall|verantwortlich|datum|beschreibung|ursache|aktion|fÃ¤llig|fällig)\b",
+            sample,
+            re.I,
+        )
+    )
     de_hits = len(
         re.findall(
             r"\b(und|die|der|das|ist|ein|eine|mit|von|bei|auf|werden|durch|oder|soll|sollen|muss|müssen|darf|dürfen)\b",
@@ -297,9 +304,28 @@ def _detect_text_language(text: str) -> str:
             re.I,
         )
     )
+    de_hits += de_domain_hits
     if de_hits == en_hits == 0:
         return ""
     return "de" if de_hits >= en_hits else "en"
+
+
+def _extract_explicit_output_language(instruction: str | None) -> str:
+    text = str(instruction or "").strip()
+    if not text:
+        return ""
+    explicit_patterns = [
+        r"\b(?:write|rewrite|respond|answer|output|translate)\s+(?:it\s+)?(?:in|to)\s+(german|deutsch|english|englisch|en|de)\b",
+        r"\b(?:in|to)\s+(german|deutsch|english|englisch)\b",
+        r"\b(?:in|to)\s+(german|deutsch|english|englisch)\s+(?:language|sprache)\b",
+        r"\boutput\s+language\s*:\s*(german|deutsch|english|englisch|en|de)\b",
+        r"\bsprache\s*:\s*(german|deutsch|english|englisch|en|de)\b",
+    ]
+    for pattern in explicit_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return _normalize_language_code(match.group(1))
+    return ""
 
 
 def _extract_detected_language(detected_nlp: dict | None) -> str:
@@ -335,9 +361,23 @@ def _infer_output_language(
     profile_md: str = "",
     context: str = "",
 ) -> str:
-    profile_lang = _normalize_language_code((profile_json or {}).get("language"))
-    if profile_lang:
-        return profile_lang
+    instruction_lang = _extract_explicit_output_language(getattr(request, "instruction", "") or "")
+    if instruction_lang:
+        return instruction_lang
+
+    text_lang = _detect_text_language(
+        "\n".join(
+            part
+            for part in [
+                getattr(request, "section_title", "") or "",
+                getattr(request, "section_type", "") or "",
+                request.section_text or "",
+            ]
+            if part
+        )
+    )
+    if text_lang:
+        return text_lang
 
     detected_lang = _extract_detected_language(detected_nlp)
     if detected_lang:
@@ -347,13 +387,13 @@ def _infer_output_language(
     if style_lang:
         return style_lang
 
+    profile_lang = _normalize_language_code((profile_json or {}).get("language"))
+    if profile_lang:
+        return profile_lang
+
     md_lang = _normalize_language_code(profile_md)
     if md_lang:
         return md_lang
-
-    text_lang = _detect_text_language(request.section_text or "")
-    if text_lang:
-        return text_lang
 
     ctx_lang = _detect_text_language(context)
     if ctx_lang:

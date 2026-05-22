@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, memo } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
-import { Send, Zap } from 'lucide-react'
+import { Plus, Send, Zap } from 'lucide-react'
 import {
   nowTime,
   runUnifiedAssistantQuery,
@@ -18,7 +18,9 @@ import {
   getKLAssistantContext,
   getAssistantContextStorageKeys,
   resetAssistantStateOnce,
+  clearAssistantLastAction,
   saveAssistantLastAction,
+  saveAssistantLastFocus,
 } from '../../utils/assistantContext'
 import {
   EDITOR_AI_ACTIONS,
@@ -43,6 +45,7 @@ import { buildGapCheckSidebarReport } from '../../utils/actionsTabGapReport'
 import './DashboardComponents.css'
 
 const LS_SESSION_BY_PATH = 'cybrain_kl_chat_session_by_path'
+const LS_MESSAGES_BY_PATH = 'cybrain_kl_chat_messages_by_path_v1'
 
 resetAssistantStateOnce()
 
@@ -68,6 +71,60 @@ function writeSessionIdForPath(pathname, sessionId) {
   }
 }
 
+function clearSessionIdForPath(pathname) {
+  try {
+    const raw = localStorage.getItem(LS_SESSION_BY_PATH)
+    const j = raw ? JSON.parse(raw) : {}
+    delete j[pathname]
+    localStorage.setItem(LS_SESSION_BY_PATH, JSON.stringify(j))
+  } catch {
+    // ignore
+  }
+}
+
+function readLocalMessagesForPath(pathname) {
+  try {
+    const raw = localStorage.getItem(LS_MESSAGES_BY_PATH)
+    const parsed = raw ? JSON.parse(raw) : {}
+    const rows = parsed?.[pathname]
+    return Array.isArray(rows) && rows.length ? rows : null
+  } catch {
+    return null
+  }
+}
+
+function writeLocalMessagesForPath(pathname, rows) {
+  try {
+    const raw = localStorage.getItem(LS_MESSAGES_BY_PATH)
+    const parsed = raw ? JSON.parse(raw) : {}
+    parsed[pathname] = (Array.isArray(rows) ? rows : [])
+      .filter((m) => m && m.role && String(m.text || '').trim())
+      .slice(-80)
+      .map((m) => ({
+        id: m.id,
+        role: m.role,
+        text: String(m.text || '').slice(0, 12000),
+        tags: Array.isArray(m.tags) ? m.tags.slice(0, 8) : [],
+        time: m.time || nowTime(),
+        isError: Boolean(m.isError),
+      }))
+    localStorage.setItem(LS_MESSAGES_BY_PATH, JSON.stringify(parsed))
+  } catch {
+    // ignore
+  }
+}
+
+function clearLocalMessagesForPath(pathname) {
+  try {
+    const raw = localStorage.getItem(LS_MESSAGES_BY_PATH)
+    const parsed = raw ? JSON.parse(raw) : {}
+    delete parsed[pathname]
+    localStorage.setItem(LS_MESSAGES_BY_PATH, JSON.stringify(parsed))
+  } catch {
+    // ignore
+  }
+}
+
 function defaultGreeting() {
   return [
     {
@@ -85,6 +142,67 @@ function mapSourcesToWidgetTags(sources) {
   return sources.slice(0, 5).map((s, idx) => s?.label || s?.id || `Quelle ${idx + 1}`)
 }
 
+const normalizeSectionLabel = (value = '') => String(value || '')
+  .toLowerCase()
+  .replace(/^\s*\d+(?:\.\d+)*[.)\]:-]?\s*/, '')
+  .replace(/[^\p{L}\p{N}]+/gu, ' ')
+  .replace(/\s+/g, ' ')
+  .trim()
+
+function editDistance(left = '', right = '') {
+  const a = String(left || '')
+  const b = String(right || '')
+  if (!a) return b.length
+  if (!b) return a.length
+  const previous = Array.from({ length: b.length + 1 }, (_, index) => index)
+  const current = Array(b.length + 1).fill(0)
+  for (let i = 1; i <= a.length; i += 1) {
+    current[0] = i
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1
+      current[j] = Math.min(previous[j] + 1, current[j - 1] + 1, previous[j - 1] + cost)
+    }
+    for (let j = 0; j <= b.length; j += 1) previous[j] = current[j]
+  }
+  return previous[b.length]
+}
+
+function findMentionedSectionFocus(message, pathname) {
+  const context = getKLAssistantContext(pathname)
+  const sections = Array.isArray(context?.current_sop?.sections) ? context.current_sop.sections : []
+  const text = normalizeSectionLabel(message)
+  if (!text || !sections.length) return null
+
+  let best = null
+  sections.forEach((section) => {
+    const label = String(section?.label || '').trim()
+    const normalized = normalizeSectionLabel(label)
+    if (!normalized) return
+    const tokens = normalized.split(' ').filter((token) => token.length > 2)
+    const matched =
+      text.includes(`${normalized} section`)
+      || text.includes(normalized)
+      || tokens.some((token) => text.includes(`${token} section`) || text.includes(`in ${token}`))
+      || tokens.some((token) => {
+        const words = text.split(' ').filter((word) => Math.abs(word.length - token.length) <= 2)
+        return words.some((word) => editDistance(word, token) <= 2)
+      })
+    if (matched && (!best || normalized.length > best.normalized.length)) {
+      best = { label, normalized }
+    }
+  })
+
+  if (!best) return null
+  return {
+    target_scope: 'section',
+    section_name: best.label,
+    sop_id: context?.current_sop?.id || context?.active_sop_id || getActiveEditorDocumentId(),
+    sop_number: context?.current_sop?.sop_number || '',
+    sop_title: context?.current_sop?.title || '',
+    source: 'sidebar_chat_focus',
+  }
+}
+
 function dbMessagesToWidget(rows) {
   if (!Array.isArray(rows) || rows.length === 0) return defaultGreeting()
   return rows.map((m) => ({
@@ -97,6 +215,25 @@ function dbMessagesToWidget(rows) {
     tags: m.role === 'user' ? [] : mapSourcesToWidgetTags(m.sources),
     time: formatChatTimeFromIso(m.created_at),
   }))
+}
+
+function mergeWidgetMessages(localRows, dbRows) {
+  const local = Array.isArray(localRows) ? localRows : []
+  const db = Array.isArray(dbRows) ? dbRows : []
+  if (!local.length) return db.length ? db : defaultGreeting()
+  if (!db.length) return local
+
+  const keyOf = (m) => `${m.role || ''}:${String(m.text || '').trim().slice(0, 500)}`
+  const seen = new Set(local.map(keyOf))
+  const merged = [...local]
+  db.forEach((row) => {
+    const key = keyOf(row)
+    if (!seen.has(key)) {
+      seen.add(key)
+      merged.push(row)
+    }
+  })
+  return merged
 }
 
 const CHAT_INPUT_PLACEHOLDER_EDITOR =
@@ -133,7 +270,7 @@ const AIWidgetMessageList = memo(function AIWidgetMessageList({
               ))}
             </div>
           )}
-          {m.role === 'ai' && !m.isError && assistantMode === 'action' && /purpose|zweck|scope|geltungsbereich|procedure|verfahren|responsibilities|verantwortlichkeiten/i.test(m.text) && (
+          {m.role === 'ai' && !m.isError && assistantMode === 'query' && m._canCreateSop && (
             <button
               className="ai-kontext-btn"
               type="button"
@@ -236,7 +373,7 @@ function AIWidget() {
   const chatEndRef = useRef(null)
   const messagesScrollRef = useRef(null)
   const messagesRef = useRef(messages)
-  /** requestId -> { messageId, action } for in-flight editor bridge requests. */
+  /** requestId -> { messageId, action, sectionName, targetScope } for in-flight editor bridge requests. */
   const pendingBridgeRef = useRef(new Map())
   const suggestions = routeMeta.suggestions
   const [sopEditorActive, setSopEditorActive] = useState(() => hasActiveSopEditor(location.pathname))
@@ -334,23 +471,29 @@ function AIWidget() {
 
   const loadChatHistory = useCallback(async () => {
     const path = location.pathname
+    const localRows = readLocalMessagesForPath(path)
     const sid = readSessionIdForPath(path)
     if (!sid) {
-      setMessages(defaultGreeting())
+      setMessages(localRows || defaultGreeting())
       return
     }
     try {
       const rows = await getChatSessionMessages(sid)
-      setMessages(dbMessagesToWidget(rows))
+      const dbRows = dbMessagesToWidget(rows)
+      setMessages(mergeWidgetMessages(localRows, dbRows))
     } catch (e) {
       console.error('[chat-history-load] AIWidget messages', e)
-      setMessages(defaultGreeting())
+      setMessages(localRows || defaultGreeting())
     }
   }, [location.pathname])
 
   useEffect(() => {
     loadChatHistory()
   }, [loadChatHistory])
+
+  useEffect(() => {
+    writeLocalMessagesForPath(location.pathname, messages)
+  }, [location.pathname, messages])
 
   useEffect(() => {
     const pending = pendingBridgeRef.current
@@ -370,8 +513,8 @@ function AIWidget() {
       )))
       saveAssistantLastAction({
         action: detail?.action || entry.action,
-        target_scope: detail?.applied_scope || 'selection',
-        section_name: detail?.section_name || '',
+        target_scope: detail?.applied_scope || entry.targetScope || 'selection',
+        section_name: detail?.section_name || entry.sectionName || '',
         sop_id: detail?.sop_id || getActiveEditorDocumentId(),
         suggested_text_excerpt: statusText,
         status: detail?.status || '',
@@ -411,12 +554,21 @@ function AIWidget() {
     const { explicitAction = null } = opts
     if (!hasActiveSopEditor(location.pathname)) return false
 
-    const plan = planEditorActionExecution(classification, { explicitAction })
+    const plan = planEditorActionExecution(classification, { explicitAction, userMessage: text })
     const intent = plan.intent
     if (!intent) return false
 
     const actionPrompt = buildEnrichedActionPrompt(text, classification)
-    const { sectionHint, targetScope } = plan.snapshotOptions
+    const mentionedFocus = findMentionedSectionFocus(text, location.pathname)
+    const sectionHint =
+      plan.snapshotOptions.sectionHint
+      || classification.record_id
+      || mentionedFocus?.section_name
+      || ''
+    const targetScope =
+      classification.target_scope === 'full_document'
+        ? 'full_document'
+        : plan.snapshotOptions.targetScope || (sectionHint ? 'section' : 'selection')
 
     if (intent === EDITOR_AI_ACTIONS.GAP_CHECK) {
       setMessages((prev) => [
@@ -499,8 +651,12 @@ function AIWidget() {
       dispatchActionsTabRun({
         action: plan.inlineAction || intent,
         prompt: actionPrompt,
+        userPrompt: text,
         sectionHint,
         targetScope,
+        lineNumber: classification.line_number || null,
+        recordId: classification.record_id || null,
+        sourceContentOverride: classification.source_content_override || null,
       })
       return true
     }
@@ -534,7 +690,12 @@ function AIWidget() {
     setMessages((prev) => [...prev, placeholderMsg])
 
     const requestId = makeEditorAiRequestId()
-    pendingBridgeRef.current.set(requestId, { messageId: placeholderId, action: intent })
+    pendingBridgeRef.current.set(requestId, {
+      messageId: placeholderId,
+      action: intent,
+      sectionName: sectionHint || '',
+      targetScope: targetScope || 'selection',
+    })
     saveAssistantLastAction({
       action: intent,
       target_scope: targetScope || 'selection',
@@ -547,6 +708,9 @@ function AIWidget() {
     dispatchEditorAiActionRequest({
       action: intent,
       prompt: actionPrompt,
+      userPrompt: text,
+      sectionHint,
+      targetScope,
       requestId,
       source: 'kl_assistant',
     })
@@ -603,6 +767,7 @@ function AIWidget() {
           if (handled) return
         }
       }
+
       const chatHistoryPayload = [
         ...messagesRef.current.map((msg) => ({
           role: msg.role === 'ai' ? 'assistant' : 'user',
@@ -648,32 +813,17 @@ function AIWidget() {
         }
       }
       if (result?.session_id) {
-        if (assistantMode === 'action') {
-          saveAssistantLastAction({
-            action: result?.intent || result?.action || 'chat',
-            target_scope: 'chat',
-            sop_id: getActiveEditorDocumentId(),
-            request_prompt: trimmed,
-            suggested_text_excerpt: result.answer || result.text || result.response || '',
-            status: 'answered',
-            source: 'sidebar_query_response',
-          })
-        }
+        const focus = findMentionedSectionFocus(trimmed, location.pathname)
+        if (focus) saveAssistantLastFocus(focus)
         writeSessionIdForPath(location.pathname, result.session_id)
         const rows = await getChatSessionMessages(result.session_id)
-        setMessages(dbMessagesToWidget(rows))
+        setMessages((prev) => {
+          const dbRows = dbMessagesToWidget(rows)
+          return mergeWidgetMessages(prev, dbRows)
+        })
       } else {
-        if (assistantMode === 'action') {
-          saveAssistantLastAction({
-            action: result?.intent || result?.action || 'chat',
-            target_scope: 'chat',
-            sop_id: getActiveEditorDocumentId(),
-            request_prompt: trimmed,
-            suggested_text_excerpt: result.answer || result.text || result.response || '',
-            status: 'answered',
-            source: 'sidebar_query_response',
-          })
-        }
+        const focus = findMentionedSectionFocus(trimmed, location.pathname)
+        if (focus) saveAssistantLastFocus(focus)
         const aiMsg = {
           id: Date.now() + 1,
           role: 'ai',
@@ -703,6 +853,16 @@ function AIWidget() {
   const handleInputChange = useCallback((e) => {
     setInput(e.target.value)
   }, [])
+
+  const handleNewChat = useCallback(() => {
+    clearSessionIdForPath(location.pathname)
+    clearLocalMessagesForPath(location.pathname)
+    clearAssistantLastAction()
+    setPendingDeleteAction(null)
+    pendingBridgeRef.current.clear()
+    setInput('')
+    setMessages(defaultGreeting())
+  }, [location.pathname, clearAssistantLastAction])
 
   // Clicking a suggestion triggers the actual query immediately
   const handleSuggestionClick = (text) => sendMessage(text)
@@ -779,7 +939,18 @@ function AIWidget() {
             <span className="ai-status-dot" />
             <h3 className="ai-widget-title">KI Assistent</h3>
           </div>
-          <span className="ai-aktiv-badge">Aktiv</span>
+          <div className="ai-widget-header-actions">
+            <button
+              type="button"
+              className="ai-new-chat-btn"
+              aria-label="Neuen Chat starten"
+              title="Neuen Chat starten"
+              onClick={handleNewChat}
+            >
+              <Plus size={14} />
+            </button>
+            <span className="ai-aktiv-badge">Aktiv</span>
+          </div>
         </div>
         <div className="ai-widget-divider" />
       </div>

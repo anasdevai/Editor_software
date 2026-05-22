@@ -77,8 +77,16 @@ def _is_model_cached(cache_dir: str, model_name: str) -> bool:
     ]
     for root in candidate_roots:
         snapshots_dir = root / "snapshots"
-        if snapshots_dir.exists() and any(p.is_dir() for p in snapshots_dir.iterdir()):
-            return True
+        if not snapshots_dir.exists():
+            continue
+        for snapshot in snapshots_dir.iterdir():
+            if not snapshot.is_dir():
+                continue
+            modules_file = snapshot / "modules.json"
+            model_file = snapshot / "config.json"
+            pooling_file = snapshot / "1_Pooling" / "config.json"
+            if modules_file.exists() and model_file.exists() and pooling_file.exists():
+                return True
     return False
 
 
@@ -190,6 +198,62 @@ def get_entity_lock(entity_type: str, entity_id: uuid.UUID) -> threading.Lock:
         if key not in _entity_locks:
             _entity_locks[key] = threading.Lock()
         return _entity_locks[key]
+
+
+def _qdrant_entity_filter(entity_type: str, entity_id: uuid.UUID) -> qmodels.Filter:
+    entity_value = str(entity_id)
+    return qmodels.Filter(
+        must=[
+            qmodels.FieldCondition(
+                key="entity_type",
+                match=qmodels.MatchValue(value=entity_type),
+            ),
+            qmodels.Filter(
+                should=[
+                    qmodels.FieldCondition(
+                        key="entity_id",
+                        match=qmodels.MatchValue(value=entity_value),
+                    ),
+                    qmodels.FieldCondition(
+                        key="source_id",
+                        match=qmodels.MatchValue(value=entity_value),
+                    ),
+                    qmodels.FieldCondition(
+                        key="metadata.entity_id",
+                        match=qmodels.MatchValue(value=entity_value),
+                    ),
+                    qmodels.FieldCondition(
+                        key="metadata.source_id",
+                        match=qmodels.MatchValue(value=entity_value),
+                    ),
+                ]
+            ),
+        ]
+    )
+
+
+def _ensure_payload_indexes(client: QdrantClient | None = None) -> None:
+    qclient = client or _get_qdrant()
+    if not qclient.collection_exists(DEFAULT_COLLECTION):
+        return
+    for _field, _typ in (
+        ("entity_type", qmodels.PayloadSchemaType.KEYWORD),
+        ("entity_id", qmodels.PayloadSchemaType.KEYWORD),
+        ("source_id", qmodels.PayloadSchemaType.KEYWORD),
+        ("metadata.entity_id", qmodels.PayloadSchemaType.KEYWORD),
+        ("metadata.source_id", qmodels.PayloadSchemaType.KEYWORD),
+        ("ref_number", qmodels.PayloadSchemaType.KEYWORD),
+        ("rag_ready", qmodels.PayloadSchemaType.BOOL),
+    ):
+        try:
+            qclient.create_payload_index(
+                collection_name=DEFAULT_COLLECTION,
+                field_name=_field,
+                field_schema=_typ,
+            )
+        except Exception:
+            # Index may already exist; keep webhook/runtime CRUD idempotent.
+            pass
 
 
 class SemanticPipelineService:
@@ -342,22 +406,12 @@ class SemanticPipelineService:
 
         try:
             client = _get_qdrant()
+            _ensure_payload_indexes(client)
             client.delete(
                 collection_name=DEFAULT_COLLECTION,
                 wait=True,
                 points_selector=qmodels.FilterSelector(
-                    filter=qmodels.Filter(
-                        must=[
-                            qmodels.FieldCondition(
-                                key="entity_id",
-                                match=qmodels.MatchValue(value=str(entity_id)),
-                            ),
-                            qmodels.FieldCondition(
-                                key="entity_type",
-                                match=qmodels.MatchValue(value=entity_type),
-                            ),
-                        ]
-                    )
+                    filter=_qdrant_entity_filter(entity_type, entity_id)
                 ),
             )
             invalidate_bm25_cache(DEFAULT_COLLECTION)
@@ -419,6 +473,7 @@ class SemanticPipelineService:
         purged = 0
         try:
             client = _get_qdrant()
+            _ensure_payload_indexes(client)
         except Exception as exc:
             print(f"[semantic-reconcile] Qdrant unavailable, skipping vector cleanup: {exc}", flush=True)
             client = None
@@ -432,18 +487,7 @@ class SemanticPipelineService:
                             collection_name=DEFAULT_COLLECTION,
                             wait=True,
                             points_selector=qmodels.FilterSelector(
-                                filter=qmodels.Filter(
-                                    must=[
-                                        qmodels.FieldCondition(
-                                            key="entity_id",
-                                            match=qmodels.MatchValue(value=str(eid)),
-                                        ),
-                                        qmodels.FieldCondition(
-                                            key="entity_type",
-                                            match=qmodels.MatchValue(value="sop"),
-                                        ),
-                                    ]
-                                )
+                                filter=_qdrant_entity_filter("sop", eid)
                             ),
                         )
                     except Exception as ex:
@@ -693,23 +737,13 @@ class SemanticPipelineService:
         logger.info("[sop-pipeline] qdrant ingestion started job=%s", job_id)
 
         client = _get_qdrant()
+        _ensure_payload_indexes(client)
         try:
             client.delete(
                 collection_name=DEFAULT_COLLECTION,
                 wait=True,
                 points_selector=qmodels.FilterSelector(
-                    filter=qmodels.Filter(
-                        must=[
-                            qmodels.FieldCondition(
-                                key="entity_id",
-                                match=qmodels.MatchValue(value=str(entity_id)),
-                            ),
-                            qmodels.FieldCondition(
-                                key="entity_type",
-                                match=qmodels.MatchValue(value="sop"),
-                            ),
-                        ]
-                    )
+                    filter=_qdrant_entity_filter("sop", entity_id)
                 ),
             )
             invalidate_bm25_cache(DEFAULT_COLLECTION)
@@ -727,6 +761,7 @@ class SemanticPipelineService:
             pl = {
                 "entity_type": "sop",
                 "entity_id": str(entity_id),
+                "source_id": str(entity_id),
                 "version_id": str(resolved_version) if resolved_version else None,
                 "section_name": section_name,
                 "chunk_index": ord_,
@@ -973,19 +1008,7 @@ class SemanticPipelineService:
                 vectors_config=qmodels.VectorParams(size=dim, distance=qmodels.Distance.COSINE),
             )
         # Cloud Qdrant can require payload indexes for filtered query performance/validity.
-        for _field, _typ in (
-            ("entity_type", qmodels.PayloadSchemaType.KEYWORD),
-            ("entity_id", qmodels.PayloadSchemaType.KEYWORD),
-        ):
-            try:
-                client.create_payload_index(
-                    collection_name=DEFAULT_COLLECTION,
-                    field_name=_field,
-                    field_schema=_typ,
-                )
-            except Exception:
-                # Index may already exist; keep indexing flow idempotent.
-                pass
+        _ensure_payload_indexes(client)
 
     @staticmethod
     def _normalize_entity(db: Session, entity_type: str, entity_id: uuid.UUID, version_id: uuid.UUID | None):
@@ -1209,24 +1232,14 @@ class SemanticPipelineService:
         example_vec = embedder.encode(["dimension_probe"], normalize_embeddings=True)[0]
         SemanticPipelineService._ensure_collection(len(example_vec))
         client = _get_qdrant()
+        _ensure_payload_indexes(client)
         # Remove prior Qdrant points for this entity so orphan vectors cannot drift from knowledge_chunks
         try:
             client.delete(
                 collection_name=DEFAULT_COLLECTION,
                 wait=True,
                 points_selector=qmodels.FilterSelector(
-                    filter=qmodels.Filter(
-                        must=[
-                            qmodels.FieldCondition(
-                                key="entity_id",
-                                match=qmodels.MatchValue(value=str(entity_id)),
-                            ),
-                            qmodels.FieldCondition(
-                                key="entity_type",
-                                match=qmodels.MatchValue(value=entity_type),
-                            ),
-                        ]
-                    )
+                    filter=_qdrant_entity_filter(entity_type, entity_id)
                 ),
             )
             invalidate_bm25_cache(DEFAULT_COLLECTION)
@@ -1291,6 +1304,7 @@ class SemanticPipelineService:
             pl = {
                 "entity_type": entity_type,
                 "entity_id": str(entity_id),
+                "source_id": str(entity_id),
                 "version_id": str(resolved_version) if resolved_version else None,
                 "section_name": section_name,
                 "chunk_index": order,

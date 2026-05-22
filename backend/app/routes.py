@@ -2,6 +2,7 @@ import io
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query, UploadFile, File
 from typing import List, Any
 from sqlalchemy.orm import Session
+from sqlalchemy.orm.attributes import flag_modified
 from sqlalchemy import func, or_, asc
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from qdrant_client.http import models as qmodels
@@ -1548,6 +1549,7 @@ def create_version(
         meta["accepted_change_justification"] = payload.change_justification
         meta["accepted_sop_version"] = next_version
         accepted_suggestion.metadata_json = meta
+        flag_modified(accepted_suggestion, "metadata_json")
         should_learn = bool((accepted_suggestion.metadata_json or {}).get("learn_to_profile"))
         if should_learn and accepted_suggestion.profile_id:
             profile = db.query(ClientProfile).filter(ClientProfile.id == accepted_suggestion.profile_id).first()
@@ -1561,6 +1563,7 @@ def create_version(
                 meta["profile_auto_updated"] = True
                 meta["profile_auto_update_result"] = profile_result
                 accepted_suggestion.metadata_json = meta
+                flag_modified(accepted_suggestion, "metadata_json")
         db.commit()
         db.refresh(accepted_suggestion)
 

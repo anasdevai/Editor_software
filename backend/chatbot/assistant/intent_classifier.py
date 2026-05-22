@@ -87,7 +87,9 @@ ROUTING RULES (semantic — infer meaning; users may paraphrase in English or Ge
 A) flow = "chat" — default for questions and explanations:
    - Questions (including with "?"), "what/why/how/welche/was/wie/warum", requests to explain, list, compare records, or summarize/explain **information** without changing the open SOP body.
    - Explaining or listing linked CAPAs, deviations, audits, decisions, or SOP meaning **without** asking to rewrite/improve/shorten the document text.
+   - Questions about the previous edit/suggestion such as "what did you change?", "what did you upgrade in the rewrite?", "show the difference", or "explain the rewrite" are chat, not another editor action.
    - If the user only wants QA/record context as an answer, use flow="chat". You may still set linked_entity_types to steer retrieval.
+   - "this SOP", "full SOP", "whole SOP", "entire SOP", and "tell me about this SOP" mean the full active SOP and must override any previous section target.
 
 B) flow = "editor_action" — user wants the **open SOP text** changed or generated in-place:
    - Rewrite, rephrase, shorten, expand, formalize, bulletize, translate output **into the document**, tighten wording, compliance polish, gap/risk review **on the prose**, section-level or full-document edits.
@@ -125,8 +127,20 @@ CONTEXT:
 - route: {route}
 - active_sop_title: {active_sop_title}
 - active_sop_number: {active_sop_number}
+- selected_section: {selected_section_summary}
+- available_sections: {available_sections}
+- previous_action: {previous_action_summary}
+- recent_conversation: {recent_conversation}
+- active_scope: {active_scope}
+- instruction_memory: {instruction_memory}
+- frustration_signal: {frustration_signal}
+- repetition_detected: {repetition_detected}
+- repetition_instruction: {repetition_instruction}
 
 When target_scope is section, the editor applies the action to the full section body under that heading.
+For follow-up requests like "it", "that", "now make it shorter", use previous_action and recent_conversation to keep the same target.
+For frustration/refinement follow-ups like "i told you make it shorter", "too long", "make it shoter/shorter", "no, better and shorter", keep the previous target and return editor_action. Use action "rewrite" for shorter rewrites, action "improve" when the user asks for better wording, and set constraints.length="shorter".
+For questions asking what the SOP/section means, who owns it, version/status/tags, or why it exists, use flow="chat" unless the user clearly asks to replace document text.
 
 USER MESSAGE:
 {user_message}
@@ -285,13 +299,124 @@ def _normalize_payload(
     )
 
 
-def _heuristic_fallback(message: str, *, has_active_sop: bool) -> AssistantIntentResult:
-    """When the LLM is unavailable, prefer safe chat routing (no keyword-based editor routing)."""
-    _ = (message, has_active_sop)
+def _looks_like_read_only_question(text: str) -> bool:
+    q = str(text or "").strip().lower()
+    if not q:
+        return False
+    if _looks_like_shortening_followup(q):
+        return False
+    if re.search(r"^(?:ok(?:ay)?\s+)?(?:rewrite|improve|summarize|shorten|expand|change|update|make|fix|delete|remove|add)\b", q, re.I):
+        return False
+    return bool(re.search(r"\b(what|what's|why|how|which|explain|tell me|describe|show me|inside|mean)\b", q, re.I))
+
+
+def _previous_section_hint(previous_action_summary: str = "") -> str | None:
+    prev = re.search(r"\bsection=([^|]+)", previous_action_summary or "", re.I)
+    if not prev:
+        return None
+    value = prev.group(1).strip()
+    if value and value.lower() not in {"selected text", "selection", "full document", "full sop", "unknown"}:
+        return value
+    return None
+
+
+def _looks_like_shortening_followup(text: str) -> bool:
+    q = str(text or "").strip().lower()
+    if not q:
+        return False
+    return bool(
+        re.search(
+            r"\b(i\s+told\s+you|too\s+long|still\s+too\s+long|make\s+it\s+(?:more\s+)?(?:shorter|shoter|smaller|smallier)|shorter|shoter|shorten|concise|more\s+brief|kürzer|kuerzer|zu\s+lang)\b",
+            q,
+            re.I,
+        )
+    )
+
+
+def _extract_section_hint_from_text(text: str, available_sections: str = "", previous_action_summary: str = "") -> str | None:
+    raw = str(text or "")
+    match = re.search(r"\b(?:the\s+)?([A-Za-zÀ-ÿ][\wÀ-ÿ\s/&()-]{1,80}?)\s+section\b", raw, re.I)
+    if match:
+        candidate = re.sub(
+            r"^(?:ok(?:ay)?\s+|now\s+|then\s+|please\s+|rewrite\s+(?:the\s+)?|improve\s+(?:the\s+)?|summarize\s+(?:the\s+)?)",
+            "",
+            match.group(1).strip(),
+            flags=re.I,
+        ).strip(" .:-")
+        if candidate.lower() not in {"this", "that", "it", "same", "previous", "current"}:
+            return candidate
+
+    known = re.search(r"\b(zweck|zwect|sweck|purpose|scope|geltungsbereich|procedure|verfahren|responsibilities|responsibility|verantwortlichkeiten|capas?|capa|decisions?|entscheidungen?|audits?|deviations?|approval|records|definitions)\b", raw, re.I)
+    if known:
+        return known.group(1)
+
+    if re.search(r"\b(this|that|it|same|previous|current)\s*(?:section|part|text|one)?\b", raw, re.I):
+        value = _previous_section_hint(previous_action_summary)
+        if value:
+            return value
+
+    normalized = raw.lower()
+    for label in [part.strip() for part in str(available_sections or "").split(",") if part.strip()]:
+        bare = re.sub(r"^\d+(?:\.\d+)*[.)\]:-]?\s*", "", label).strip()
+        if bare and re.search(rf"\b{re.escape(bare.lower())}\b", normalized):
+            return label
+    return None
+
+
+def _heuristic_fallback(
+    message: str,
+    *,
+    has_active_sop: bool,
+    has_editor_selection: bool = False,
+    available_sections: str = "",
+    previous_action_summary: str = "",
+) -> AssistantIntentResult:
+    """Deterministic safety net for when the classifier model is unavailable or returns invalid JSON."""
+    q = str(message or "").strip()
+    lower = q.lower()
+    if not q or _looks_like_read_only_question(q):
+        return AssistantIntentResult(flow="chat", confidence=0.45, reasoning="classifier_unavailable_safe_chat")
+
+    action: ActionType | None = None
+    constraints = IntentConstraints()
+    if re.search(r"\b(gap\s*check|gap analysis|lücken|compliance gap)\b", lower, re.I):
+        action = "gap_check"
+    elif _looks_like_shortening_followup(lower):
+        action = "improve" if re.search(r"\b(better|improve|verbesser)\b", lower, re.I) else "rewrite"
+        constraints.length = "shorter"
+    elif re.search(r"\b(summarize|summary|zusammenfass|kurzfassung)\b", lower, re.I):
+        return AssistantIntentResult(flow="chat", confidence=0.7, reasoning="classifier_unavailable_summary_is_chat")
+    elif re.search(r"\b(improve|polish|enhance|refine|verbesser)\b", lower, re.I):
+        action = "improve"
+    elif re.search(r"\b(rewrite|re-?write|rephrase|umschreib|überarbeit|ueberarbeit)\b", lower, re.I):
+        action = "rewrite"
+
+    if not action:
+        return AssistantIntentResult(flow="chat", confidence=0.3, reasoning="classifier_unavailable_default_chat")
+    if not has_active_sop:
+        return AssistantIntentResult(
+            flow="clarify",
+            clarification_question="Please open an SOP in the editor first so I can run that action.",
+            confidence=0.7,
+            reasoning="classifier_unavailable_needs_active_sop",
+        )
+
+    section_hint = _extract_section_hint_from_text(q, available_sections, previous_action_summary)
+    if not section_hint and _looks_like_shortening_followup(lower):
+        section_hint = _previous_section_hint(previous_action_summary)
+    full_doc = bool(
+        re.search(r"\b(full|whole|entire|complete|gesamt|komplett)\s+(?:sop|document|doc)\b", lower, re.I)
+        or re.search(r"\b(?:rewrite|improve|summarize|gap\s*check)\s+(?:this\s+|the\s+)?sop\b", lower, re.I)
+    )
+    target_scope: TargetScope = "full_document" if full_doc else "section" if section_hint else "selection" if has_editor_selection else "section"
     return AssistantIntentResult(
-        flow="chat",
-        confidence=0.2,
-        reasoning="classifier_unavailable_default_chat",
+        flow="editor_action",
+        action=action,
+        target_scope=target_scope,
+        section_hint=section_hint,
+        constraints=constraints,
+        confidence=0.72,
+        reasoning="classifier_unavailable_deterministic_action",
     )
 
 
@@ -303,6 +428,15 @@ def classify_assistant_intent(
     route: str = "",
     active_sop_title: str = "",
     active_sop_number: str = "",
+    selected_section_summary: str = "",
+    available_sections: str = "",
+    previous_action_summary: str = "",
+    recent_conversation: str = "",
+    active_scope: dict | None = None,
+    instruction_memory: list | None = None,
+    frustration_signal: dict | None = None,
+    repetition_detected: bool = False,
+    repetition_instruction: str | None = None,
 ) -> AssistantIntentResult:
     """Classify user intent for the KL/KI Assistant using a small LLM call."""
     user_message = (message or "").strip()
@@ -330,6 +464,15 @@ def classify_assistant_intent(
                 "route": route or "-",
                 "active_sop_title": active_sop_title or "-",
                 "active_sop_number": active_sop_number or "-",
+                "selected_section_summary": selected_section_summary or "-",
+                "available_sections": available_sections or "-",
+                "previous_action_summary": previous_action_summary or "-",
+                "recent_conversation": recent_conversation or "-",
+                "active_scope": str(active_scope or {}),
+                "instruction_memory": str(instruction_memory or []),
+                "frustration_signal": str(frustration_signal or {}),
+                "repetition_detected": str(bool(repetition_detected)).lower(),
+                "repetition_instruction": repetition_instruction or "-",
             }
         )
         data = _extract_json_object(raw)
@@ -349,4 +492,10 @@ def classify_assistant_intent(
         return result
     except Exception as exc:
         logger.warning("[assistant-intent] LLM classification failed: %s", exc)
-        return _heuristic_fallback(user_message, has_active_sop=has_active_sop)
+        return _heuristic_fallback(
+            user_message,
+            has_active_sop=has_active_sop,
+            has_editor_selection=has_editor_selection,
+            available_sections=available_sections,
+            previous_action_summary=previous_action_summary,
+        )
