@@ -416,6 +416,8 @@ class ClientProfileResponse(BaseModel):
     description: Optional[str] = None
     domain: Optional[str] = None
     current_version_id: Optional[UUID] = None
+    active_profile_json: Optional[Any] = None
+    active_profile_md: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 

@@ -47,7 +47,11 @@ import {
   prepareEditorSOPImport,
 } from '../utils/sopImportService'
 import { InlineAiSuggestion } from '../extensions/InlineAiSuggestion'
-import { notifySopEditorContextChanged } from '../utils/editorAiBridge'
+import {
+  KL_ASSISTANT_CONTEXT_REFRESH_DONE,
+  KL_ASSISTANT_CONTEXT_REFRESH_REQUEST,
+  notifySopEditorContextChanged,
+} from '../utils/editorAiBridge'
 import '../assets/styles/global.css'
 
 const PreviewModal = lazy(() => import('../components/Common/PreviewModal'))
@@ -687,6 +691,21 @@ const EditorPage = ({
       syncContext.cancel()
     }
   }, [editor, isEditorMounted, persistKlEditorContext])
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined
+    const onRefreshRequest = (event) => {
+      const requestId = event?.detail?.requestId
+      persistKlEditorContext()
+      window.dispatchEvent(
+        new CustomEvent(KL_ASSISTANT_CONTEXT_REFRESH_DONE, {
+          detail: { requestId, ok: true },
+        }),
+      )
+    }
+    window.addEventListener(KL_ASSISTANT_CONTEXT_REFRESH_REQUEST, onRefreshRequest)
+    return () => window.removeEventListener(KL_ASSISTANT_CONTEXT_REFRESH_REQUEST, onRefreshRequest)
+  }, [persistKlEditorContext])
 
   const persistDocument = useCallback(async ({ showSavingIndicator = true } = {}) => {
     if (!editor || !isEditorMounted || editor.isDestroyed || isHistoricalView || hydrationRef.current) return

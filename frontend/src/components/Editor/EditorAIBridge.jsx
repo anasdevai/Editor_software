@@ -236,6 +236,9 @@ const EditorAIBridge = ({
           selection: selectionPayload,
           sectionHint: String(request?.sectionHint || ''),
           targetScope: String(request?.targetScope || ''),
+          lineNumber: request?.lineNumber ?? null,
+          recordId: String(request?.recordId || ''),
+          preferFullSection: Boolean(request?.preferFullSection),
         })
         if (resolved?.text && resolved.from != null && resolved.to != null) {
           from = resolved.from
@@ -446,6 +449,7 @@ const EditorAIBridge = ({
       targetScope,
       lineNumber,
       recordId,
+      preferFullSection,
     }) => {
       const liveEditor = editorRef.current
       if (!liveEditor || liveEditor.isDestroyed || !isEditableRef.current) {
@@ -477,6 +481,7 @@ const EditorAIBridge = ({
           targetScope: String(targetScope || ''),
           lineNumber: lineNumber ?? null,
           recordId: String(recordId || ''),
+          preferFullSection: Boolean(preferFullSection),
         })
         if (!target?.text || target.from == null || target.to == null) {
           dispatchEditorSnapshotResponse({

@@ -9,8 +9,16 @@ import { AI_ACTION_TRIGGERED_BY, getActiveEditorDocumentId } from './editorAiBri
 import { inferEditScope } from './editScopeInference'
 import { wantsFullSopIntent } from './sopActionIntent'
 
-export async function resolveGapCheckTarget(instruction) {
-  const snapshot = await requestEditorSnapshot({ prompt: instruction })
+export async function resolveGapCheckTarget(instruction, targetOptions = {}) {
+  const snapshot = await requestEditorSnapshot({
+    prompt: instruction,
+    userPrompt: targetOptions.userPrompt || '',
+    sectionHint: targetOptions.sectionHint || '',
+    targetScope: targetOptions.targetScope || '',
+    lineNumber: targetOptions.lineNumber ?? null,
+    recordId: targetOptions.recordId || '',
+    preferFullSection: Boolean(targetOptions.preferFullSection),
+  })
   const target = snapshot.target
   if (!target?.text || target.from == null || target.to == null) {
     throw new Error(snapshot.error || 'Could not find that section in the open SOP.')
@@ -18,7 +26,12 @@ export async function resolveGapCheckTarget(instruction) {
   return { snapshot, target }
 }
 
-export async function runEditorGapCheck({ instruction, documentId: docIdOverride } = {}) {
+export async function runEditorGapCheck({
+  instruction,
+  documentId: docIdOverride,
+  targetOptions = {},
+  triggeredBy,
+} = {}) {
   const instructionText = String(instruction || '').trim()
   if (!instructionText) {
     throw new Error('Describe what to check, e.g. "gap check CAPAs (zugehörig zu SOP-IT-003)" or "gap check this SOP".')
@@ -29,7 +42,7 @@ export async function runEditorGapCheck({ instruction, documentId: docIdOverride
     throw new Error('No active SOP. Open a document in the editor first.')
   }
 
-  const { snapshot, target } = await resolveGapCheckTarget(instructionText)
+  const { snapshot, target } = await resolveGapCheckTarget(instructionText, targetOptions)
 
   scrollEditorToRange(target.from, target.to)
 
@@ -53,7 +66,7 @@ export async function runEditorGapCheck({ instruction, documentId: docIdOverride
           instruction: instructionText,
         }),
     sop_entity_id: documentId,
-    triggered_by: AI_ACTION_TRIGGERED_BY.EDITOR_BUBBLE,
+    triggered_by: triggeredBy || AI_ACTION_TRIGGERED_BY.EDITOR_BUBBLE,
   })
 
   const normalized = normalizeAiActionResult('gap_check', result)

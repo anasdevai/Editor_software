@@ -58,55 +58,6 @@ function deriveLineRows(text) {
     .filter((row) => row.text)
 }
 
-const SECTION_ALIAS_MAP = {
-  purpose: ['Zweck', 'Ziel', '1. Purpose', 'objective'],
-  scope: ['Geltungsbereich', 'Anwendungsbereich', 'applicability'],
-  responsibilities: ['Verantwortlichkeiten', 'roles', 'who is responsible'],
-  definitions: ['Definitionen', 'glossary', 'terms', 'begriffe'],
-  deviations: ['Abweichungen', 'DEV', 'nonconformance'],
-  capas: ['Korrekturmaßnahmen', 'corrective actions', 'CAPA', 'CAPAs'],
-  audits: ['Auditbericht', 'audit', 'findings', 'Audit Findings'],
-  references: ['Referenzen', 'related documents', 'see also'],
-  zweck: ['Purpose', 'Objective', 'Ziel', '1. Zweck'],
-  geltungsbereich: ['Scope', 'applicability', 'Geltungsbereich'],
-  abweichungen: ['Deviations', 'DEV', 'Abweichungen'],
-  korrekturmaßnahmen: ['CAPAs', 'CAPA', 'corrective actions', 'Korrekturmaßnahmen'],
-}
-
-function traceabilityKindFromLabel(label = '') {
-  const low = String(label || '').toLowerCase()
-  if (/\bcapas?\b|korrektur/.test(low)) return 'capa'
-  if (/\b(?:deviations?|abweichungen?)\b/.test(low)) return 'deviation'
-  if (/\b(?:audits?|audit\s+findings?)\b/.test(low)) return 'audit'
-  if (/\b(?:decisions?|entscheidungen?)\b/.test(low)) return 'decision'
-  return null
-}
-
-const TRACEABILITY_KIND_ALIASES = {
-  capa: ['capa', 'capas', 'Korrekturmaßnahmen', 'corrective actions', 'CAPA', 'CAPAs'],
-  deviation: ['deviation', 'deviations', 'Abweichungen', 'DEV', 'devs'],
-  audit: ['audit', 'audits', 'Audit Findings', 'auditbericht', 'findings'],
-  decision: ['decision', 'decisions', 'Entscheidungen', 'DEC'],
-}
-
-function labelAliasesForSection(label = '') {
-  const normalized = String(label || '')
-    .replace(/^\s*\d+(?:\.\d+)*[.)\]:-]?\s*/, '')
-    .trim()
-    .toLowerCase()
-    .replace(/\s+/g, ' ')
-  const aliases = [...(SECTION_ALIAS_MAP[normalized] || [])]
-  if (SECTION_ALIAS_MAP[normalized]) {
-    aliases.push(normalized, normalized.charAt(0).toUpperCase() + normalized.slice(1))
-  }
-  const kind = traceabilityKindFromLabel(label)
-  if (kind && TRACEABILITY_KIND_ALIASES[kind]) {
-    aliases.push(...TRACEABILITY_KIND_ALIASES[kind])
-  }
-  if (label) aliases.push(label)
-  return [...new Set(aliases.filter(Boolean))]
-}
-
 function deriveSopSections(text) {
   const rows = deriveLineRows(text)
   if (!rows.length) return []
@@ -154,7 +105,6 @@ function deriveSopSections(text) {
     ...section,
     content: sanitizeText(section.content, 2400),
     lines: section.lines.slice(0, 80),
-    label_aliases: labelAliasesForSection(section.label),
   }))
 }
 
@@ -202,7 +152,7 @@ export function getKLAssistantContext(pathname = '/') {
   const onEditorSurface =
     pathname.startsWith('/editor') ||
     ((pathname === '/sops' || pathname.startsWith('/sops/')) && workspaceEditorTabActive)
-  const editorText = sanitizeText(editorState?.editor_text, 9000)
+  const editorText = sanitizeText(editorState?.editor_text, 14000)
   const sections = deriveSopSections(editorText)
   const selectedSectionPayload = buildSelectedSectionPayload(editorState, sections)
   const metadata = sanitizeObjectStrings(editorState?.sop?.metadata || {}, 220)
@@ -265,7 +215,7 @@ export function getKLAssistantContext(pathname = '/') {
     opened_tabs: trimEntityList(workspaceState?.opened_tabs, 8),
     active_tab_id: workspaceState?.active_tab_id || '',
     active_tab_label: workspaceState?.active_tab_label || '',
-    editor_excerpt: sanitizeText(editorState?.editor_text, 5000),
+    editor_excerpt: sanitizeText(editorState?.editor_text, 10000),
     last_action:
       actionMemory?.last_action && typeof actionMemory.last_action === 'object'
         ? {
@@ -345,6 +295,36 @@ export function saveAssistantSessionSnapshot(snapshot = {}) {
     window.dispatchEvent(new CustomEvent('sop-editor-context-changed'))
   } catch {
     // ignore
+  }
+}
+
+/**
+ * Remember the user's intended target for this chat session (before the editor finishes).
+ * Enables follow-ups like "rewrite in 6 lines" without repeating the section name.
+ */
+export function recordAssistantTurnPlan({ action, targetScope, sectionName, requestPrompt, sopId } = {}) {
+  if (typeof window === 'undefined') return
+  const existing = readLocalJson(KL_ASSISTANT_ACTION_MEMORY_KEY, {})
+  const section = sanitizeText(sectionName || '', 160)
+  const scope = sanitizeText(targetScope || (section ? 'section' : ''), 80)
+  const act = sanitizeText(action || '', 60)
+  if (!act && !section && !scope) return
+  saveAssistantLastAction({
+    action: act || existing?.last_action?.action || '',
+    target_scope: scope || existing?.last_action?.target_scope || '',
+    section_name: section || existing?.last_action?.section_name || '',
+    sop_id: sopId || existing?.last_action?.sop_id || getActiveEditorDocumentIdFromStorage(),
+    request_prompt: sanitizeText(requestPrompt || '', 500),
+    status: 'planned',
+    source: 'sidebar_turn_plan',
+  })
+}
+
+function getActiveEditorDocumentIdFromStorage() {
+  try {
+    return String(localStorage.getItem('current_document_id') || '').trim()
+  } catch {
+    return ''
   }
 }
 

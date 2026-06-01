@@ -1,0 +1,35 @@
+﻿========================================================================
+  VERIFY: Editorial profile rewrite on open SOP (content preserved)
+========================================================================
+  [PASS] Extract editorial profile reference ù Emergency access
+  [PASS] Hints include CONTENT SOURCE lock
+  [FAIL] Hints forbid copying other SOP body
+  [FAIL] Style override resolves in DB
+  [PASS] Open SOP exists ù SOP-IT-002
+  [PASS] Emergency SOP exists ù SOP-IT-003
+
+  Open SOP profile:      SOP-IT-002 - Netzwerksicherheit & Firewall (OT/IT-Trennung)
+  Emergency SOP profile: SOP-IT-003 - Notfallzugriff (Break-Glass-Verfahren)
+
+--- Classify-intent API ---
+python : Traceback (most recent call last):
+At C:\Users\AbdulRauf(AIEngineer\AppData\Local\Temp\ps-script-a82e177f-72bd-42e8-af31-594e587768f3.ps1:86 char:102
++ ... ybrian-qs"; python scripts/verify_editorial_profile_rewrite.py 2>&1 | ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (Traceback (most recent call last)::String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+  File "C:\Users\AbdulRauf(AIEngineer\Desktop\cybernet\Full-project-cybrian-qs\Full-project-cybrian-qs\scripts\verify_e
+ditorial_profile_rewrite.py", line 228, in <module>
+    main()
+  File "C:\Users\AbdulRauf(AIEngineer\Desktop\cybernet\Full-project-cybrian-qs\Full-project-cybrian-qs\scripts\verify_e
+ditorial_profile_rewrite.py", line 167, in main
+    check("Classify \u2192 editor_action", classified.get("flow") == "editor_action", classified.get("flow"))
+  File "C:\Users\AbdulRauf(AIEngineer\Desktop\cybernet\Full-project-cybrian-qs\Full-project-cybrian-qs\scripts\verify_e
+ditorial_profile_rewrite.py", line 42, in check
+    print(f"  [{status}] {label}" + (f" ù {detail}" if detail else ""))
+  File "C:\Users\AbdulRauf(AIEngineer\AppData\Local\Programs\Python\Python312\Lib\encodings\cp1252.py", line 19, in 
+encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode character '\u2192' in position 18: character maps to <undefined>

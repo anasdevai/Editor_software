@@ -59,9 +59,13 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
     setPending(null)
   }, [])
 
-  const runGapCheck = useCallback(async (instructionText = '') => {
+  const runGapCheck = useCallback(async (instructionText = '', targetOptions = {}) => {
     const instruction = String(instructionText || '').trim()
-    const { target, result, normalized } = await runEditorGapCheck({ instruction })
+    const { target, result, normalized } = await runEditorGapCheck({
+      instruction,
+      targetOptions,
+      triggeredBy: AI_ACTION_TRIGGERED_BY.KL_ASSISTANT,
+    })
     const report = buildGapCheckSidebarReport(result)
     const plainReport = report.sections
       .map((section) => {
@@ -107,6 +111,7 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
       targetScope: targetOptions.targetScope || '',
       lineNumber: targetOptions.lineNumber ?? null,
       recordId: targetOptions.recordId || '',
+      preferFullSection: Boolean(targetOptions.preferFullSection),
     })
     let target = snapshot.target
     if (target?.from == null || target?.to == null || !target?.text) {
@@ -214,6 +219,8 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
       isFullDoc: Boolean(target.isFullDoc),
       summarySections: buildActionSummary(action, result),
       previewHtml: inlineHtml,
+      suggestedPlain: normalized.suggestedPlain || '',
+      originalText: target.text || '',
       range: { from: target.from, to: target.to },
     })
     saveAssistantLastAction({
@@ -261,7 +268,7 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
 
     try {
       if (action === 'gap_check') {
-        await runGapCheck(instruction)
+        await runGapCheck(instruction, targetOptions)
       } else if (action === 'rewrite' || action === 'improve' || action === 'summarize') {
         await runInlineContentAction(action, instruction, targetOptions)
       } else {
@@ -282,7 +289,7 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
   const runActionWithTarget = useCallback(
     (action, instructionText, targetOptions = {}) => {
       if (action === 'gap_check') {
-        return runAction('gap_check', instructionText)
+        return runAction('gap_check', instructionText, targetOptions)
       }
       return runAction(action, instructionText, targetOptions)
     },
@@ -298,6 +305,7 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
       targetScope,
       lineNumber,
       recordId,
+      preferFullSection,
       sourceContentOverride,
     }) => {
       const normalizedAction =
@@ -314,6 +322,7 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
         targetScope: targetScope || '',
         lineNumber: lineNumber ?? null,
         recordId: recordId || '',
+        preferFullSection: Boolean(preferFullSection),
         sourceContentOverride: sourceContentOverride || null,
       })
     })
@@ -358,7 +367,8 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
         target_scope: pendingRef.current.isFullDoc ? 'full_document' : 'section',
         section_name: pendingRef.current.sectionName || '',
         sop_id: getActiveEditorDocumentId(),
-        suggested_text_excerpt: pendingRef.current.previewHtml || '',
+        original_text_excerpt: pendingRef.current.originalText || '',
+        suggested_text_excerpt: pendingRef.current.suggestedPlain || pendingRef.current.previewHtml || '',
         status: 'applied',
         source: 'editor_actions_tab',
       })

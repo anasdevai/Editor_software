@@ -2018,6 +2018,11 @@ def _extract_explicit_style_reference(instruction: str | None) -> str | None:
     text = str(instruction or "").strip()
     if not text:
         return None
+    from chatbot.assistant.profile_reference import extract_editorial_profile_reference
+
+    editorial = extract_editorial_profile_reference(text)
+    if editorial:
+        return editorial
     if re.search(r"\bgerman\s+(?:pharma|pharmaceutical)\s+(?:sop\s+)?profile\b", text, re.IGNORECASE):
         return GERMAN_PROFILE_NAME
     patterns = [
@@ -2068,6 +2073,44 @@ def _resolve_explicit_style_override(instruction: str | None) -> dict[str, Any] 
 
     db = SessionLocal()
     try:
+        from chatbot.assistant.profile_reference import editorial_profile_sop_number_hint
+
+        sop_num_hint = editorial_profile_sop_number_hint(ref or "")
+        if sop_num_hint:
+            sop = db.query(SOP).filter(SOP.sop_number == sop_num_hint).first()
+            if sop:
+                row = (
+                    db.query(SOPDetectedParameters)
+                    .filter(SOPDetectedParameters.sop_id == sop.id)
+                    .order_by(SOPDetectedParameters.created_at.desc())
+                    .first()
+                )
+                profile = (
+                    db.query(ClientProfile).filter(ClientProfile.id == row.client_profile_id).first()
+                    if row and row.client_profile_id
+                    else None
+                )
+                if profile:
+                    current_version = (
+                        db.query(ProfileVersion).filter(ProfileVersion.id == profile.current_version_id).first()
+                        if profile.current_version_id
+                        else None
+                    )
+                    profile_json, profile_md, profile_version, profile_id_str = _load_profile_payload(db, profile)
+                    return {
+                        "matched_type": "editorial_sop_profile",
+                        "style_reference": ref,
+                        "resolved_name": profile.name,
+                        "profile_id": profile_id_str,
+                        "profile_json": profile_json,
+                        "profile_md": profile_md,
+                        "profile_version": profile_version,
+                        "detected_nlp": _serialize_detected_parameters_row(row) if row else None,
+                        "style_source_text": profile_md or "",
+                        "source_sop_id": str(sop.id),
+                        "source_sop_number": sop.sop_number,
+                    }
+
         # 1) Exact-ish profile match by display names.
         for profile in db.query(ClientProfile).all():
             candidates = [
@@ -2701,6 +2744,11 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
             style_profile=style_profile,
             ch_budget=ch_budget,
         )
+        from chatbot.assistant.context_intelligence import enforce_output_line_count
+
+        improved_text = enforce_output_line_count(
+            getattr(payload, "instruction", None), improved_text
+        )
         logger.info(
             "[ai-action-result] action=improve ok=1 provider=%s model=%s suggested_chars=%s",
             cfg.provider,
@@ -2874,6 +2922,11 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
             detected_nlp=detected_nlp,
             style_profile=style_profile,
             ch_budget=ch_budget,
+        )
+        from chatbot.assistant.context_intelligence import enforce_output_line_count
+
+        rewritten_text = enforce_output_line_count(
+            getattr(payload, "instruction", None), rewritten_text
         )
         logger.info(
             "[ai-action-result] action=rewrite ok=1 provider=%s model=%s suggested_chars=%s edit_scope=%s",
@@ -3336,7 +3389,7 @@ def _query_intents(question: str) -> set[str]:
         intents.add("sop_count")
     if re.search(r"\b(list|show|which|what)\b.*\b(sop|sops)\b", q):
         intents.add("sop_list")
-    if re.search(r"\b(summarize|summary|brief|gist)\b", q):
+    if re.search(r"\b(summarize|summary|brief|gist|zusammenfass|kurzfass|fasse\s+zusammen)\b", q):
         intents.add("summary")
     if re.search(r"\b(explain|easy wording|easy words|simple words|what does this mean|tell me about|describe)\b", q):
         intents.add("explain")
@@ -3416,38 +3469,87 @@ def _deterministic_active_sop_metadata_response(question: str, assistant_context
     }
 
 
-def _deterministic_last_action_response(question: str, assistant_context: dict | None) -> dict[str, Any] | None:
+def _deterministic_explain_preview_response(question: str, assistant_context: dict | None) -> dict[str, Any] | None:
+    from chatbot.assistant.context_intelligence import (
+        build_explain_last_output_answer,
+        extract_format_constraints,
+        infer_output_language_from_context,
+        is_explain_recent_output_query,
+        merge_constraints,
+    )
+
     ctx = assistant_context or {}
     last = ctx.get("last_action") if isinstance(ctx.get("last_action"), dict) else {}
-    if not last:
-        return None
-    q = str(question or "").strip().lower()
-    asks = bool(re.search(r"\b(what|which|how|why|tell me|explain|show me|describe|list)\b", q, re.IGNORECASE))
-    about_change = bool(re.search(r"\b(upgrad(?:e|ed)|chang(?:e|ed)|improv(?:e|ed|ement)|rewrit(?:e|ten)|rewrite|modified|different|difference|diff|did you do|was done)\b", q, re.IGNORECASE))
-    if not (asks and about_change):
+    if not last or not is_explain_recent_output_query(question, last):
         return None
 
-    action = str(last.get("action") or "AI action").strip()
-    section = str(last.get("section_name") or "the last target").strip()
+    fmt = extract_format_constraints(question)
+    rc = ctx.get("response_constraints") if isinstance(ctx.get("response_constraints"), dict) else {}
+    fmt = merge_constraints(rc, fmt, {"language": infer_output_language_from_context(ctx)})
+    answer = build_explain_last_output_answer(
+        question,
+        last,
+        format_constraints=fmt,
+        assistant_context=ctx,
+    )
+    return {
+        "answer": answer,
+        "sources": [{"id": "last_editor_action", "type": "assistant_memory", "label": "Last editor preview"}],
+        "citations": [],
+        "retrieval_debug": [],
+        "suggestions": [],
+        "retrieval_stats": {
+            "total_docs": 1,
+            "source": "assistant_explain_preview",
+            "strict_mode": "last_preview_explain",
+        },
+        "routed_to": "assistant_explain_preview",
+        "assistant_action": None,
+    }
+
+
+def _deterministic_last_action_response(question: str, assistant_context: dict | None) -> dict[str, Any] | None:
+    from chatbot.assistant.context_intelligence import (
+        build_diff_explanation_answer,
+        extract_format_constraints,
+        infer_output_language_from_context,
+        is_meta_question_about_assistant_output,
+        merge_constraints,
+    )
+
+    ctx = assistant_context or {}
+    last = ctx.get("last_action") if isinstance(ctx.get("last_action"), dict) else {}
+    if not last or not is_meta_question_about_assistant_output(question):
+        return None
+
+    active_scope = ctx.get("active_scope") if isinstance(ctx.get("active_scope"), dict) else {}
+    fmt = extract_format_constraints(question)
+    rc = ctx.get("response_constraints") if isinstance(ctx.get("response_constraints"), dict) else {}
+    fmt = merge_constraints(rc, fmt, {"language": infer_output_language_from_context(ctx)})
+
+    answer = build_diff_explanation_answer(
+        question,
+        last,
+        format_constraints=fmt,
+        active_scope=active_scope,
+        assistant_context=ctx,
+    )
+    action = str(last.get("action") or "unknown").strip()
+    section = str(last.get("section_name") or "unknown").strip()
     status = str(last.get("status") or "").strip()
-    original = str(last.get("original_text_excerpt") or "").strip()
-    suggested = str(last.get("suggested_text_excerpt") or "").strip()
-    if not suggested:
-        suggested = "The last action did not store a preview excerpt yet."
-
-    answer = (
-        f"The last editor action was **{action}** on **{section}**"
-        + (f" (status: {status})." if status else ".")
-        + "\n\nWhat changed / was upgraded:\n"
-    )
-    if original:
-        answer += "- It used the original section text as the source, preserving the same target scope.\n"
-    answer += (
-        "- It produced a rewritten/improved preview rather than changing unrelated SOP sections.\n"
-        "- The preview is available for Accept/Reject in the editor; accepting it creates the persisted SOP change/version path.\n\n"
-        "Latest preview excerpt:\n"
-        f"{suggested[:1200]}"
-    )
+    lang = fmt.get("language") or infer_output_language_from_context(ctx)
+    if lang == "de":
+        suggestions = [
+            "Kürzer umschreiben",
+            "Abschnitt in einfachen Worten erklären",
+            "Vorschau im Editor annehmen oder verwerfen",
+        ]
+    else:
+        suggestions = [
+            "Make the rewrite shorter",
+            "Explain this section in simple words",
+            "Accept or reject the inline preview",
+        ]
     return {
         "answer": answer,
         "sources": [{"id": "last_editor_action", "type": "assistant_memory", "label": "Last editor action"}],
@@ -3461,7 +3563,7 @@ def _deterministic_last_action_response(question: str, assistant_context: dict |
             }
         ],
         "retrieval_debug": [],
-        "suggestions": ["Make the rewrite shorter", "Explain this section in simple words", "Accept or reject the inline preview"],
+        "suggestions": suggestions,
         "retrieval_stats": {
             "total_docs": 1,
             "source": "assistant_last_action",
@@ -3585,7 +3687,7 @@ def _resolve_live_section_for_answer(assistant_context: dict | None, question: s
     return None
 
 
-def _simple_live_summary(content: str, *, max_items: int = 5) -> list[str]:
+def _simple_live_summary(content: str, *, max_items: int = 4, max_chars: int = 120) -> list[str]:
     lines = [re.sub(r"\s+", " ", line).strip(" -•\t") for line in re.split(r"\r?\n+", str(content or "")) if line.strip()]
     useful = [
         line for line in lines
@@ -3593,7 +3695,13 @@ def _simple_live_summary(content: str, *, max_items: int = 5) -> list[str]:
     ]
     if not useful:
         useful = [part.strip() for part in re.split(r"(?<=[.!?])\s+", re.sub(r"\s+", " ", content or "")) if len(part.strip()) > 12]
-    return useful[:max_items]
+    out: list[str] = []
+    for line in useful[:max_items]:
+        text = line.strip()
+        if len(text) > max_chars:
+            text = text[: max_chars - 1].rstrip() + "…"
+        out.append(text)
+    return out
 
 
 def _deterministic_live_section_response(question: str, assistant_context: dict | None) -> dict[str, Any] | None:
@@ -3606,8 +3714,12 @@ def _deterministic_live_section_response(question: str, assistant_context: dict 
     content = target["content"]
     label = target["label"]
     items = _simple_live_summary(content)
+    src_words = len(re.findall(r"\b\w+\b", content or "", flags=re.UNICODE))
     if "summary" in intents:
-        answer = f"Summary of **{label}**:\n" + "\n".join(f"- {item}" for item in items)
+        answer = f"Short summary of **{label}**"
+        if src_words:
+            answer += f" ({src_words} words in source → keep this brief)"
+        answer += ":\n" + "\n".join(f"- {item}" for item in items)
     else:
         answer = f"**{label}** explains:\n" + "\n".join(f"- {item}" for item in items)
     if not items:
@@ -3740,7 +3852,51 @@ def _summarize_live_context(assistant_context: dict | None, question: str = "") 
         if suggested_excerpt:
             context_lines.append(f"- Last assistant output excerpt: {suggested_excerpt[:1400]}")
         last_action_context = "\n".join(context_lines) + "\n"
+    from chatbot.assistant.context_intelligence import infer_output_language_from_context
+
+    response_constraints = ctx.get("response_constraints") if isinstance(ctx.get("response_constraints"), dict) else {}
+    sop_lang = infer_output_language_from_context(ctx)
+    lang_note = ""
+    if sop_lang == "de":
+        lang_note = (
+            "- RESPONSE LANGUAGE: German (de). Reply in natural conversational German matching the "
+            "open SOP document prose — not English — unless the user explicitly asks for English.\n"
+        )
+    elif sop_lang == "en":
+        lang_note = (
+            "- RESPONSE LANGUAGE: English (en). Reply in natural conversational English matching the "
+            "open SOP document prose unless the user explicitly asks for another language.\n"
+        )
+    chat_style_note = (
+        "- Chat style: friendly SOP co-pilot — short plain paragraphs; no rigid Summary/Details "
+        "templates, bullet forms, or HTML.\n"
+    )
+    format_note = lang_note + chat_style_note
+    chat_submode = str(ctx.get("chat_submode") or "").strip().lower()
+    if chat_submode == "sop_summarize" or "summary" in intents:
+        format_note += (
+            "- SUMMARY MODE (sidebar only — never rewrite the SOP): Output MUST be clearly shorter than "
+            "the source section or document (aim ~25–40% of source length). Use 3–6 short bullets or "
+            "at most 2 brief paragraphs. Be direct; do not paste headings or repeat the full text.\n"
+        )
+    if response_constraints.get("line_count"):
+        n = int(response_constraints["line_count"])
+        format_note += (
+            f"- User output format: exactly {n} short lines as conversational sentences. "
+            "FORBIDDEN: Summary/Details/Status/Cross-refs template.\n"
+        )
+    elif response_constraints.get("word_count"):
+        format_note += f"- User output format: about {int(response_constraints['word_count'])} words.\n"
+
     focus_note = ""
+    session_active = ctx.get("active_scope") if isinstance(ctx.get("active_scope"), dict) else {}
+    session_section = str(session_active.get("section_label") or "").strip()
+    session_action = str(session_active.get("last_action") or "").strip()
+    if session_section or session_action:
+        focus_note += (
+            f"- Session target (this chat only): action={session_action or 'none'} | "
+            f"section={session_section or 'none'} — keep follow-ups on this target unless the user names a new one.\n"
+        )
     if "summary" in intents and active_sop_ref:
         focus_note = f"- Focus SOP for summary: {active_sop_ref}\n"
     elif "compare" in intents and open_sop_tabs:
@@ -3764,6 +3920,7 @@ def _summarize_live_context(assistant_context: dict | None, question: str = "") 
                 minimal
                 + last_action_line
                 + last_action_context
+                + format_note
                 + requested_section_context
                 + (
                     f"- Selected section: {selected.get('name') or 'none'} | scope={selected.get('scope') or 'none'}\n"
@@ -3787,6 +3944,7 @@ def _summarize_live_context(assistant_context: dict | None, question: str = "") 
             minimal
             + last_action_line
             + last_action_context
+            + format_note
             + requested_section_context
             + f"- Linked deviations: {len(scope.get('linked_deviation_ids') or [])} ({', '.join(linked_devs) or 'none'})\n"
             + f"- Linked CAPAs: {len(scope.get('linked_capa_ids') or [])} ({', '.join(linked_capas) or 'none'})\n"
@@ -3821,6 +3979,7 @@ def _summarize_live_context(assistant_context: dict | None, question: str = "") 
         + f"status={current.get('status') or 'unknown'}\n"
         + f"{last_action_line}"
         + f"{last_action_context}"
+        + format_note
         + f"{requested_section_context}"
         + (
             f"- Selected section: {selected.get('name') or 'none'} | scope={selected.get('scope') or 'none'}\n"
@@ -4243,8 +4402,13 @@ async def classify_intent(payload: dict):
     Returns flow (chat | editor_action | clarify), action, target scope, and constraints.
     """
     from chatbot.assistant.context_intelligence import (
+        build_intent_classifier_invoke_context,
         finalize_classify_response,
+        is_follow_up_edit_refinement,
+        is_meta_question_about_assistant_output,
+        is_read_only_sop_query,
         prepare_message_context,
+        use_llm_orchestrator,
     )
     from chatbot.assistant.intent_classifier import classify_assistant_intent
 
@@ -4253,6 +4417,39 @@ async def classify_intent(payload: dict):
         raise HTTPException(status_code=422, detail="message is required")
 
     prep = prepare_message_context(payload)
+
+    def _classify_return_llm(raw: dict) -> dict:
+        return finalize_classify_response(raw, prep, user_message=message)
+
+    if use_llm_orchestrator():
+        invoke_ctx = build_intent_classifier_invoke_context(payload, prep)
+        result = await asyncio.to_thread(
+            classify_assistant_intent,
+            message,
+            has_active_sop=invoke_ctx["has_active_sop"],
+            has_editor_selection=invoke_ctx["has_editor_selection"],
+            route=invoke_ctx["route"],
+            active_sop_title=invoke_ctx["active_sop_title"],
+            active_sop_number=invoke_ctx["active_sop_number"],
+            selected_section_summary=invoke_ctx["selected_section_summary"],
+            available_sections=invoke_ctx["available_sections"],
+            previous_action_summary=invoke_ctx["previous_action_summary"],
+            recent_conversation=invoke_ctx["recent_conversation"],
+            active_scope=invoke_ctx.get("active_scope"),
+            instruction_memory=invoke_ctx.get("instruction_memory"),
+            frustration_signal=invoke_ctx.get("frustration_signal"),
+            repetition_detected=invoke_ctx["repetition_detected"],
+            repetition_instruction=invoke_ctx.get("repetition_instruction"),
+            resolved_scope_hint=invoke_ctx.get("resolved_scope_hint") or "-",
+            query_analysis_hint=invoke_ctx.get("query_analysis_hint") or "-",
+        )
+        raw = result.model_dump()
+        raw["reasoning"] = raw.get("reasoning") or "llm_orchestrator"
+        prev = invoke_ctx.get("previous_action")
+        if prev:
+            raw["previous_action"] = prev
+        return _classify_return_llm(raw)
+
     if prep.get("early_response"):
         return finalize_classify_response(prep["early_response"], prep, user_message=message)
 
@@ -4260,6 +4457,38 @@ async def classify_intent(payload: dict):
         return finalize_classify_response(raw, prep, user_message=message)
 
     resolved_scope = prep.get("resolved_scope") if isinstance(prep.get("resolved_scope"), dict) else {}
+    from chatbot.assistant.context_intelligence import (
+        detect_edit_action_from_message,
+        is_imperative_edit_command,
+        message_specifies_new_target,
+    )
+
+    ctx_early = payload.get("assistant_context") if isinstance(payload.get("assistant_context"), dict) else {}
+    prev_early = ctx_early.get("last_action") if isinstance(ctx_early.get("last_action"), dict) else {}
+    if (
+        prep.get("has_active_sop")
+        and isinstance(resolved_scope, dict)
+        and message_specifies_new_target(resolved_scope)
+        and is_imperative_edit_command(
+            message,
+            previous_action=prev_early,
+            resolved_scope=resolved_scope,
+        )
+    ):
+        return _classify_return({
+            "flow": "editor_action",
+            "action": detect_edit_action_from_message(message, previous_action=prev_early),
+            "target_scope": str(resolved_scope.get("target_scope") or "section"),
+            "section_hint": str(resolved_scope.get("section_label") or "").strip() or None,
+            "resolved_scope": resolved_scope,
+            "linked_entity_types": [],
+            "constraints": {},
+            "requires_selection": False,
+            "requires_confirmation": True,
+            "confidence": 0.96,
+            "reasoning": "explicit_section_from_scope_resolution",
+            "previous_action": prev_early or None,
+        })
     alias_resolved_label = (
         str(resolved_scope.get("section_label") or "").strip()
         if resolved_scope.get("resolved_from") in {"ALIAS_MATCH", "SUB_SECTION", "RECORD_ID"}
@@ -4292,34 +4521,26 @@ async def classify_intent(payload: dict):
         return out
 
     def _infer_previous_action() -> dict[str, Any]:
-        if isinstance(last_action, dict) and last_action:
-            return {
-                "action": str(last_action.get("action") or "").strip(),
-                "target_scope": str(last_action.get("target_scope") or "").strip(),
-                "section_name": str(last_action.get("section_name") or "").strip(),
-                "request_prompt": str(last_action.get("request_prompt") or "").strip(),
-                "status": str(last_action.get("status") or "").strip(),
-            }
-        recent = _recent_message_texts()
-        for text in reversed(recent):
-            low = text.lower()
-            action = ""
-            if re.search(r"\bgap\s*check|lücken|compliance\b", low, re.IGNORECASE):
-                action = "gap_check"
-            elif re.search(r"\bsummarize|summary|shorter|shorten|smaller|smallier\b", low, re.IGNORECASE):
-                action = "summarize"
-            elif re.search(r"\bimprove|verbesser", low, re.IGNORECASE):
-                action = "improve"
-            elif re.search(r"\brewrite|umschreib|überarbeit|ueberarbeit", low, re.IGNORECASE):
-                action = "rewrite"
-            if action:
-                return {
-                    "action": action,
-                    "target_scope": "section",
-                    "section_name": str(selected_section.get("name") or "").strip(),
-                    "request_prompt": text[:400],
-                    "status": "inferred",
-                }
+        from chatbot.assistant.context_intelligence import (
+            build_session_from_payload,
+            enrich_sections_with_aliases,
+            resolve_effective_previous_action,
+        )
+
+        sop_sections = current_sop.get("sections") if isinstance(current_sop.get("sections"), list) else []
+        if not sop_sections:
+            sop_ctx = editor_contract.get("sop_context") if isinstance(editor_contract.get("sop_context"), dict) else {}
+            sop_sections = sop_ctx.get("sections") if isinstance(sop_ctx.get("sections"), list) else []
+        sections_enriched = enrich_sections_with_aliases(sop_sections)
+        session = build_session_from_payload(payload)
+        inferred = resolve_effective_previous_action(
+            ctx,
+            session,
+            sections=sections_enriched,
+            recent_messages=recent_messages,
+        )
+        if inferred:
+            return inferred
         return {}
 
     previous_action = _infer_previous_action()
@@ -4550,33 +4771,7 @@ async def classify_intent(payload: dict):
         return ""
 
     def _is_context_dependent_followup(text: str) -> bool:
-        q = str(text or "").strip().lower()
-        if not q or not previous_action:
-            return False
-        explicit = re.search(
-            r"\b(previous|suggestion|i\s+told\s+you|too\s+long|still\s+too\s+long|shorter|shoter|shorten|smaller|smallier|keep the same|same tone|make it shorter|make it shoter|summarize it|improve that|that specific section|what is the gap check|same style|same company style)\b",
-            q,
-            re.IGNORECASE,
-        )
-        if explicit:
-            return True
-        if re.search(r"^(ok(?:ay)?|now|then|and now|next)\b", q, re.IGNORECASE):
-            return True
-        if re.search(
-            r"\b(?:make|rewrite|re-?write|improve|summarize|shorten|expand|redo|try)\s+(?:it|them|that|this version)\b",
-            q,
-            re.IGNORECASE,
-        ):
-            return True
-        if re.search(
-            r"\b(?:it|them|that|this version)\s+(?:again|shorter|shoter|smaller|smallier|better|more\s+formal|more\s+clear|clearer)\b",
-            q,
-            re.IGNORECASE,
-        ):
-            return True
-        if re.fullmatch(r"(make it shorter|make it shoter|make it smaller|make it smallier|summarize it|improve it|rewrite it|improve them|rewrite them)", q, re.IGNORECASE):
-            return True
-        return False
+        return is_follow_up_edit_refinement(text, previous_action)
 
     def _is_explicit_selection_reference(text: str) -> bool:
         return bool(
@@ -4588,31 +4783,10 @@ async def classify_intent(payload: dict):
         )
 
     def _is_read_only_followup_about_action(text: str) -> bool:
-        q = str(text or "").strip().lower()
-        if not q:
-            return False
-        if re.search(r"\b(rewrite|improve|shorten|expand|change|update|fix)\b", q, re.IGNORECASE):
-            return False
-        asks = bool(re.search(r"\b(what|which|how|why|tell me|explain|show me|describe|list)\b", q, re.IGNORECASE))
-        about_change = bool(re.search(r"\b(upgrad(?:e|ed)|chang(?:e|ed)|improv(?:e|ed|ement)|rewrit(?:e|ten)|rewrite|modified|different|difference|diff|did you do|was done)\b", q, re.IGNORECASE))
-        imperative_edit = bool(re.search(r"^(?:ok(?:ay)?\s+)?(?:rewrite|improve|summarize|shorten|expand|change|update|make)\b", q, re.IGNORECASE))
-        return asks and about_change and not imperative_edit
+        return is_meta_question_about_assistant_output(text)
 
     def _is_read_only_explain_request(text: str) -> bool:
-        q = str(text or "").strip().lower()
-        if not q:
-            return False
-        if re.search(r"^(?:ok(?:ay)?\s+)?(?:rewrite|improve|shorten|expand|change|update|make|fix|delete|remove|add)\b", q, re.IGNORECASE):
-            return False
-        if re.search(r"\b(rewrite|improve|shorten|expand|change|update|fix|make\s+.+\baudit[-\s]?ready)\b", q, re.IGNORECASE):
-            return False
-        return bool(
-            re.search(
-                r"\b(summarize|summary|zusammenfass|kurzfassung|explain|easy wording|easy words|simple words|what\s+(?:is|are|'s|does)|what'?s\s+inside|tell\s+me\s+about|describe|read|show\s+(?:me\s+)?)\b",
-                q,
-                re.IGNORECASE,
-            )
-        )
+        return is_read_only_sop_query(text)
 
     lower_message = message.lower()
     full_sop_read_request = bool(
@@ -4953,6 +5127,25 @@ async def query_ai(
     intents = _query_intents(question)
     active_scope = _extract_active_sop_scope(assistant_context)
     context_summary = _summarize_live_context(assistant_context, question)
+    explain_preview_response = _deterministic_explain_preview_response(question, assistant_context)
+    if explain_preview_response:
+        explain_preview_response["retrieval_stats"].update(
+            {
+                "provider": "deterministic",
+                "model": "assistant_memory",
+                "surface": surface,
+                "intents": sorted(intents),
+                "assistant_mode": assistant_mode,
+                "latency_ms_total": round((time.perf_counter() - t0) * 1000.0, 1),
+            }
+        )
+        explain_preview_response["elapsed_ms_total"] = round((time.perf_counter() - t0) * 1000.0, 1)
+        explain_preview_response["retrieval_stats"]["elapsed_ms_total"] = explain_preview_response[
+            "elapsed_ms_total"
+        ]
+        logger.info("[chatbot-response] source=assistant_explain_preview latency_ms=%.1f", (time.perf_counter() - t0) * 1000.0)
+        return await _merge_persisted(explain_preview_response)
+
     last_action_response = _deterministic_last_action_response(question, assistant_context)
     if last_action_response:
         last_action_response["retrieval_stats"].update(
@@ -5024,6 +5217,15 @@ async def query_ai(
     )
     question_for_rag = question
     context_hints: list[str] = []
+    rc_query = (
+        assistant_context.get("response_constraints")
+        if isinstance(assistant_context.get("response_constraints"), dict)
+        else {}
+    )
+    if rc_query.get("line_count"):
+        context_hints.append(
+            f"OUTPUT_LINES_EXACTLY={int(rc_query['line_count'])}_NO_SUMMARY_DETAILS_STATUS_TEMPLATE"
+        )
     current_sop = assistant_context.get("current_sop") if isinstance(assistant_context.get("current_sop"), dict) else {}
     active_ref = str(active_scope.get("active_sop_ref") or current_sop.get("sop_number") or current_sop.get("id") or "").strip()
     active_id = str(active_scope.get("active_sop_id") or "").strip()

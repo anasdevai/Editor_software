@@ -58,7 +58,21 @@ class AssistantIntentResult(BaseModel):
 
 
 CLASSIFIER_PROMPT = """\
-You are the intent router for a pharmaceutical QA SOP assistant (English and German).
+You are the orchestrator for a pharmaceutical QA SOP assistant (English and German).
+Your job is to understand the user query first, then choose exactly one path:
+
+1) RAG chat — no SOP open in the editor; answer from knowledge base / regulations.
+2) Open-SOP chat — SOP is open; user wants information only (explain, list, compare, summarize in sidebar) — do NOT change document text.
+3) Editor action — user wants the open SOP body changed in-place (rewrite, improve, revise, gap check, etc.) with Accept/Reject preview.
+
+EDITORIAL PROFILE vs OPEN SOP CONTENT (critical for rewrite/improve):
+- Default: use the open SOP's own detected profile/NLP when the user does not name another profile.
+- When the user names another profile (e.g. "rewrite in Emergency access sop profile", "using SOP-IT-003 profile", "improve per Network Security profile"):
+  → flow=editor_action, action=rewrite or improve
+  → The **content** to edit is always the **currently open SOP** in the editor (preserve its IDs, systems, dates, sensitive facts).
+  → The **editorial rules** come from the **named profile** (profile.md parameters), NOT from copying that other SOP's body text.
+  → Set constraints.format = "editorial_profile_on_open_sop" when a named editorial profile is requested.
+- Do NOT use flow=chat to list profile metadata from the database when the user asked to rewrite/improve with a named profile.
 
 Given the user message and context, return ONLY valid JSON (no markdown) matching this schema:
 
@@ -86,30 +100,63 @@ ROUTING RULES (semantic — infer meaning; users may paraphrase in English or Ge
 
 A) flow = "chat" — default for questions and explanations:
    - Questions (including with "?"), "what/why/how/welche/was/wie/warum", requests to explain, list, compare records, or summarize/explain **information** without changing the open SOP body.
-   - Explaining or listing linked CAPAs, deviations, audits, decisions, or SOP meaning **without** asking to rewrite/improve/shorten the document text.
+   - Explaining or listing linked CAPA **database records** only (eg "which CAPAs exist for SOP-IT-002?") when the user does NOT ask for gap/risk/compliance analysis on document text.
+   - NOT chat when the user asks to **find gaps**, **gap check**, **identify risks**, or **compliance gaps** on the open SOP or a named section (CAPAs, Zweck, …) — use editor_action gap_check instead (see D).
    - Questions about the previous edit/suggestion such as "what did you change?", "what did you upgrade in the rewrite?", "show the difference", or "explain the rewrite" are chat, not another editor action.
    - If the user only wants QA/record context as an answer, use flow="chat". You may still set linked_entity_types to steer retrieval.
    - "this SOP", "full SOP", "whole SOP", "entire SOP", and "tell me about this SOP" mean the full active SOP and must override any previous section target.
 
 B) flow = "editor_action" — user wants the **open SOP text** changed or generated in-place:
-   - Rewrite, rephrase, shorten, expand, formalize, bulletize, translate output **into the document**, tighten wording, compliance polish, gap/risk review **on the prose**, section-level or full-document edits.
-   - Summarize **into** the document (replace or condense a section) is editor_action with action "summarize" and the right target_scope.
+   - Rewrite, revise, rephrase, improve, shorten, expand, formalize, bulletize, translate output **into the document**, tighten wording, compliance polish, gap/risk review **on the prose**.
+   - "Revise the SOP", "revise the standard operating procedure", "überarbeiten" → editor_action rewrite or improve on target_scope full_document unless they only named one section.
+   - Pick section_hint from available_sections when the user names a heading (Purpose/Zweck, CAPAs, DEVIATIONS, etc.) — use the exact label from available_sections when possible.
+   - Summarize requests are **always** flow="chat" (sidebar answer only — never editor_action "summarize").
    - Requires has_active_sop=true for document edits. If has_active_sop=false but they clearly want document work → flow="clarify" (ask to open an SOP).
 
 C) flow = "clarify" — one short follow-up when necessary:
    - Cannot tell if they want a **chat answer** vs **editing the SOP**, or cannot tell **which target** (selection vs section vs whole document) and it matters.
    - Do **not** clarify if a safe default exists: e.g. has_editor_selection=true and the message refers to "this" / "the selected text" → target_scope "selection"; a clearly named section (Purpose, Scope, …) → target_scope "section" with section_hint.
 
-TARGET_SCOPE (editor_action):
-- "selection": non-empty editor selection exists AND the user refers to the selection, this paragraph, highlighted text, or similar. If has_editor_selection=true and the target is vague ("this", "here"), prefer "selection".
-- "section": a named heading/section in the SOP; set section_hint to the best heading label (Purpose, Scope, Procedure, Responsibilities, Zweck, Geltungsbereich, Verfahren, …). The app will expand to the **full section body**, not the heading line alone.
+TARGET_SCOPE (editor_action) — read the user query carefully:
+
+PRIORITY (highest wins):
+1) User names a **section** (Zweck, Purpose, CAPAs, "section of X", "entire section of Zweck", "rewrite the Zweck section"):
+   → target_scope = "section"
+   → section_hint = **exact string from available_sections** (e.g. "1. Zweck" not bare "Zweck")
+   → constraints.detail_level = "full_section_body"
+   → **IGNORE** has_editor_selection unless they explicitly say "selection", "highlighted text", "selected word", "only this word".
+
+2) User says **full SOP / entire document / revise the SOP** → target_scope = "full_document", section_hint = null.
+
+3) User explicitly says **selected text / highlighted / this paragraph / only the selection** AND has_editor_selection=true → target_scope = "selection".
+
+4) Vague "this" / "here" with has_editor_selection=true and NO section name → target_scope = "selection".
+
+SECTION vs HEADING vs ONE WORD (critical):
+- "Rewrite the **entire section** of Zweck" = section body (all paragraphs under "1. Zweck" until next heading). NOT the heading line alone. NOT one word.
+- "Rewrite the **heading**" / "only the title line" → still section scope but constraints.detail_level = "heading_line_only" (rare).
+- Never use target_scope "selection" when the user said section/Abschnitt/Zweck/Purpose/CAPAs by name.
+
+German examples → section + full_section_body:
+- "schreib den ganzen Abschnitt Zweck um"
+- "überarbeite den kompletten Abschnitt 1. Zweck"
+- "rewrite the entire section of zweck"
+
+- "selection": only when rule 3 or 4 applies.
+- "section": named heading; full body under that heading (see above).
 - "full_document": entire SOP / whole document / "die ganze SOP".
-- "linked_context": user wants the action focused on **blocks that reference** linked CAPAs, deviations, audits, or decisions (set linked_entity_types). Use for gap_check on registers; for pure Q&A about links use "chat" instead.
+- "linked_context": gap/risk on CAPA/DEVIATION/AUDIT/DECISION blocks (linked_entity_types).
+
+D) GAP CHECK (editor_action, action = "gap_check") — compliance / risk gaps on **open SOP text**:
+   - "find the gap checks in the CAPAs section", "gap analysis on Zweck", "identify gaps in this SOP", "Lücken im Abschnitt CAPAs"
+   - → flow="editor_action", action="gap_check", target_scope="section" with section_hint from available_sections (eg CAPAs heading), linked_entity_types includes "capas" when relevant.
+   - Hybrid RAG runs **inside** the gap_check editor action (not as a sidebar-only chat answer). Do NOT return flow="chat" that only lists CAPA records from the knowledge base.
+   - Distinguish: "list all CAPAs for this SOP" (chat + linked_entity_types) vs "find gaps in the CAPAs **section** of this document" (gap_check editor).
 
 ACTION (editor_action only):
 - rewrite: restructure/rephrase wording (not necessarily shorter).
 - improve: clarity, compliance tone, professionalism, fix awkward phrasing.
-- gap_check: risks, gaps, missing controls, Lückenanalyse on the chosen target.
+- gap_check: risks, gaps, missing controls, missing acceptance criteria, Lückenanalyse on the chosen target (section or full_document).
 - summarize: produce a shorter version; set word_count and/or line_count when the user asks (e.g. "100 words", "two lines", "vier Zeilen").
 - analyze: deep structure/compliance analysis (often whole document).
 - compare: version comparison.
@@ -122,7 +169,7 @@ CONSTRAINTS (extract when mentioned):
 - tone, language (en/de), format, detail_level as appropriate.
 
 CONTEXT:
-- has_active_sop: {has_active_sop}
+- has_active_sop: {has_active_sop} (false → prefer RAG chat unless user only asks general QA)
 - has_editor_selection: {has_editor_selection}
 - route: {route}
 - active_sop_title: {active_sop_title}
@@ -136,9 +183,14 @@ CONTEXT:
 - frustration_signal: {frustration_signal}
 - repetition_detected: {repetition_detected}
 - repetition_instruction: {repetition_instruction}
+- resolved_scope_hint (deterministic hint, may override if user clearly means something else): {resolved_scope_hint}
+- query_analysis_hint: {query_analysis_hint}
 
-When target_scope is section, the editor applies the action to the full section body under that heading.
-For follow-up requests like "it", "that", "now make it shorter", use previous_action and recent_conversation to keep the same target.
+When target_scope is section, set constraints.detail_level = "full_section_body" unless the user clearly asked for heading-only or selection-only.
+The editor applies the action to every paragraph under that heading until the next section — never only the heading word or a accidental single-word selection.
+Match section_hint to available_sections (cross-language: user "Purpose" → document may show "1. Zweck").
+For follow-up requests like "it", "that", "now make it shorter", use previous_action and recent_conversation to keep the same target and scope.
+If resolved_scope_hint says ENTIRE_SECTION or section_label, prefer that over selection.
 For frustration/refinement follow-ups like "i told you make it shorter", "too long", "make it shoter/shorter", "no, better and shorter", keep the previous target and return editor_action. Use action "rewrite" for shorter rewrites, action "improve" when the user asks for better wording, and set constraints.length="shorter".
 For questions asking what the SOP/section means, who owns it, version/status/tags, or why it exists, use flow="chat" unless the user clearly asks to replace document text.
 
@@ -237,10 +289,15 @@ def _normalize_payload(
     else:
         reasoning = None
 
-    # Enforce consistency
+    # Enforce consistency — summarize is always sidebar chat (keep scope hints for targeting).
+    summarize_sidebar = action == "summarize"
+    if summarize_sidebar:
+        flow = "chat"  # type: ignore[assignment]
+        action = None
     if flow == "chat":
         action = None
-        target_scope = None
+        if not summarize_sidebar:
+            target_scope = None
         clarification = None
     elif flow == "clarify":
         action = None
@@ -261,6 +318,34 @@ def _normalize_payload(
         elif not action:
             flow = "chat"  # type: ignore[assignment]
         else:
+            user_msg = str(data.get("_user_message") or "")
+            names_section = bool(
+                section_hint
+                or re.search(
+                    r"\b(?:entire|whole|full|gesamte?|komplette?)\s+(?:section|abschnitt)\b",
+                    user_msg,
+                    re.I,
+                )
+                or re.search(r"\b(?:section|abschnitt)\s+(?:of|von|für)\b", user_msg, re.I)
+                or re.search(
+                    r"\b(zweck|purpose|scope|geltungsbereich|capas?|deviations?|abweichungen?)\b",
+                    user_msg,
+                    re.I,
+                )
+            )
+            if names_section and (not target_scope or target_scope == "selection"):
+                target_scope = "section"  # type: ignore[assignment]
+                if not section_hint:
+                    known = re.search(
+                        r"\b(zweck|purpose|scope|geltungsbereich|capas?|deviations?)\b",
+                        user_msg,
+                        re.I,
+                    )
+                    if known:
+                        section_hint = known.group(1)
+                constraints = constraints.model_copy(
+                    update={"detail_level": constraints.detail_level or "full_section_body"}
+                )
             # Default target: explicit non-empty selection + vague "this/here" → selection
             content_actions = {"rewrite", "improve", "summarize", "gap_check"}
             if (
@@ -268,6 +353,7 @@ def _normalize_payload(
                 and not target_scope
                 and not section_hint
                 and has_editor_selection
+                and not names_section
             ):
                 target_scope = "selection"  # type: ignore[assignment]
             elif (
@@ -379,16 +465,31 @@ def _heuristic_fallback(
 
     action: ActionType | None = None
     constraints = IntentConstraints()
-    if re.search(r"\b(gap\s*check|gap analysis|lücken|compliance gap)\b", lower, re.I):
+    if re.search(
+        r"\b(?:gap\s*checks?|gap\s+analysis|gaps?\s+in|lücken|luecken|luken|compliance\s+(?:gap|check|review)|"
+        r"(?:find|identify|check|analyse|analyze)\s+(?:the\s+)?(?:gap\s*checks?|gaps?)|"
+        r"finde\s+(?:the\s+)?(?:gap\s*checks?|gaps?|lücken)|welche\s+(?:gap\s*checks?|gaps?|lücken))\b",
+        lower,
+        re.I,
+    ):
         action = "gap_check"
     elif _looks_like_shortening_followup(lower):
         action = "improve" if re.search(r"\b(better|improve|verbesser)\b", lower, re.I) else "rewrite"
         constraints.length = "shorter"
-    elif re.search(r"\b(summarize|summary|zusammenfass|kurzfassung)\b", lower, re.I):
-        return AssistantIntentResult(flow="chat", confidence=0.7, reasoning="classifier_unavailable_summary_is_chat")
+    elif re.search(r"\b(summarize|summary|zusammenfass|kurzfassung|fasse)\b", lower, re.I):
+        return AssistantIntentResult(
+            flow="chat",
+            confidence=0.75,
+            reasoning="classifier_unavailable_summary_is_sidebar_chat",
+            section_hint=_extract_section_hint_from_text(q, available_sections, previous_action_summary),
+        )
     elif re.search(r"\b(improve|polish|enhance|refine|verbesser)\b", lower, re.I):
         action = "improve"
-    elif re.search(r"\b(rewrite|re-?write|rephrase|umschreib|überarbeit|ueberarbeit)\b", lower, re.I):
+    elif re.search(
+        r"\b(rewrite|re-?write|rephrase|revise|revision|umschreib|überarbeit|ueberarbeit)\b",
+        lower,
+        re.I,
+    ):
         action = "rewrite"
 
     if not action:
@@ -406,7 +507,12 @@ def _heuristic_fallback(
         section_hint = _previous_section_hint(previous_action_summary)
     full_doc = bool(
         re.search(r"\b(full|whole|entire|complete|gesamt|komplett)\s+(?:sop|document|doc)\b", lower, re.I)
-        or re.search(r"\b(?:rewrite|improve|summarize|gap\s*check)\s+(?:this\s+|the\s+)?sop\b", lower, re.I)
+        or re.search(r"\b(?:rewrite|improve|revise|summarize|gap\s*check)\s+(?:this\s+|the\s+)?sop\b", lower, re.I)
+        or re.search(r"\brevise\s+(?:the\s+)?(?:standard\s+operating\s+)?procedure\b", lower, re.I)
+        or (
+            re.search(r"\bstandard\s+operating\s+procedure\b", lower, re.I)
+            and re.search(r"\b(?:revise|rewrite|improve|überarbeit)\b", lower, re.I)
+        )
     )
     target_scope: TargetScope = "full_document" if full_doc else "section" if section_hint else "selection" if has_editor_selection else "section"
     return AssistantIntentResult(
@@ -437,6 +543,8 @@ def classify_assistant_intent(
     frustration_signal: dict | None = None,
     repetition_detected: bool = False,
     repetition_instruction: str | None = None,
+    resolved_scope_hint: str = "-",
+    query_analysis_hint: str = "-",
 ) -> AssistantIntentResult:
     """Classify user intent for the KL/KI Assistant using a small LLM call."""
     user_message = (message or "").strip()
@@ -473,6 +581,8 @@ def classify_assistant_intent(
                 "frustration_signal": str(frustration_signal or {}),
                 "repetition_detected": str(bool(repetition_detected)).lower(),
                 "repetition_instruction": repetition_instruction or "-",
+                "resolved_scope_hint": resolved_scope_hint or "-",
+                "query_analysis_hint": query_analysis_hint or "-",
             }
         )
         data = _extract_json_object(raw)

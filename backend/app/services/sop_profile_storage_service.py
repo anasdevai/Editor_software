@@ -10,7 +10,6 @@ try:
     import nlp_pipeline
     HAS_ROOT_NLP = True
 except ImportError:
-    # Attempt to add parent dir to path
     parent_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
     if parent_dir not in sys.path:
         sys.path.insert(0, parent_dir)
@@ -24,6 +23,31 @@ from app.models import SOP, SOPDetectedParameters, ClientProfile, ProfileVersion
 
 logger = logging.getLogger(__name__)
 
+
+def _find_existing_profile_for_sop(db: Session, sop_id: UUID, tenant_id: UUID) -> Optional[ClientProfile]:
+    """
+    Look up the ClientProfile already linked to this SOP via SOPDetectedParameters.
+    This is the authoritative lookup — each SOP has exactly one profile.
+    """
+    existing_param = (
+        db.query(SOPDetectedParameters)
+        .filter(
+            SOPDetectedParameters.sop_id == sop_id,
+            SOPDetectedParameters.client_profile_id.isnot(None),
+        )
+        .order_by(SOPDetectedParameters.created_at.desc())
+        .first()
+    )
+    if existing_param and existing_param.client_profile_id:
+        profile = db.query(ClientProfile).filter(
+            ClientProfile.id == existing_param.client_profile_id,
+            ClientProfile.tenant_id == tenant_id,
+        ).first()
+        if profile:
+            return profile
+    return None
+
+
 def analyze_and_store_sop_profile(
     db: Session,
     sop_id: UUID,
@@ -31,11 +55,18 @@ def analyze_and_store_sop_profile(
     text: str,
     client_name: str = "Client",
     source_filename: str = "",
-    user_id: Optional[UUID] = None
+    user_id: Optional[UUID] = None,
 ) -> None:
     """
-    Analyzes an SOP using the NLP pipeline and stores the detected parameters
-    and profile history. Never fails the upload process (errors are caught and logged).
+    Analyses an SOP via the NLP pipeline and stores:
+      - SOPDetectedParameters  (always one per upload)
+      - ClientProfile          (one PER SOP — created on first upload, updated on re-upload)
+
+    Each SOP always has its own isolated ClientProfile row.
+    The profile_name is based on SOP metadata so it is human-readable in the UI.
+    Lookup is done via SOPDetectedParameters.sop_id → client_profile_id so that
+    re-uploads of the same SOP always update the SAME profile row, never merge
+    with a different SOP's profile.
     """
     try:
         sop = db.query(SOP).filter(SOP.id == sop_id).first()
@@ -45,17 +76,103 @@ def analyze_and_store_sop_profile(
 
         tenant_id = sop.tenant_id
 
-        # 1. Run NLP analysis
+        # ── 1. Run NLP analysis ──────────────────────────────────────────────
         if HAS_ROOT_NLP:
-            analysis = nlp_pipeline.analyze_sop_industry_level(text, client_name=client_name)
+            analysis = nlp_pipeline.analyze_sop_industry_level(
+                text,
+                client_name=client_name,
+                include_profile_md=True,
+            )
         else:
             from app.services.nlp.pipeline import analyze_sop_text
             analysis = analyze_sop_text(text)
 
-        # 2. Save SOPDetectedParameters
+        # ── 2. Extract profile_json / profile_md from pipeline output ────────
+        built_profile_json = analysis.get("client_profile") or {}
+        built_profile_md   = analysis.get("profile_md")   or ""
+
+        # Fallback: generate profile_md from the built profile json
+        if not built_profile_md and built_profile_json and HAS_ROOT_NLP:
+            try:
+                built_profile_md = nlp_pipeline.generate_profile_md(built_profile_json)
+            except Exception as md_err:
+                logger.warning(f"generate_profile_md fallback failed: {md_err}")
+
+        if not built_profile_md:
+            built_profile_md = (
+                f"# {client_name} SOP Profile\n\n"
+                f"Profile generated from SOP: {source_filename}\n"
+            )
+
+        # ── 3. Build a human-readable unique profile name ────────────────────
+        if client_name == "German_Pharma_SOP_Profile":
+            profile_name = client_name
+        elif sop.sop_number:
+            profile_name = f"{sop.sop_number} - {sop.title or source_filename or str(sop_id)}"
+        elif sop.title:
+            profile_name = sop.title
+        else:
+            profile_name = source_filename or f"SOP {sop_id}"
+
+        # ── 4. Find or create the ClientProfile FOR THIS SOP ─────────────────
+        # Primary lookup: via SOPDetectedParameters.sop_id link (authoritative)
+        profile = _find_existing_profile_for_sop(db, sop_id, tenant_id)
+
+        if not profile:
+            # Secondary lookup: by name (for legacy rows created before this fix)
+            profile = (
+                db.query(ClientProfile)
+                .filter(
+                    ClientProfile.name == profile_name,
+                    ClientProfile.tenant_id == tenant_id,
+                )
+                .first()
+            )
+            # Make sure this named profile is actually linked to THIS sop (not another)
+            if profile:
+                linked_param = (
+                    db.query(SOPDetectedParameters)
+                    .filter(
+                        SOPDetectedParameters.client_profile_id == profile.id,
+                        SOPDetectedParameters.sop_id != sop_id,
+                    )
+                    .first()
+                )
+                if linked_param:
+                    # This profile belongs to a DIFFERENT sop → don't reuse it
+                    profile = None
+
+        if not profile:
+            # First time this SOP is analysed — create a brand-new profile
+            profile = ClientProfile(
+                tenant_id=tenant_id,
+                name=profile_name,
+                company_name=client_name,
+                total_sops_analyzed=0,
+                active_profile_json={},
+                active_profile_md="",
+            )
+            db.add(profile)
+            db.flush()  # get profile.id
+            logger.info(
+                f"[profile] Created NEW ClientProfile for sop_id={sop_id} "
+                f"name='{profile_name}'"
+            )
+        else:
+            # Re-upload of the same SOP — update the existing profile
+            logger.info(
+                f"[profile] Updating existing ClientProfile id={profile.id} "
+                f"for sop_id={sop_id} name='{profile_name}'"
+            )
+            # Keep name in sync if SOP metadata changed
+            profile.name = profile_name
+            profile.company_name = client_name
+
+        # ── 5. Save SOPDetectedParameters ────────────────────────────────────
         detected = SOPDetectedParameters(
             sop_id=sop_id,
             sop_version_id=sop_version_id,
+            client_profile_id=profile.id,
             client_name=client_name,
             source_filename=source_filename,
             analysis_json=analysis,
@@ -71,93 +188,62 @@ def analyze_and_store_sop_profile(
             readiness_check=analysis.get("readiness_check"),
         )
         db.add(detected)
-        
-        # 3. Find or create ClientProfile
-        profile = db.query(ClientProfile).filter(
-            ClientProfile.name == client_name, 
-            ClientProfile.tenant_id == tenant_id
-        ).first()
-        
-        is_new_profile = False
-        if not profile:
-            profile = ClientProfile(
-                tenant_id=tenant_id,
-                name=client_name,
-                company_name=client_name,
-                total_sops_analyzed=0,
-                active_profile_json={}
-            )
-            db.add(profile)
-            db.flush()
-            is_new_profile = True
-            
-        detected.client_profile_id = profile.id
-        
-        # Calculate new version number first
-        latest_version = db.query(ProfileVersion).filter(
-            ProfileVersion.profile_id == profile.id
-        ).order_by(ProfileVersion.version_number.desc()).first()
-        new_version_num = (latest_version.version_number + 1) if latest_version else 1
-        
-        # 4. Merge analysis into profile
-        merged_json = merge_analysis_into_profile(profile.active_profile_json or {}, analysis)
-        merged_json["profile_version"] = f"{new_version_num}.0"
-        profile.active_profile_json = merged_json
-        profile.total_sops_analyzed += 1
-        
-        # 5. Generate profile markdown
-        if HAS_ROOT_NLP:
-            profile_md = nlp_pipeline.generate_profile_md(merged_json)
+
+        # ── 6. Update profile JSON & markdown ────────────────────────────────
+        # For this SOP's OWN profile, we always use the freshly-built data.
+        # No cross-SOP merging: each profile reflects exactly the one SOP it belongs to.
+        existing_json = profile.active_profile_json or {}
+
+        if existing_json and profile.total_sops_analyzed > 0:
+            # Re-upload: merge to keep any manually-added rewrite_rules, but
+            # overwrite all NLP-derived fields with the latest analysis.
+            merged_json = dict(existing_json)
+            merged_json.update(built_profile_json)
+            # Preserve manually-added rewrite_rules
+            if existing_json.get("rewrite_rules"):
+                merged_json["rewrite_rules"] = _deduplicate_list(
+                    built_profile_json.get("rewrite_rules", []) +
+                    existing_json.get("rewrite_rules", [])
+                )
         else:
-            profile_md = "# Profile\nGenerated without root nlp_pipeline."
-            
-        profile.active_profile_md = profile_md
-        
-        # 6. Create ProfileVersion
-        prof_version = ProfileVersion(
-            profile_id=profile.id,
-            version_number=new_version_num,
-            rules_json=merged_json,
-            profile_md=profile_md,
-            source_sop_id=sop_id,
-            source_version_id=sop_version_id,
-            change_reason="Initial creation" if is_new_profile else "SOP Analysis update",
-            detected_parameters_snapshot=analysis
+            merged_json = built_profile_json
+
+        merged_json["profile_version"] = existing_json.get("profile_version", "3.0")
+
+        profile.active_profile_json = merged_json
+
+        # Regenerate profile_md from the merged profile
+        if HAS_ROOT_NLP and merged_json:
+            try:
+                profile.active_profile_md = nlp_pipeline.generate_profile_md(merged_json)
+            except Exception as regen_err:
+                logger.warning(f"profile_md regen failed: {regen_err}")
+                profile.active_profile_md = built_profile_md
+        else:
+            profile.active_profile_md = built_profile_md
+
+        profile.total_sops_analyzed = (profile.total_sops_analyzed or 0) + 1
+        profile.current_version_id = None  # versioning disabled
+
+        logger.info(
+            f"[profile] Stored profile for sop_id={sop_id} "
+            f"profile_id={profile.id} "
+            f"profile_md_length={len(profile.active_profile_md)} chars "
+            f"total_sops_analyzed={profile.total_sops_analyzed}"
         )
-        db.add(prof_version)
-        db.flush()
-        
-        profile.current_version_id = prof_version.id
-        
-        # 7. Append ProfileHistoryEvent
-        event_type = "PROFILE_CREATED" if is_new_profile else "SOP_ANALYZED"
-        history = ProfileHistoryEvent(
-            client_profile_id=profile.id,
-            profile_version_id=prof_version.id,
-            event_type=event_type,
-            event_summary=f"Profile updated via SOP {source_filename}",
-            after_snapshot=merged_json,
-            source_sop_id=sop_id,
-            created_by=str(user_id) if user_id else "system"
-        )
-        db.add(history)
-        
-        # 8. Store detected profile suggestions
-        style_suggs = analysis.get("style_suggestions", [])
-        for sugg in style_suggs:
+
+        # ── 7. Store style suggestions (dedup per profile+sop+rule) ──────────
+        for sugg in analysis.get("style_suggestions", []):
             rule_text = sugg.get("suggestion") or sugg.get("suggested_rule") or ""
             if not rule_text:
                 continue
-            
-            # Check if this suggestion already exists for this profile and SOP
-            existing_sugg = db.query(ProfileSuggestion).filter(
+            exists = db.query(ProfileSuggestion).filter(
                 ProfileSuggestion.profile_id == profile.id,
                 ProfileSuggestion.sop_id == sop_id,
-                ProfileSuggestion.suggested_rule == rule_text
+                ProfileSuggestion.suggested_rule == rule_text,
             ).first()
-            
-            if not existing_sugg:
-                new_sugg = ProfileSuggestion(
+            if not exists:
+                db.add(ProfileSuggestion(
                     tenant_id=tenant_id,
                     profile_id=profile.id,
                     sop_id=sop_id,
@@ -165,15 +251,18 @@ def analyze_and_store_sop_profile(
                     suggested_rule=rule_text,
                     evidence_json=sugg,
                     confidence=0.8,
-                    status="pending"
-                )
-                db.add(new_sugg)
-        
+                    status="pending",
+                ))
+
         db.commit()
-    except Exception as e:
+        logger.info(f"[profile] Committed profile update for sop_id={sop_id}")
+
+    except Exception:
         logger.exception("Failed to analyze and store SOP profile")
         db.rollback()
 
+
+# ── Helpers ─────────────────────────────────────────────────────────────────
 
 def _deduplicate_list(lst: list) -> list:
     seen = []
@@ -182,27 +271,31 @@ def _deduplicate_list(lst: list) -> list:
             seen.append(item)
     return seen
 
+
 def merge_analysis_into_profile(existing_profile: Dict[str, Any], new_analysis: Dict[str, Any]) -> Dict[str, Any]:
     """
-    Properly merges new analysis into existing profile JSON structure.
+    Merges a new NLP pipeline analysis result into an existing profile JSON.
+    Uses analysis["client_profile"] as the new data source.
     """
     merged = dict(existing_profile)
-    
-    # Extract client_profile if it exists, otherwise fallback to the root new_analysis dict
     new_prof = new_analysis.get("client_profile") or {}
-    if not new_prof and "preferred_style" in new_analysis:
-        new_prof = new_analysis
 
-    # 1. Basic Metadata
-    merged["client_name"] = new_prof.get("client_name") or existing_profile.get("client_name") or new_analysis.get("client_name", "Client")
-    
-    # 2. Lists of domains, departments, sop types
+    # 1. Basic metadata
+    merged["client_name"] = (
+        new_prof.get("client_name")
+        or existing_profile.get("client_name")
+        or new_analysis.get("client_name", "Client")
+    )
+
+    # 2. Lists of domains / departments / sop_types
     for key in ["detected_domains", "detected_departments", "detected_sop_types"]:
-        merged[key] = _deduplicate_list(existing_profile.get(key, []) + new_prof.get(key, []))
+        merged[key] = _deduplicate_list(
+            existing_profile.get(key, []) + new_prof.get(key, [])
+        )
 
-    # 3. preferred_style (formality, tone, directive_wording, writing_complexity, primary_format)
+    # 3. preferred_style
     ex_style = existing_profile.get("preferred_style", {}) or {}
-    n_style = new_prof.get("preferred_style", {}) or {}
+    n_style  = new_prof.get("preferred_style", {}) or {}
     merged_style = dict(ex_style)
     for k in ["formality", "tone", "directive_wording", "writing_complexity", "primary_format"]:
         val = n_style.get(k) or ex_style.get(k)
@@ -211,8 +304,7 @@ def merge_analysis_into_profile(existing_profile: Dict[str, Any], new_analysis: 
     merged["preferred_style"] = merged_style
 
     # 4. modal_language
-    ex_modal = existing_profile.get("modal_language", {}) or {}
-    n_modal = new_prof.get("modal_language", {}) or {}
+    ex_modal, n_modal = existing_profile.get("modal_language", {}) or {}, new_prof.get("modal_language", {}) or {}
     merged_modal = dict(ex_modal)
     for k, v in n_modal.items():
         if isinstance(v, list) and isinstance(ex_modal.get(k), list):
@@ -222,67 +314,130 @@ def merge_analysis_into_profile(existing_profile: Dict[str, Any], new_analysis: 
     merged["modal_language"] = merged_modal
 
     # 5. common_sections
-    merged["common_sections"] = _deduplicate_list(existing_profile.get("common_sections", []) + new_prof.get("common_sections", []))
+    merged["common_sections"] = _deduplicate_list(
+        existing_profile.get("common_sections", []) + new_prof.get("common_sections", [])
+    )
 
     # 6. terminology
     ex_term = existing_profile.get("terminology", {}) or {}
-    n_term = new_prof.get("terminology", {}) or {}
-    if not n_term:
-        n_term = new_analysis.get("terminology", {}) or {}
-    
+    n_term  = new_prof.get("terminology", {}) or new_analysis.get("terminology", {}) or {}
     merged_term = {}
     for sub_key in ["acronyms", "controlled_terms", "domain_terms"]:
-        ex_list = ex_term.get(sub_key, []) or []
-        n_list = n_term.get(sub_key, []) or []
-        merged_term[sub_key] = _deduplicate_list(ex_list + n_list)
+        merged_term[sub_key] = _deduplicate_list(
+            (ex_term.get(sub_key) or []) + (n_term.get(sub_key) or [])
+        )
+    ex_phrases = ex_term.get("key_phrases", []) or []
+    n_phrases  = n_term.get("key_phrases",  []) or []
+    phrase_counts: Dict[str, int] = {}
+    for p in ex_phrases + n_phrases:
+        if isinstance(p, dict) and p.get("phrase"):
+            phrase_counts[p["phrase"]] = phrase_counts.get(p["phrase"], 0) + p.get("count", 1)
+    merged_term["key_phrases"] = [
+        {"phrase": k, "count": v}
+        for k, v in sorted(phrase_counts.items(), key=lambda x: x[1], reverse=True)
+    ]
     merged["terminology"] = merged_term
 
     # 7. compliance_elements
     ex_comp = existing_profile.get("compliance_elements", {}) or {}
-    n_comp = new_analysis.get("compliance_elements", {}) or {}
-    
-    merged_comp = {}
-    all_comp_keys = set(list(ex_comp.keys()) + list(n_comp.keys()))
-    for c_key in all_comp_keys:
-        ex_val = ex_comp.get(c_key, [])
-        n_val = n_comp.get(c_key, [])
+    n_comp  = new_analysis.get("compliance_elements", {}) or {}
+    merged_comp: Dict[str, Any] = {}
+    for c_key in set(list(ex_comp.keys()) + list(n_comp.keys())):
+        ex_val, n_val = ex_comp.get(c_key, []), n_comp.get(c_key, [])
         if isinstance(ex_val, list) and isinstance(n_val, list):
             merged_comp[c_key] = _deduplicate_list(ex_val + n_val)
         else:
             merged_comp[c_key] = n_val or ex_val
     merged["compliance_elements"] = merged_comp
 
-    # 8. workflow_patterns
+    # 8. document_content_profile
+    new_dcp = new_prof.get("document_content_profile") or {}
+    merged["document_content_profile"] = new_dcp or merged.get("document_content_profile", {})
+
+    # 9. workflow_patterns
     ex_wf = existing_profile.get("workflow_patterns", {}) or {}
-    n_wf = new_prof.get("workflow_patterns", {}) or {}
+    n_wf  = new_prof.get("workflow_patterns", {}) or {}
     merged_wf = dict(ex_wf)
     for k, v in n_wf.items():
         ex_v = ex_wf.get(k, {}) or {}
         merged_wf[k] = {
             "detected": v.get("detected") or ex_v.get("detected", False),
-            "stages": _deduplicate_list(ex_v.get("stages", []) + v.get("stages", []))
+            "status":   v.get("status")   or ex_v.get("status", "not_detected"),
+            "confidence": v.get("confidence") or ex_v.get("confidence", 0.0),
+            "stages": _deduplicate_list(ex_v.get("stages", []) + v.get("stages", [])),
+            "missing_core_stages": _deduplicate_list(
+                ex_v.get("missing_core_stages", []) + v.get("missing_core_stages", [])
+            ),
         }
     merged["workflow_patterns"] = merged_wf
 
-    # 9. rewrite_rules
-    merged["rewrite_rules"] = _deduplicate_list(existing_profile.get("rewrite_rules", []) + new_prof.get("rewrite_rules", []))
-    
-    # 10. writing_style (raw)
+    # 10. rewrite_rules
+    merged["rewrite_rules"] = _deduplicate_list(
+        existing_profile.get("rewrite_rules", []) + new_prof.get("rewrite_rules", [])
+    )
+
+    # 11. roles_raci
+    ex_roles = existing_profile.get("roles_raci", {}) or {}
+    n_roles  = new_analysis.get("roles_raci", {}) or new_prof.get("roles_raci", {}) or {}
+    r_dict_ex = ex_roles.get("roles", ex_roles) if isinstance(ex_roles.get("roles"), dict) else ex_roles
+    r_dict_n  = n_roles.get("roles", n_roles)   if isinstance(n_roles.get("roles"),  dict) else n_roles
+    for role, spec in r_dict_n.items():
+        if not isinstance(spec, dict):
+            continue
+        if role in r_dict_ex:
+            r_dict_ex[role] = {
+                "detected": spec.get("detected") or r_dict_ex[role].get("detected", False),
+                "status":   spec.get("status")   or r_dict_ex[role].get("status", "not_detected"),
+                "confidence": max(spec.get("confidence", 0.0), r_dict_ex[role].get("confidence", 0.0)),
+                "matched_terms": _deduplicate_list(r_dict_ex[role].get("matched_terms", []) + spec.get("matched_terms", [])),
+                "responsibility_actions": _deduplicate_list(r_dict_ex[role].get("responsibility_actions", []) + spec.get("responsibility_actions", [])),
+                "raci_category": spec.get("raci_category") or r_dict_ex[role].get("raci_category"),
+                "evidence": _deduplicate_list(r_dict_ex[role].get("evidence", []) + spec.get("evidence", []))[:20],
+            }
+        else:
+            r_dict_ex[role] = spec
+    merged["roles_raci"] = r_dict_ex
+
+    # 12. risks_gaps
+    ex_risks = existing_profile.get("risks_gaps", {}) or {}
+    n_risks  = new_analysis.get("risks_gaps", {}) or new_prof.get("risks_gaps", {}) or {}
+    ex_gaps  = ex_risks.get("gaps", {}) or {}
+    n_gaps   = n_risks.get("gaps",  {}) or {}
+    merged_gaps: Dict[str, Any] = {}
+    for g_key in set(list(ex_gaps.keys()) + list(n_gaps.keys())):
+        merged_gaps[g_key] = _deduplicate_list(ex_gaps.get(g_key, []) + n_gaps.get(g_key, []))
+    merged["risks_gaps"] = {
+        "gaps": merged_gaps,
+        "risk_score": n_risks.get("risk_score") or ex_risks.get("risk_score") or {"score": 0.0, "level": "low"},
+        "gap_count": sum(len(v) for v in merged_gaps.values()),
+        "critical_focus_areas": _deduplicate_list(
+            ex_risks.get("critical_focus_areas", []) + n_risks.get("critical_focus_areas", [])
+        ),
+    }
+
+    # 13. structure_patterns
+    ex_struct = existing_profile.get("structure_patterns", {}) or {}
+    n_struct  = new_analysis.get("structure_patterns", {}) or new_prof.get("structure_patterns", {}) or {}
+    merged["structure_patterns"] = {
+        "section_labels": _deduplicate_list(ex_struct.get("section_labels", []) + n_struct.get("section_labels", [])),
+        "primary_format": n_struct.get("primary_format") or ex_struct.get("primary_format") or "standard",
+        "section_count": max(ex_struct.get("section_count", 0), n_struct.get("section_count", 0)),
+        "headings_detected": _deduplicate_list(ex_struct.get("headings_detected", []) + n_struct.get("headings_detected", [])),
+    }
+
+    # 14. writing_style (always use latest)
     merged["writing_style"] = new_analysis.get("writing_style", {}) or new_prof.get("writing_style", {})
 
     return merged
 
 
 def get_profile_context_for_llm(db: Session, client_profile_id: UUID) -> Dict[str, Any]:
-    """
-    Returns a compact dict from active_profile_json for LLM context.
-    """
+    """Returns a compact dict from active_profile_json for LLM context."""
     profile = db.query(ClientProfile).filter(ClientProfile.id == client_profile_id).first()
     if not profile or not profile.active_profile_json:
         return {}
-    
     return {
         "client_name": profile.company_name or profile.name,
         "terminology": profile.active_profile_json.get("terminology", []),
-        "writing_style": profile.active_profile_json.get("writing_style", {})
+        "writing_style": profile.active_profile_json.get("writing_style", {}),
     }

@@ -76,13 +76,16 @@ const GAP_PATTERNS = [
   /\bwhat\s+(?:is|are)\s+the\s+gaps?\b/i,
   /\bwhat\s+gaps?\s+(?:are|exist)\b/i,
   /\bgaps?\s+in\s+(?:this\s+)?sop\b/i,
-  /\bcompliance\s+(check|gap)\b/i,
-  /\bl(?:ü|ue)cken[\s-]?(analyse|pr(?:ü|ue)fung|check)\b/i,
+  /\bcompliance\s+(check|gap|review|audit)\b/i,
+  /\bl(?:ü|ue|u)cken[\s-]?(analyse|pr(?:ü|ue|u)fung|check)?\b/i,
+  /\b(?:finde|zeige|identifiziere|pr(?:ü|ue)fe)\s+(?:die\s+)?l(?:ü|ue|u)cken\b/i,
   /\bqa\s*review\b/i,
-  /\bwelche\s+lücken\b/i,
+  /\bwelche\s+l(?:ü|ue|u)cken\b/i,
   /\bidentify\s+risks?\b/i,
   /\brisks?\s+and\s+gaps?\b/i,
-  /\brisiken\s+und\s+lücken\b/i,
+  /\brisiken\s+und\s+l(?:ü|ue|u)cken\b/i,
+  /\b(?:sop|dokument).*\bl(?:ü|ue|u)cken\b/i,
+  /\bl(?:ü|ue|u)cken\b.*\b(?:sop|dokument)\b/i,
 ]
 
 const READ_PATTERNS = [
@@ -100,8 +103,12 @@ const SUMMARIZE_PATTERNS = [
   /\bexecutive\s+summary\b/i,
   /\bzusammenfass/i,
   /\bkurzfassung\b/i,
+  /\bfasse\s+zusammen\b/i,
+  /\bverkürz/i,
   /\bsummarize\s+this\s+sop\s+in\s+\d+\s+words?\b/i,
   /\bzusammenfass(?:en|ung).*\b\d+\s+wörter\b/i,
+  /\b(?:summarize|zusammenfass).*\b(?:section|abschnitt)\b/i,
+  /\b(?:abschnitt|section)\s+.*\b(?:summarize|zusammenfass)\b/i,
 ]
 
 const ANALYZE_PATTERNS = [
@@ -208,10 +215,51 @@ export function hasActiveSopEditor(pathname) {
 }
 
 export const SOP_EDITOR_CONTEXT_EVENT = 'sop-editor-context-changed'
+export const KL_ASSISTANT_CONTEXT_REFRESH_REQUEST = 'kl-assistant-context-refresh-request'
+export const KL_ASSISTANT_CONTEXT_REFRESH_DONE = 'kl-assistant-context-refresh-done'
 
 export function notifySopEditorContextChanged() {
   if (typeof window === 'undefined') return
   window.dispatchEvent(new CustomEvent(SOP_EDITOR_CONTEXT_EVENT))
+}
+
+/**
+ * Ask the open editor to flush the latest SOP text/selection into assistant context
+ * before classify-intent or /api/ai/query (avoids stale 1.2s debounced snapshots).
+ * @param {number} [timeoutMs]
+ * @returns {Promise<boolean>} true when editor acknowledged refresh
+ */
+export function requestAssistantEditorContextRefresh(timeoutMs = 500) {
+  if (typeof window === 'undefined') {
+    return Promise.resolve(false)
+  }
+  if (!getActiveEditorDocumentId()) {
+    return Promise.resolve(false)
+  }
+
+  const requestId = `ctx-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`
+
+  return new Promise((resolve) => {
+    const timer = window.setTimeout(() => {
+      window.removeEventListener(KL_ASSISTANT_CONTEXT_REFRESH_DONE, onDone)
+      resolve(false)
+    }, timeoutMs)
+
+    const onDone = (event) => {
+      const d = event.detail || {}
+      if (d.requestId !== requestId) return
+      window.clearTimeout(timer)
+      window.removeEventListener(KL_ASSISTANT_CONTEXT_REFRESH_DONE, onDone)
+      resolve(d.ok !== false)
+    }
+
+    window.addEventListener(KL_ASSISTANT_CONTEXT_REFRESH_DONE, onDone)
+    window.dispatchEvent(
+      new CustomEvent(KL_ASSISTANT_CONTEXT_REFRESH_REQUEST, {
+        detail: { requestId },
+      }),
+    )
+  })
 }
 
 /** Lightweight, opaque request id. */
@@ -232,13 +280,35 @@ export function makeEditorAiRequestId() {
  * @param {string} [opts.source]    Origin tag (e.g. 'kl_assistant', 'chat_page').
  * @returns {string} The request id that result events will echo back.
  */
-export function dispatchEditorAiActionRequest({ action, prompt = '', requestId, source = 'kl_assistant' } = {}) {
+export function dispatchEditorAiActionRequest({
+  action,
+  prompt = '',
+  userPrompt = '',
+  sectionHint = '',
+  targetScope = '',
+  lineNumber = null,
+  recordId = '',
+  preferFullSection = false,
+  requestId,
+  source = 'kl_assistant',
+} = {}) {
   if (typeof window === 'undefined') return ''
   const id = requestId || makeEditorAiRequestId()
   console.info('[kl-editor-bridge-dispatch]', { action, requestId: id, source, promptLen: String(prompt || '').length })
   window.dispatchEvent(
     new CustomEvent(EDITOR_AI_ACTION_REQUEST_EVENT, {
-      detail: { action, prompt, requestId: id, source },
+      detail: {
+        action,
+        prompt,
+        userPrompt: String(userPrompt || '').trim(),
+        sectionHint: String(sectionHint || '').trim(),
+        targetScope: String(targetScope || '').trim().toLowerCase(),
+        lineNumber: lineNumber ?? null,
+        recordId: String(recordId || '').trim(),
+        preferFullSection: Boolean(preferFullSection),
+        requestId: id,
+        source,
+      },
     }),
   )
   return id

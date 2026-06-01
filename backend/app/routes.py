@@ -14,6 +14,8 @@ from .models import (
     AILinkSuggestion,
     AISuggestion,
     EmbeddingJob,
+    SOPDetectedParameters,
+    ProfileDetection,
 )
 from .schemas import (
     # Editor compat request bodies
@@ -1069,9 +1071,15 @@ def create_document(
         .first()
     )
     if existing:
-        return _create_new_version_for_existing_sop(
-            db, existing, payload, resolved_title, department, sop_number, background_tasks
-        )
+        has_params = db.query(SOPDetectedParameters).filter(SOPDetectedParameters.sop_id == existing.id).first()
+        if has_params:
+            logger.info("SOP %s already uploaded and analyzed, returning existing document without duplication.", sop_number)
+            current_version = _resolve_current_version(db, existing)
+            return _build_editor_doc_response(existing, current_version)
+        else:
+            return _create_new_version_for_existing_sop(
+                db, existing, payload, resolved_title, department, sop_number, background_tasks
+            )
 
     dept_final = _truncate_field(department, 100) or "Quality"
     title_final = _truncate_field(resolved_title, 255) or "Untitled SOP"

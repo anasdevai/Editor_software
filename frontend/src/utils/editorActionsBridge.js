@@ -57,6 +57,7 @@ export function requestEditorSnapshot({
   targetScope = '',
   lineNumber = null,
   recordId = '',
+  preferFullSection = false,
 } = {}) {
   if (typeof window === 'undefined') {
     return Promise.reject(new Error('Editor snapshot is only available in the browser.'))
@@ -93,6 +94,7 @@ export function requestEditorSnapshot({
           targetScope: String(targetScope || '').trim().toLowerCase(),
           lineNumber: lineNumber ?? null,
           recordId: String(recordId || '').trim(),
+          preferFullSection: Boolean(preferFullSection),
         },
       }),
     )
@@ -134,6 +136,7 @@ export function dispatchActionsTabRun({
   targetScope = '',
   lineNumber = null,
   recordId = null,
+  preferFullSection = false,
   sourceContentOverride = null,
 } = {}) {
   if (typeof window === 'undefined') return
@@ -147,6 +150,7 @@ export function dispatchActionsTabRun({
         targetScope: String(targetScope || '').trim().toLowerCase(),
         lineNumber: lineNumber ?? null,
         recordId: recordId ? String(recordId).trim() : '',
+        preferFullSection: Boolean(preferFullSection),
         sourceContentOverride: sourceContentOverride || null,
       },
     }),

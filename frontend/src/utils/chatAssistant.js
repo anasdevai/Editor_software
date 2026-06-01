@@ -306,7 +306,15 @@ function buildEditorContextContract({
       label: selected.label || selected.name || null,
       content: selected.content || selected.text_excerpt || null,
     },
-    conversation_history: normalizeHistoryRows(chatHistory),
+    conversation_history: normalizeHistoryRows(
+      chatHistory.length
+        ? chatHistory
+        : assistantContext?.conversation_history || [],
+    ),
+    active_scope: assistantContext?.active_scope || null,
+    instruction_memory: Array.isArray(assistantContext?.instruction_memory)
+      ? assistantContext.instruction_memory
+      : [],
     last_affected_scope: last
       ? {
           level: last.target_scope === 'full_document' ? 'full' : (last.target_scope || null),
@@ -359,10 +367,11 @@ export async function runUnifiedAssistantQuery({
   surface = 'global_chatbot',
   sessionId = null,
   assistantMode = null,
+  assistantContextOverride = null,
 }) {
   const routeMeta = matchRouteConfig(pathname)
   const visibleQuestion = String(question || '').trim()
-  const assistantContext = getKLAssistantContext(pathname)
+  const assistantContext = assistantContextOverride || getKLAssistantContext(pathname)
   const editorContextContract = buildEditorContextContract({
     sessionId,
     visibleQuestion,

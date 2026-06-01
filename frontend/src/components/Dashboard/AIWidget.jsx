@@ -19,10 +19,12 @@ import {
   getAssistantContextStorageKeys,
   resetAssistantStateOnce,
   clearAssistantLastAction,
+  recordAssistantTurnPlan,
   saveAssistantLastAction,
   saveAssistantLastFocus,
 } from '../../utils/assistantContext'
 import {
+  AI_ACTION_TRIGGERED_BY,
   EDITOR_AI_ACTIONS,
   EDITOR_AI_ACTION_STATUS,
   describeEditorAiResult,
@@ -35,9 +37,12 @@ import {
 } from '../../utils/editorAiBridge'
 import {
   buildEnrichedActionPrompt,
-  classifyAssistantMessage,
   planEditorActionExecution,
 } from '../../utils/assistantIntentRouter'
+import {
+  buildTargetOptionsFromClassification,
+  prepareSidebarTurn,
+} from '../../utils/sidebarAssistantOrchestrator'
 import EditorChatActions from './EditorChatActions'
 import { dispatchActionsTabRun } from '../../utils/editorActionsBridge'
 import { runEditorGapCheck } from '../../utils/editorGapCheck'
@@ -559,18 +564,14 @@ function AIWidget() {
     if (!intent) return false
 
     const actionPrompt = buildEnrichedActionPrompt(text, classification)
-    const mentionedFocus = findMentionedSectionFocus(text, location.pathname)
-    const sectionHint =
-      plan.snapshotOptions.sectionHint
-      || classification.record_id
-      || mentionedFocus?.section_name
-      || ''
+    const sectionHint = plan.snapshotOptions.sectionHint || classification.record_id || ''
     const targetScope =
       classification.target_scope === 'full_document'
         ? 'full_document'
         : plan.snapshotOptions.targetScope || (sectionHint ? 'section' : 'selection')
 
     if (intent === EDITOR_AI_ACTIONS.GAP_CHECK) {
+      const targetOptions = buildTargetOptionsFromClassification(classification, text)
       setMessages((prev) => [
         ...prev,
         {
@@ -582,7 +583,11 @@ function AIWidget() {
         },
       ])
       try {
-        const { result, target } = await runEditorGapCheck({ instruction: actionPrompt })
+        const { result, target } = await runEditorGapCheck({
+          instruction: actionPrompt,
+          targetOptions,
+          triggeredBy: AI_ACTION_TRIGGERED_BY.KL_ASSISTANT,
+        })
           const report = buildGapCheckSidebarReport(result)
           const parts = report.sections.map((s) => {
             if (s.gapItems?.length) {
@@ -648,15 +653,17 @@ function AIWidget() {
           time: nowTime(),
         },
       ])
+      const targetOpts = buildTargetOptionsFromClassification(classification, text)
       dispatchActionsTabRun({
         action: plan.inlineAction || intent,
         prompt: actionPrompt,
-        userPrompt: text,
-        sectionHint,
-        targetScope,
-        lineNumber: classification.line_number || null,
-        recordId: classification.record_id || null,
-        sourceContentOverride: classification.source_content_override || null,
+        userPrompt: targetOpts.userPrompt,
+        sectionHint: targetOpts.sectionHint || sectionHint,
+        targetScope: targetOpts.targetScope || targetScope,
+        lineNumber: targetOpts.lineNumber,
+        recordId: targetOpts.recordId,
+        preferFullSection: targetOpts.preferFullSection,
+        sourceContentOverride: targetOpts.sourceContentOverride,
       })
       return true
     }
@@ -705,12 +712,16 @@ function AIWidget() {
       source: 'sidebar_bridge_action',
       sop_id: activeDocumentId,
     })
+    const bridgeTarget = buildTargetOptionsFromClassification(classification, text)
     dispatchEditorAiActionRequest({
       action: intent,
       prompt: actionPrompt,
-      userPrompt: text,
-      sectionHint,
-      targetScope,
+      userPrompt: bridgeTarget.userPrompt,
+      sectionHint: bridgeTarget.sectionHint || sectionHint,
+      targetScope: bridgeTarget.targetScope || targetScope,
+      lineNumber: bridgeTarget.lineNumber,
+      recordId: bridgeTarget.recordId,
+      preferFullSection: bridgeTarget.preferFullSection,
       requestId,
       source: 'kl_assistant',
     })
@@ -738,9 +749,11 @@ function AIWidget() {
     setInput('')
     setSending(true)
 
+    let classification = null
+
     try {
       if (!opts.assistantActionConfirmation) {
-        const classification = await classifyAssistantMessage({
+        const turn = await prepareSidebarTurn({
           message: trimmed,
           pathname: location.pathname,
           recentMessages: messagesRef.current.map((msg) => ({
@@ -748,6 +761,9 @@ function AIWidget() {
             content: msg.text,
           })),
         })
+        setLiveAssistantContext(turn.assistantContext)
+
+        classification = turn.classification
 
         if (classification.flow === 'clarify' && classification.clarification_question) {
           setMessages((prev) => [
@@ -762,9 +778,52 @@ function AIWidget() {
           return
         }
 
-        if (classification.flow === 'editor_action' || classification.flow === 'follow_up_action') {
+        if (
+          classification.flow === 'chat'
+          && classification.assistant_message
+          && (classification.chat_submode === 'explain_last_edit_diff'
+            || classification.chat_submode === 'explain_last_output')
+        ) {
+          setMessages((prev) => [
+            ...prev,
+            {
+              id: Date.now() + 1,
+              role: 'ai',
+              text: classification.assistant_message,
+              time: nowTime(),
+            },
+          ])
+          return
+        }
+
+        const wantsEditor =
+          classification.run_editor_action
+          && classification.flow !== 'chat'
+          && classification.sidebar_intent !== 'sop_query'
+          && classification.sidebar_intent !== 'rag'
+        if (wantsEditor) {
+          recordAssistantTurnPlan({
+            action: classification.action,
+            targetScope: classification.target_scope,
+            sectionName:
+              classification.section_hint
+              || classification.target_resolution?.section_hint
+              || '',
+            requestPrompt: trimmed,
+            sopId: getActiveEditorDocumentId(),
+          })
           const handled = await routeClassifiedEditorAction(trimmed, classification, opts)
           if (handled) return
+        }
+
+        if (classification.chat_submode === 'sop_summarize') {
+          recordAssistantTurnPlan({
+            action: 'summarize',
+            targetScope: classification.target_scope || 'section',
+            sectionName: classification.section_hint || classification.target_resolution?.section_hint,
+            requestPrompt: trimmed,
+            sopId: getActiveEditorDocumentId(),
+          })
         }
       }
 
@@ -776,6 +835,12 @@ function AIWidget() {
         { role: 'user', content: trimmed },
       ]
       const sid = readSessionIdForPath(location.pathname)
+      const queryContext = {
+        ...getKLAssistantContext(location.pathname),
+        response_constraints: classification?.constraints || {},
+        chat_submode: classification?.chat_submode || null,
+      }
+      setLiveAssistantContext(queryContext)
       const result = await runUnifiedAssistantQuery({
         question: trimmed,
         pathname: location.pathname,
@@ -784,6 +849,7 @@ function AIWidget() {
         surface: 'kl_assistant',
         sessionId: sid,
         assistantMode,
+        assistantContextOverride: queryContext,
       })
       const action = result?.assistant_action
       if (assistantMode === 'action' && action?.requires_confirmation && action?.type === 'delete_sop') {

@@ -37,18 +37,65 @@ _PRESERVE_CORE = """PRESERVE (never alter):
 - Named vendors, tools, systems, ports, protocols, values exactly — never convert to examples"""
 
 _THREE_C_IMPROVE_STANDARD = """3C SOP IMPROVEMENT STANDARD:
-- Clarity: Correct grammar, sentence flow, vague terms, unclear abbreviations, and unclear responsibility without changing meaning.
+- Clarity: Correct grammar, sentence flow, vague terms, unclear abbreviations, and unclear responsibility; align operational wording to ACTIVE PROFILE RULES when present.
 - Consistency: Keep the original structure, numbering, field labels, formatting, terminology, paragraph boundaries, and compact register style.
-- Compliance: Preserve audit-relevant facts and improve GMP/QA wording without adding new requirements, controls, dates, systems, owners, approvals, or regulatory claims.
-- Final self-check: Confirm the output preserves the same meaning, scope, records, IDs, and required fields as TEXT."""
+- Compliance: Preserve audit-relevant facts (IDs, dates, systems, thresholds) and improve GMP/QA control language per profile without inventing new records or approvals.
+- Final self-check: Confirm IDs, record inventory, and required fields match TEXT; procedural content should reflect the active profile, not only synonym edits."""
 
 _THREE_C_REWRITE_STANDARD = """3C SOP REWRITE STANDARD:
-- Clarity: Rewrite vague, passive, or informal wording into clear, role-based, action-oriented SOP language.
-- Consistency: Keep the same section order, numbering, terminology, register format, IDs, record structure, and document tone unless EDIT_SCOPE is FULL_DOCUMENT and TEXT is missing required SOP backbone sections.
-- Compliance: Strengthen GMP/QA control language only when supported by TEXT, metadata, or a visible risk in the provided content. Do not invent approvals, limits, systems, owners, dates, forms, thresholds, or regulatory references.
-- Final self-check: Verify the rewritten SOP is clear, consistent, compliant, and that no original ID, record, section, or required field was removed."""
+- Clarity: Rewrite vague, passive, or informal wording into clear, role-based, action-oriented SOP language per ACTIVE PROFILE RULES.
+- Consistency: Keep the same section order, numbering, register format, IDs, record structure unless EDIT_SCOPE is FULL_DOCUMENT and TEXT lacks required backbone sections.
+- Compliance: Strengthen GMP/QA control language per profile and TEXT; reshape procedures and sensitive content to profile standards without inventing new IDs, dates, systems, or approvals.
+- Final self-check: Verify IDs, records, and sections are preserved; procedural substance must reflect the profile, not only tone."""
 
 _META_USAGE = """METADATA: Use NLP_STRUCTURE_AND_PARAMETERS and database metadata for style, terminology, and structure alignment only. If metadata conflicts with TEXT, preserve TEXT meaning."""
+
+
+def _build_profile_application_block(
+    profile_md: str = "",
+    profile_json: dict | None = None,
+    *,
+    action: str = "rewrite",
+) -> str:
+    """When an active profile is loaded, apply it to substance and style — not tone-only polish."""
+    has_profile = bool((profile_md or "").strip()) or bool(profile_json)
+    if not has_profile:
+        return _META_USAGE
+
+    rewrite_rules: list[str] = []
+    if isinstance(profile_json, dict):
+        raw_rules = profile_json.get("rewrite_rules")
+        if isinstance(raw_rules, list):
+            rewrite_rules = [str(r).strip() for r in raw_rules if str(r).strip()]
+
+    rules_hint = ""
+    if rewrite_rules:
+        rules_hint = "\n- Profile rewrite_rules to apply:\n" + "\n".join(f"  • {r}" for r in rewrite_rules[:12])
+
+    action_line = (
+        "IMPROVE: strengthen clarity, compliance tone, and profile-aligned operational wording; "
+        "do not invent new records, IDs, or approval steps."
+        if action == "improve"
+        else "REWRITE: perform a full profile-driven editorial pass on procedures, controls, and narrative — "
+        "not a synonym swap."
+    )
+
+    return f"""PROFILE APPLICATION (active profile.md / JSON — mandatory):
+- {action_line}
+- Apply rewrite_rules, workflow_patterns, terminology_preferences, RACI patterns, modal verbs, section flow, "
+  "and rewrite_improve_parameters from ACTIVE PROFILE RULES to **both** style and **substance** of TEXT.
+- Reshape sensitive operational content (access, break-glass, approvals, logging, escalation, data handling) "
+  "so it reads like an SOP written under this profile — while keeping the same underlying process intent.
+- **Preserve hard anchors**: all IDs (SOP-*, DEV-*, CAPA-*, AUD-*, DEC-*), register entry count/order, field labels "
+  "(Datum:, Beschreibung:, …), dates, system names, ports, thresholds, and version metadata unless the profile "
+  "explicitly mandates a label rename.
+- **Forbidden**: output that only tweaks tone/syntax but leaves procedures, controls, and responsibilities "
+  "substantively identical when the profile defines different patterns.
+- If USER_INSTRUCTION names another profile or says \"using profile …\", ACTIVE PROFILE RULES override default "
+  "SOP habits from TEXT for editorial shape (not for inventing new facts).{rules_hint}
+- If USER_INSTRUCTION says editorial_profile_on_open_sop or names another SOP profile: "
+  "ACTIVE PROFILE RULES are the **editorial** contract; TEXT is the **content** to rewrite (open document). "
+  "Never paste body text from the editorial profile's source SOP — only apply its rewrite_rules and patterns."""
 
 _RECORD_ID_RE = re.compile(r"\b(?:DEV|CAPA|AUD|DEC)-[A-Z0-9]+-\d+\b", re.IGNORECASE)
 TRACEABILITY_SECTION_HEADER_RE = re.compile(
@@ -211,6 +258,23 @@ def _scope_directive(request: ActionRequest, action: str) -> str:
 - Preserve every ID (SOP-*, DEV-*, CAPA-*, AUD-*, DEC-*), register line, deviation/CAPA/audit/decision block, and trailing traceability content.
 - Output can be longer than input only when required to add missing backbone sections for FULL_DOCUMENT scope."""
 
+    from chatbot.assistant.context_intelligence import extract_format_constraints
+
+    line_cap = int(
+        extract_format_constraints(getattr(request, "instruction", "") or "").get("line_count") or 0
+    )
+    length_clause = (
+        f"- HARD USER LIMIT: output exactly {line_cap} newline-separated lines; ignore 70–130% length rules."
+        if line_cap
+        else "- Output length must stay close to input (about 80–130% of character count)."
+    )
+    section_length_clause = (
+        f"- HARD USER LIMIT: output exactly {line_cap} newline-separated lines; ignore 70–130% length rules."
+        if line_cap
+        else "- Keep the same structural units as TEXT (headings, lists, tables, register lines). "
+        "Keep output length within 70–130% of input unless grammar repair requires minor variance."
+    )
+
     register_note = ""
     section_title = (request.section_title or "").strip()
     if is_traceability_register_block(request.section_text or "") or TRACEABILITY_SECTION_HEADER_RE.search(
@@ -225,7 +289,7 @@ TRACEABILITY_SECTION_MODE (named block: "{section_title}"):
 - NEVER output SOP title, Version, Status, Purpose, Scope, Responsibilities, Procedure, or Documentation from other sections.
 - NEVER stop after the heading — include all CAPA/DEV/AUD/DEC items until the section ends in TEXT.
 - Keep the exact record count and order; improve grammar and clarity inside each entry only.
-- Output length must stay close to input (about 80–130% of character count)."""
+{length_clause}"""
 
     return f"""EDIT_SCOPE: SECTION_ONLY
 - Target section/selection: "{section}" (type: {request.section_type})
@@ -233,9 +297,33 @@ TRACEABILITY_SECTION_MODE (named block: "{section_title}"):
 - FORBIDDEN: adding Purpose, Scope, Responsibilities, Procedure, Documentation, Review, or other headings not already inside TEXT.
 - FORBIDDEN: rewriting or inventing content for other sections (e.g. if TEXT is DEVIATIONS only, do not add Procedure or Scope).
 - FORBIDDEN: outputting "SOP-IT-001", Version, Status, Abteilung, or numbered backbone sections 1–5 unless they are already in TEXT.
-- Keep the same structural units as TEXT (headings, lists, tables, register lines). Keep output length within 70–130% of input unless grammar repair requires minor variance.
-- Use NLP_STRUCTURE_AND_PARAMETERS only to align tone, terminology, and micro-structure of THIS block — not to expand into a complete SOP.
+{section_length_clause}
+- Use NLP_STRUCTURE_AND_PARAMETERS and ACTIVE PROFILE RULES to align tone, terminology, control language, and procedural wording of THIS block.
+- When a profile is active: apply profile rewrite_rules and rewrite_improve_parameters to sensitive operational content in TEXT, not only surface style.
+- Do not expand into a complete SOP unless EDIT_SCOPE is FULL_DOCUMENT.
 - Return only the improved/rewritten block that replaces TEXT in the editor.{register_note}"""
+
+
+def _user_instruction_blocks(request: ActionRequest) -> str:
+    """User chat instruction + hard line/word limits (overrides default length rules)."""
+    from chatbot.assistant.context_intelligence import extract_format_constraints
+
+    instr = str(getattr(request, "instruction", "") or "").strip()
+    if not instr:
+        return ""
+    fc = extract_format_constraints(instr)
+    parts = [f"USER_INSTRUCTION (mandatory — follow exactly):\n{instr}"]
+    line_n = int(fc.get("line_count") or 0)
+    if line_n:
+        parts.append(
+            f"HARD FORMAT LIMIT: rewritten_text / improved_text MUST be exactly {line_n} "
+            f"newline-separated lines (one sentence or bullet per line). "
+            f"Do NOT exceed {line_n} lines. Ignore default 70–130% input length rules."
+        )
+    word_n = int(fc.get("word_count") or 0)
+    if word_n:
+        parts.append(f"HARD FORMAT LIMIT: about {word_n} words maximum in the model output.")
+    return "\n".join(parts) + "\n\n"
 
 
 def _doc_block(request: ActionRequest, context: str) -> str:
@@ -465,6 +553,13 @@ def build_improve_prompt(
     style_profile: dict | None = None,
 ) -> str:
     context_extra = _format_nlp_profile_context(profile_md, profile_json, detected_nlp)
+    profile_usage = _build_profile_application_block(profile_md, profile_json, action="improve")
+    has_profile = bool((profile_md or "").strip()) or bool(profile_json)
+    task_line = (
+        "profile-aligned improvement of clarity, compliance language, responsibilities, and operational wording"
+        if has_profile
+        else "light editorial polish — not a full-document rewrite"
+    )
     language_rule = _build_language_rule(
         request,
         profile_json=profile_json,
@@ -473,24 +568,27 @@ def build_improve_prompt(
         profile_md=profile_md,
         context=context,
     )
-    return f"""You are a senior GMP/QA SOP editor. TASK: light editorial polish — not a full-document rewrite.
+    return f"""You are a senior GMP/QA SOP editor. TASK: {task_line}.
 {_SPEED_FIRST}
 {_JSON_ESCAPING_RULE}
 {language_rule}
+{_user_instruction_blocks(request)}
 {_doc_block(request, context)}
 {_scope_directive(request, "improve")}
 {_nlp_section(nlp_block)}
 {context_extra}
-{_META_USAGE}
+{profile_usage}
 {_PRESERVE_CORE}
 {_THREE_C_IMPROVE_STANDARD}
 
 IMPROVE RULES:
-- Fix only grammar, missing articles, unclear abbreviations, passive ownership, vague responsibility, and non-GMP wording.
-- Align with the Active Profile rules, configuration, and detected NLP parameters if available. Maintain consistency with style suggestions, preferred tone, and terminology.
-- Keep the original sentence shape, list/table style, numbering, blank-line rhythm, and paragraph boundaries unless the original structure is broken.
-- Never introduce bullets, numbering, labels, or headings not present in the original.
-- Never add steps, approvals, systems, requirements, or compliance claims.
+- Fix grammar, unclear abbreviations, passive ownership, vague responsibility, and non-GMP wording.
+- When ACTIVE PROFILE RULES are present: rephrase procedures, controls, and sensitive operational statements to match "
+  "profile terminology, modal patterns, and workflow style — not only tone.
+- When no profile is present: keep the original sentence shape and make minimal edits.
+- Keep list/table style, numbering, blank-line rhythm, and paragraph boundaries unless structure is broken or profile requires clearer steps.
+- Never introduce bullets, numbering, labels, or headings not present in the original unless profile rewrite_rules require clearer step labels inside existing lists.
+- Do not invent new record IDs, dates, systems, or approval chains; strengthen existing content per profile.
 - Keep compact register statements compact — do not inflate into narrative prose.
 - When EDIT_SCOPE is SECTION_ONLY: output must replace only the targeted block; never return a full SOP skeleton.
 - Before returning: compare output against TEXT and restore any missing section, record, field, or ID present in TEXT.
@@ -603,28 +701,31 @@ FULL SOP BACKBONE (add when missing from TEXT, in the active SOP/profile languag
   Training (if relevant) · Appendices/Traceability (if records present)
 """
     context_extra = _format_nlp_profile_context(profile_md, profile_json, detected_nlp)
+    profile_usage = _build_profile_application_block(profile_md, profile_json, action="rewrite")
     return f"""You are a senior GMP/QA SOP architect. TASK: structural rewrite into industry-ready SOP language for the scope in EDIT_SCOPE.
 {_SPEED_FIRST}
 {_JSON_ESCAPING_RULE}
 {language_rule}
+{_user_instruction_blocks(request)}
 {_doc_block(request, context)}
 {_scope_directive(request, "rewrite")}
 {_nlp_section(nlp_block)}
 {context_extra}
-{_META_USAGE}
+{profile_usage}
 {_PRESERVE_CORE}
 {_THREE_C_REWRITE_STANDARD}
 {full_backbone}
 REWRITE RULES:
 - STRICT STRUCTURE LOCK: preserve the current SOP structure exactly as it appears in TEXT. Do not add, remove, rename, merge, split, or reorder headings, subheadings, numbered items, lists, tables, register blocks, or appendices.
-- STRICT MEANING LOCK: preserve the original factual meaning, scope, intent, and compliance context of the SOP. Rewrite wording only; do not change the operational meaning of requirements, controls, responsibilities, or records.
+- FACT ANCHOR LOCK: preserve record IDs, dates, system names, thresholds, and register line inventory. You MAY change how requirements, controls, responsibilities, and sensitive procedures are expressed when ACTIVE PROFILE RULES require it.
 - Follow EDIT_SCOPE strictly: SECTION_ONLY → never emit a full SOP; FULL_DOCUMENT → rewrite from the first line of TEXT through the end in document order.
-- Follow the Active Profile JSON, Markdown (profile.md), and current SOP detected NLP parameters. Strictly apply rewrite rules, terminology preferences, RACI patterns, tone guidelines, and workflow patterns.
-- When the active profile is German_Pharma_SOP_Profile or the profile describes German pharmaceutical SOPs, make the profile visible in the output: formal German controlled-SOP register, traceable section wording, and appropriate modal/control language such as "muss", "sollte", or "darf nicht" without inventing obligations.
+- Follow Active Profile JSON, profile.md, and detected NLP parameters for terminology, RACI, workflow flow, control language, and rewrite_improve_parameters on **substance and style**.
+- When the active profile is German_Pharma_SOP_Profile or describes German pharmaceutical SOPs: formal controlled register, traceable section wording, modal verbs (muss/sollte/darf nicht) per profile — reshape procedural content accordingly.
 - Single section/heading (e.g. CAPAs, DEVIATIONS, Procedure): rewrite only lines in TEXT; never swap CAPAs for DEVIATIONS or vice versa.
-- Use bracketed placeholders only for missing controls clearly implied by TEXT inside that section.
-- Apply rewrite_improve_parameters from NLP_STRUCTURE_AND_PARAMETERS only for tone, formality, numbering, and domain vocabulary; never use them to change facts.
+- Use bracketed placeholders only for missing controls clearly implied by TEXT or profile rewrite_rules inside that section.
+- Apply rewrite_improve_parameters for tone, formality, numbering, domain vocabulary, **and** procedural/control patterns defined in the profile.
 - FULL_DOCUMENT default behavior: keep the same section set and same order as TEXT. Do not add standard SOP backbone sections unless the user explicitly asks to restructure the SOP.
+- Self-check: if output reads like TEXT with minor synonym changes, deepen the rewrite per profile until procedures and controls match the profile's SOP standard.
 
 LANGUAGE & STYLE:
 - Active voice, named accountable roles, precise verbs, consistent controlled vocabulary.
