@@ -1013,13 +1013,23 @@ async def extract_text_from_upload(file: UploadFile = File(...)):
     from .services.sop_metadata_extractor import extract_sop_metadata_from_text
 
     name = (file.filename or "").lower()
+    meta_cap = int(os.getenv("SOP_IMPORT_METADATA_TEXT_CAP", "120000"))
+
+    def clip_for_metadata(src: str) -> str:
+        text = (src or "").strip()
+        return text if len(text) <= meta_cap else text[:meta_cap]
+
     try:
         if name.endswith((".pdf", ".docx", ".txt", ".md", ".csv", ".json")):
             raw = await file.read()
             elements, blocks, text, scanned_pdf = extract_sequential_upload(raw, name)
             text = strip_invalid_control_chars(text)
             meta_text = enrich_metadata_text(text, blocks)
-            structured = extract_sop_metadata_from_text(meta_text, blocks)
+            structured = extract_sop_metadata_from_text(
+                clip_for_metadata(meta_text),
+                blocks,
+                use_llm_fallback=len(text) < 250000,
+            )
             return _build_extract_response(text, blocks, structured, elements=elements, scanned_pdf=scanned_pdf)
         else:
             # Best-effort UTF-8 for unknown extensions
@@ -1034,7 +1044,11 @@ async def extract_text_from_upload(file: UploadFile = File(...)):
                 ) from None
             blocks = structure_blocks_from_text(text)
             meta_text = enrich_metadata_text(text, blocks)
-            structured = extract_sop_metadata_from_text(meta_text, blocks)
+            structured = extract_sop_metadata_from_text(
+                clip_for_metadata(meta_text),
+                blocks,
+                use_llm_fallback=len(text) < 250000,
+            )
             return _build_extract_response(text, blocks, structured)
     except HTTPException:
         raise

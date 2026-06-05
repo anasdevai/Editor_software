@@ -338,6 +338,8 @@ pypdfium2==5.8.0
     # via pdfplumber
 pytesseract==0.3.13
     # via cybrain-qs
+python-docx==1.2.0
+    # via cybrain-qs
 python-dotenv==1.2.2
     # via
     #   cybrain-qs

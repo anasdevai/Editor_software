@@ -1321,17 +1321,157 @@ def _normalize_gap_check_analysis_text(text: str) -> str:
     t = re.sub(r"(?m)^\s*#+\s*", "", t)
     t = t.replace("**", "")
     t = re.sub(r"(?m)^\s*---+\s*$", "", t)
+    # LM output sometimes emits pseudo-markers such as "/Summary:" or "/Base:".
+    # Promote them to normal headings so they do not render as stray text.
+    heading_aliases = {
+        "summary": "Summary",
+        "zusammenfassung": "Summary",
+        "base": "RAG/NLP Basis",
+        "basis": "RAG/NLP Basis",
+        "rag/nlp basics": "RAG/NLP Basis",
+        "rag/nlp basis": "RAG/NLP Basis",
+        "rag/nlp-grundlage": "RAG/NLP Basis",
+        "identified gaps": "Identified Gaps",
+        "identified gap": "Identified Gaps",
+        "festgestellte lücken": "Identified Gaps",
+        "festgestellte lucken": "Identified Gaps",
+        "recommended corrections": "Recommended Fixes",
+        "recommended fixes": "Recommended Fixes",
+        "empfohlene korrekturen": "Recommended Fixes",
+        "suggested sop amendment text": "Suggested SOP Text",
+        "suggested sop text": "Suggested SOP Text",
+        "vorgeschlagener sop-ergänzungstext": "Suggested SOP Text",
+        "vorgeschlagener sop-erganzungstext": "Suggested SOP Text",
+        "remaining assumptions": "Residual Assumptions",
+        "residual assumptions": "Residual Assumptions",
+        "verbleibende annahmen": "Residual Assumptions",
+    }
+
+    def replace_heading(match: re.Match[str]) -> str:
+        raw = match.group(1).strip()
+        key = re.sub(r"\s+", " ", raw).strip().lower()
+        canonical = heading_aliases.get(key)
+        return f"\n{canonical}:\n" if canonical else match.group(0)
+
+    aliases_pattern = "|".join(re.escape(k) for k in sorted(heading_aliases, key=len, reverse=True))
+    t = re.sub(rf"(?im)^\s*/?\s*({aliases_pattern})\s*:?\s*$", replace_heading, t)
     t = re.sub(r"\n{3,}", "\n\n", t)
     return t.strip()
 
 
 def _render_gap_check_analysis_html(analysis: str) -> str:
-    # Keep compatibility with chatbot.routes implementation so this shim
-    # never fails with NameError when gap_check is requested.
     normalized = _normalize_gap_check_analysis_text(analysis)
     if not normalized:
         return "<p>No suggestion returned.</p>"
-    return _render_dynamic_text(normalized)
+
+    canonical_headings = [
+        "Summary",
+        "RAG/NLP Basis",
+        "Identified Gaps",
+        "Recommended Fixes",
+        "Suggested SOP Text",
+        "Residual Assumptions",
+    ]
+    heading_re = re.compile(
+        r"^\s*(Summary|RAG/NLP Basis|Identified Gaps|Recommended Fixes|Suggested SOP Text|Residual Assumptions)\s*:?\s*(.*)$",
+        re.IGNORECASE,
+    )
+
+    sections: dict[str, list[str]] = {}
+    order: list[str] = []
+    current: str | None = None
+
+    for raw_line in normalized.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            if current:
+                sections.setdefault(current, []).append("")
+            continue
+
+        match = heading_re.match(line)
+        if match:
+            matched = match.group(1)
+            current = next((h for h in canonical_headings if h.lower() == matched.lower()), matched)
+            if current not in sections:
+                sections[current] = []
+                order.append(current)
+            remainder = match.group(2).strip()
+            if remainder:
+                sections[current].append(remainder)
+            continue
+
+        if not current:
+            current = "Summary"
+            sections.setdefault(current, [])
+            if current not in order:
+                order.append(current)
+        sections[current].append(line)
+
+    num_re = re.compile(r"^\s*(\d+)[\)\.]\s+(.*)$")
+    bullet_re = re.compile(r"^\s*(?:[-*]|\u2022)\s+(.*)$")
+
+    def render_body(lines: list[str]) -> str:
+        html_parts: list[str] = []
+        paragraph: list[str] = []
+
+        def flush_paragraph() -> None:
+            nonlocal paragraph
+            if paragraph:
+                text = "\n".join(paragraph)
+                html_parts.append(f"<p>{escape(text).replace(chr(10), '<br />')}</p>")
+                paragraph = []
+
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            if not line:
+                flush_paragraph()
+                i += 1
+                continue
+
+            is_ordered = bool(num_re.match(line))
+            is_bullet = bool(bullet_re.match(line))
+            if is_ordered or is_bullet:
+                flush_paragraph()
+                tag = "ol" if is_ordered else "ul"
+                items: list[str] = []
+                while i < len(lines):
+                    cur = lines[i].strip()
+                    if not cur:
+                        i += 1
+                        break
+                    m_num = num_re.match(cur)
+                    m_bul = bullet_re.match(cur)
+                    if is_ordered and m_num:
+                        items.append(m_num.group(2).strip())
+                        i += 1
+                        continue
+                    if is_bullet and m_bul:
+                        items.append(m_bul.group(1).strip())
+                        i += 1
+                        continue
+                    break
+                if items:
+                    html_parts.append(f"<{tag}>" + "".join(f"<li>{escape(item)}</li>" for item in items) + f"</{tag}>")
+                continue
+
+            paragraph.append(line)
+            i += 1
+
+        flush_paragraph()
+        return "".join(html_parts)
+
+    rendered: list[str] = []
+    for heading in canonical_headings:
+        block = sections.get(heading)
+        if not block or not any(line.strip() for line in block):
+            continue
+        rendered.append(f"<h3>{escape(heading)}</h3>")
+        rendered.append(render_body(block))
+
+    if not rendered:
+        return _render_dynamic_text(normalized)
+    return "".join(rendered)
 
 
 def _render_dynamic_gap_check(gaps: list[dict[str, str]]) -> str:

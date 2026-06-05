@@ -691,16 +691,30 @@ CONTROL_KEYWORDS = [
     "control", "verification", "check", "approval", "review", "audit trail", "record", "evidence", "segregation",
     "access restriction", "mfa", "dual approval", "independent review", "effectiveness check", "monitoring",
     "least privilege", "periodic review", "risk assessment", "authorization", "validated",
+    "validation", "qualification", "mitigation", "preventive action", "corrective action", "root cause",
+    "segregation of duties", "four eyes", "two person review", "witness", "quality check", "qa review",
+    "access review", "change control", "deviation", "capa", "audit", "decision", "decision record",
+    "freigabe", "genehmigung", "autorisierung", "pruefung", "prufung", "ueberpruefung", "uberprufung",
+    "kontrolle", "wirksamkeitspruefung", "wirksamkeitsprufung", "validierung", "qualifizierung",
+    "risikobewertung", "risikominderung", "abweichung", "korrekturmassnahme", "vorbeugemassnahme",
+    "vier-augen-prinzip", "nachweis", "protokollierung", "logging", "rollen", "berechtigung",
 ]
 
 ESCALATION_KEYWORDS = [
     "escalate", "escalation", "notify", "inform", "report to", "management", "department head",
     "qa manager", "critical", "overdue", "unresolved", "severity", "immediate", "urgent",
+    "melden", "benachrichtigen", "informieren", "eskalieren", "eskalation", "kritisch",
+    "ueberfaellig", "uberfallig", "schweregrad", "sofort", "dringend", "management informieren",
 ]
 
 RECORD_KEYWORDS = [
     "record", "records", "log", "evidence", "form", "retention", "audit trail", "documentation",
     "report", "register", "history", "signature",
+    "document", "documented", "document control", "traceability", "reference", "linked record",
+    "deviation record", "capa record", "audit finding", "decision record", "minutes", "attachment",
+    "aufzeichnung", "aufzeichnungen", "dokumentation", "dokumentieren", "nachweis", "nachweise",
+    "protokoll", "protokollierung", "bericht", "register", "historie", "unterschrift",
+    "verknuepfung", "verknupfung", "zugehoerig", "zugehorig", "anlage", "anhang",
 ]
 
 TIMING_PATTERN = re.compile(
@@ -794,6 +808,22 @@ def contains_term(text: str, term: str) -> bool:
 
 def keyword_hits(text: str, keywords: Sequence[str]) -> List[str]:
     return sorted({kw for kw in keywords if contains_term(text, kw)}, key=lambda x: x.lower())
+
+
+def merge_unique_terms(*term_groups: Sequence[str]) -> List[str]:
+    terms: List[str] = []
+    seen = set()
+    for group in term_groups:
+        for term in group or []:
+            clean = normalize_space(str(term))
+            if not clean:
+                continue
+            key = clean.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            terms.append(clean)
+    return sorted(terms, key=lambda x: x.lower())
 
 
 def extract_evidence(text: str, keywords: Sequence[str], max_items: int = 3) -> List[str]:
@@ -1857,6 +1887,7 @@ def extract_workflows(
 def detect_compliance_elements(text: str, sections: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     sections = sections or detect_sections(text)
     labels = [s.get("label") for s in sections]
+    label_set = set(l for l in labels if l and l != "general")
 
     standards = detect_regulatory_standards(text)
     trace_ids = sorted(set(m.group(0) for m in TRACE_ID_PATTERN.finditer(text or "")))
@@ -1864,16 +1895,79 @@ def detect_compliance_elements(text: str, sections: Optional[List[Dict[str, Any]
     controls = keyword_hits(text, CONTROL_KEYWORDS)
     escalation = keyword_hits(text, ESCALATION_KEYWORDS)
     records = keyword_hits(text, RECORD_KEYWORDS)
-    training = keyword_hits(text, ["training", "competency", "qualified", "qualification", "training record"])
-    data_integrity = keyword_hits(text, ["alcoa", "data integrity", "audit trail", "electronic signature", "part 11", "access control"])
-    approvals = keyword_hits(text, ["approval", "approved by", "approver", "authorize", "sign-off", "signature"])
-    review = keyword_hits(text, ["review", "periodic review", "annual review", "access review", "management review"])
-    risk_terms = keyword_hits(text, ["risk", "risk assessment", "hazard", "severity", "criticality", "impact assessment", "mitigation"])
+    training = keyword_hits(text, [
+        "training", "competency", "qualified", "qualification", "training record",
+        "schulung", "training record", "qualifikation", "kompetenz",
+    ])
+    data_integrity = keyword_hits(text, [
+        "alcoa", "data integrity", "audit trail", "electronic signature", "part 11", "access control",
+        "datenintegritaet", "datenintegritat", "audit trail", "elektronische signatur", "zugriffskontrolle",
+    ])
+    approvals = keyword_hits(text, [
+        "approval", "approved by", "approver", "authorize", "authorization", "sign-off", "signature",
+        "release", "freigabe", "genehmigung", "genehmigt", "freigegeben", "autorisierung",
+        "unterschrift", "in freigabe",
+    ])
+    review = keyword_hits(text, [
+        "review", "periodic review", "annual review", "access review", "management review",
+        "pruefung", "prufung", "ueberpruefung", "uberprufung", "review", "bewertung",
+        "menschliche pruefung", "human-in-the-loop",
+    ])
+    risk_terms = keyword_hits(text, [
+        "risk", "risk assessment", "hazard", "severity", "criticality", "impact assessment", "mitigation",
+        "risiko", "risikobewertung", "schweregrad", "kritisch", "auswirkung", "begruendung",
+        "begrundung", "spezifikation", "patientensicherheit",
+    ])
+
+    id_prefixes = sorted(set(
+        (m.group(1) or "").upper()
+        for m in re.finditer(r"\b(DEV|CAPA|AUD|NCR|CC|CR|DEC|TRN|VAL|QMS|SOP|WI|POL|FORM|FRM|SEC)-", text or "", re.I)
+    ))
+    implicit_signals: List[str] = []
+    implicit_controls: List[str] = []
+    implicit_records: List[str] = []
+    implicit_approvals: List[str] = []
+    implicit_reviews: List[str] = []
+
+    compliance_labels = label_set & {
+        "approval", "review", "records", "references", "revision_history", "training",
+        "risk_controls", "escalation", "deviation", "capa", "audit", "linked_deviations",
+        "linked_capas", "linked_audit_findings", "linked_decisions",
+    }
+    if compliance_labels:
+        implicit_signals.append("compliance_section_labels")
+
+    if trace_ids:
+        implicit_signals.append("traceable_document_ids")
+        implicit_records.append("traceability ids")
+
+    if {"DEV", "CAPA", "AUD", "DEC", "NCR", "CC", "CR"} & set(id_prefixes):
+        implicit_signals.append("linked_quality_record_ids")
+        implicit_records.append("linked quality records")
+        implicit_controls.append("linked record traceability")
+
+    if {"approval", "linked_decisions"} & label_set or "DEC" in id_prefixes:
+        implicit_approvals.append("decision/approval records")
+        implicit_controls.append("approval decision traceability")
+
+    if {"review", "audit", "linked_audit_findings"} & label_set or "AUD" in id_prefixes:
+        implicit_reviews.append("audit/review records")
+        implicit_controls.append("audit/review traceability")
+
+    if {"capa", "linked_capas", "deviation", "linked_deviations"} & label_set or {"CAPA", "DEV", "NCR"} & set(id_prefixes):
+        implicit_controls.append("deviation/CAPA control loop")
+
+    controls = merge_unique_terms(controls, implicit_controls)
+    records = merge_unique_terms(records, implicit_records)
+    approvals = merge_unique_terms(approvals, implicit_approvals)
+    review = merge_unique_terms(review, implicit_reviews)
 
     return {
         "standards_detected": standards,
         "traceability_ids": trace_ids,
-        "section_labels_detected": sorted(set(l for l in labels if l and l != "general")),
+        "section_labels_detected": sorted(label_set),
+        "traceability_id_prefixes": id_prefixes,
+        "implicit_compliance_signals": sorted(set(implicit_signals)),
         "timing_mentions": timing_mentions,
         "control_terms": controls,
         "escalation_terms": escalation,

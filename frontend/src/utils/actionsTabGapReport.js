@@ -8,6 +8,51 @@ const stripHtml = (value) =>
     .replace(/\s+/g, ' ')
     .trim()
 
+const TITLE_ALIASES = {
+  summary: 'Summary',
+  zusammenfassung: 'Summary',
+  base: 'RAG/NLP Basis',
+  basis: 'RAG/NLP Basis',
+  'rag/nlp basics': 'RAG/NLP Basis',
+  'rag/nlp basis': 'RAG/NLP Basis',
+  'rag/nlp-grundlage': 'RAG/NLP Basis',
+  details: 'Details',
+  status: 'Status',
+  sources: 'Sources',
+  references: 'References',
+  'cross-refs': 'Cross-Refs',
+  'cross refs': 'Cross-Refs',
+  'identified gaps': 'Identified Gaps',
+  'identified gap': 'Identified Gaps',
+  'festgestellte lucken': 'Identified Gaps',
+  'festgestellte lücken': 'Identified Gaps',
+  'recommended corrections': 'Recommended Fixes',
+  'recommended fixes': 'Recommended Fixes',
+  'empfohlene korrekturen': 'Recommended Fixes',
+  'suggested sop amendment text': 'Suggested SOP Text',
+  'suggested sop text': 'Suggested SOP Text',
+  'vorgeschlagener sop-erganzungstext': 'Suggested SOP Text',
+  'vorgeschlagener sop-ergänzungstext': 'Suggested SOP Text',
+  'remaining assumptions': 'Residual Assumptions',
+  'residual assumptions': 'Residual Assumptions',
+  'verbleibende annahmen': 'Residual Assumptions',
+}
+
+const normalizeHeadingKey = (value) =>
+  String(value || '')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase()
+
+const HEADING_RE = new RegExp(
+  `^/?\\s*(${Object.keys(TITLE_ALIASES)
+    .map((key) => key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+    .join('|')})\\s*:?\\s*(.*)$`,
+  'i',
+)
+
 function splitAnalysisBlocks(analysis) {
   const raw = String(analysis || '').replace(/\r\n/g, '\n').trim()
   if (!raw) return []
@@ -25,12 +70,10 @@ function splitAnalysisBlocks(analysis) {
 
   for (const line of lines) {
     const trimmed = line.trim()
-    const headingMatch = trimmed.match(
-      /^(Summary|Details|Status|Cross-Refs|Cross Refs|Sources|References|Zusammenfassung|RAG\/NLP-Grundlage|Festgestellte Lücken|Identified Gaps|Empfohlene Korrekturen|Recommended Fixes|Vorgeschlagener SOP-Ergänzungstext|Suggested SOP Text|Verbleibende Annahmen|Residual Assumptions)\s*:?\s*(.*)$/i,
-    )
+    const headingMatch = trimmed.match(HEADING_RE)
     if (headingMatch) {
       flush()
-      currentTitle = headingMatch[1]
+      currentTitle = TITLE_ALIASES[normalizeHeadingKey(headingMatch[1])] || headingMatch[1]
       if (headingMatch[2]) currentLines.push(headingMatch[2])
     } else {
       currentLines.push(line)
@@ -106,7 +149,7 @@ export function buildGapCheckSidebarReport(result) {
   } else {
     for (const block of splitAnalysisBlocks(analysis)) {
       const titleLower = block.title.toLowerCase()
-      if (titleLower.includes('gap') || titleLower.includes('lücken')) {
+      if (titleLower.includes('gap') || titleLower.includes('lücke') || titleLower.includes('lucke')) {
         const gapItems = extractGapItems(block.body)
         if (gapItems.length) {
           sections.push({ id: `gaps-${sections.length}`, title: block.title, gapItems })

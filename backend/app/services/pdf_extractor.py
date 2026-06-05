@@ -386,24 +386,6 @@ def extract_structured_blocks(file_path_or_obj) -> List[Dict[str, Any]]:
 
 
 def extract_docx_bytes(docx_bytes: bytes) -> Tuple[List[Dict[str, Any]], str]:
-    """
-    Extract text from DOCX without requiring python-docx. Tables are flattened into row blocks.
-    """
-    try:
-        with zipfile.ZipFile(io.BytesIO(docx_bytes)) as zf:
-            xml = zf.read("word/document.xml").decode("utf-8", errors="replace")
-    except Exception as exc:
-        raise ValueError("Invalid DOCX file") from exc
+    from .docx_extractor import extract_docx_bytes as extract_docx_structured
 
-    paragraphs: List[str] = []
-    for para_xml in re.findall(r"<w:p[\s\S]*?</w:p>", xml):
-        texts = re.findall(r"<w:t[^>]*>([\s\S]*?)</w:t>", para_xml)
-        text = _clean_line("".join(unescape(t) for t in texts))
-        if text:
-            paragraphs.append(text)
-
-    from .document_structure import structure_blocks_from_text
-
-    text = sanitize_extracted_text("\n\n".join(paragraphs).strip())
-    blocks = structure_blocks_from_text(text)
-    return blocks, text
+    return extract_docx_structured(docx_bytes)
