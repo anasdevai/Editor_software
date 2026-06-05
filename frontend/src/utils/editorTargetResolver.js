@@ -859,7 +859,7 @@ function resolveNumberedSemanticSection(doc, label) {
   return null
 }
 
-function collectSectionRanges(doc) {
+export function collectSectionRanges(doc) {
   const blocks = collectBlocks(doc)
   const starts = blocks
     .map((block, index) => ({ ...block, index }))
@@ -880,6 +880,24 @@ function collectSectionRanges(doc) {
       sectionType: getTraceabilitySectionKind(start.text) ? 'Section' : 'Heading',
     }
   }).filter((section) => section.text)
+}
+
+export function buildEditorSectionIndex(editor) {
+  const doc = editor?.state?.doc || editor
+  if (!doc) return []
+
+  return collectSectionRanges(doc).map((section, index) => ({
+    id: `section-${index + 1}`,
+    index,
+    title: section.sectionName,
+    heading: section.sectionName,
+    sectionName: section.sectionName,
+    sectionType: section.sectionType,
+    from: section.from,
+    to: section.to,
+    text: section.text,
+    confidence: 1,
+  }))
 }
 
 function resolveOrdinalSectionTarget(doc, promptText) {
