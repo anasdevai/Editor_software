@@ -48,6 +48,73 @@ def _find_existing_profile_for_sop(db: Session, sop_id: UUID, tenant_id: UUID) -
     return None
 
 
+def cleanup_profile_for_deleted_sop(db: Session, sop_id: UUID) -> Dict[str, Any]:
+    """
+    Stage deletion of the per-SOP profile data when an SOP is deleted.
+
+    This does not commit. The caller owns the surrounding SOP-delete transaction.
+    A ClientProfile is deleted only when no other SOPDetectedParameters row still
+    points at it, so older/shared profiles are not removed accidentally.
+    """
+    summary: Dict[str, Any] = {
+        "deleted_profile_ids": [],
+        "retained_profile_ids": [],
+        "deleted_suggestions": 0,
+        "detected_rows": 0,
+    }
+
+    detected_rows = (
+        db.query(SOPDetectedParameters)
+        .filter(SOPDetectedParameters.sop_id == sop_id)
+        .all()
+    )
+    summary["detected_rows"] = len(detected_rows)
+
+    profile_ids = []
+    for row in detected_rows:
+        if row.client_profile_id and row.client_profile_id not in profile_ids:
+            profile_ids.append(row.client_profile_id)
+
+    summary["deleted_suggestions"] += db.query(ProfileSuggestion).filter(
+        ProfileSuggestion.sop_id == sop_id
+    ).delete(synchronize_session=False)
+
+    for profile_id in profile_ids:
+        still_used = (
+            db.query(SOPDetectedParameters.id)
+            .filter(
+                SOPDetectedParameters.client_profile_id == profile_id,
+                SOPDetectedParameters.sop_id != sop_id,
+            )
+            .first()
+        )
+        if still_used:
+            summary["retained_profile_ids"].append(str(profile_id))
+            continue
+
+        summary["deleted_suggestions"] += db.query(ProfileSuggestion).filter(
+            ProfileSuggestion.profile_id == profile_id
+        ).delete(synchronize_session=False)
+        db.query(ProfileHistoryEvent).filter(
+            ProfileHistoryEvent.client_profile_id == profile_id
+        ).delete(synchronize_session=False)
+        db.query(ProfileVersion).filter(
+            ProfileVersion.profile_id == profile_id
+        ).delete(synchronize_session=False)
+
+        profile = db.query(ClientProfile).filter(ClientProfile.id == profile_id).first()
+        if profile:
+            db.delete(profile)
+            summary["deleted_profile_ids"].append(str(profile_id))
+
+    db.query(SOPDetectedParameters).filter(
+        SOPDetectedParameters.sop_id == sop_id
+    ).delete(synchronize_session=False)
+
+    logger.info("[profile] cleanup staged for deleted SOP %s: %s", sop_id, summary)
+    return summary
+
+
 def analyze_and_store_sop_profile(
     db: Session,
     sop_id: UUID,
