@@ -105,7 +105,14 @@ export function mapBlocksToTipTapDoc(blocks, fallbackText = '') {
 
   for (const block of blocks) {
     const typ = String(block.type || '').toLowerCase()
-    if ((typ === 'section_heading' || typ === 'heading') && block.text) {
+    if (typ === 'text' && block.content) {
+      const style = String(block.style || 'paragraph').toLowerCase()
+      if (style === 'heading') {
+        content.push(headingNode(block.content, 2))
+      } else {
+        content.push(paragraphNode(block.content))
+      }
+    } else if ((typ === 'section_heading' || typ === 'heading') && block.text) {
       const level = Math.min(3, Math.max(1, Number(block.level) || 2))
       content.push(headingNode(block.text, level))
     } else if (typ === 'paragraph' && block.text) {
@@ -157,11 +164,15 @@ export function mapBlocksToTipTapDoc(blocks, fallbackText = '') {
         .filter((it) => String(it ?? '').trim())
         .map((it) => listItemNode(it))
       if (items.length) content.push({ type: listType, content: items })
-    } else if (typ === 'table' && Array.isArray(block.rows) && block.rows.length) {
+    } else if (typ === 'table' && (Array.isArray(block.rows) || Array.isArray(block.content))) {
+      const sourceRows = Array.isArray(block.rows) ? block.rows : block.content
+      const headerRows = Math.max(0, Number(block.header_rows ?? block.headerRows ?? 0) || 0)
       const rows = []
-      for (const row of block.rows) {
+      for (let rowIndex = 0; rowIndex < sourceRows.length; rowIndex += 1) {
+        const row = sourceRows[rowIndex]
+        const cellType = rowIndex < headerRows ? 'tableHeader' : 'tableCell'
         const cells = (row || []).map((cell) => ({
-          type: 'tableCell',
+          type: cellType,
           content: [{ type: 'paragraph', content: [_text(cell)] }],
         }))
         if (cells.length) rows.push({ type: 'tableRow', content: cells })

@@ -77,7 +77,12 @@ export function requestEditorSnapshot({
       window.clearTimeout(timer)
       window.removeEventListener(EDITOR_SNAPSHOT_RESPONSE_EVENT, onResponse)
       if (detail.ok === false) {
-        reject(new Error(detail.message || detail.error || 'Editor snapshot unavailable.'))
+        const err = new Error(detail.message || detail.error || 'Editor snapshot unavailable.')
+        err.code = detail.code || 'snapshot_unavailable'
+        err.candidates = Array.isArray(detail.candidates) ? detail.candidates : []
+        err.targetPhrase = detail.targetPhrase || ''
+        err.confidence = detail.confidence ?? null
+        reject(err)
         return
       }
       resolve(detail)

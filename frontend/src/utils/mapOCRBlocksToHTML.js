@@ -86,6 +86,7 @@ const renderTwoColumnRow = (block, isContract) => {
 
 const renderTable = (block = {}) => {
     const rows = Array.isArray(block.rows) ? block.rows : [];
+    const headerRows = Math.max(0, Number(block.header_rows ?? block.headerRows ?? 0) || 0);
     if (!rows.length) return '';
 
     const normalizedRows = rows
@@ -99,9 +100,12 @@ const renderTable = (block = {}) => {
       <tbody>
         ${normalizedRows
             .map(
-                (row) => `
+                (row, rowIndex) => `
               <tr>
-                ${row.map((cell) => `<td>${escapeHtml(cell)}</td>`).join('')}
+                ${row.map((cell) => {
+                    const tag = rowIndex < headerRows ? 'th' : 'td';
+                    return `<${tag}>${escapeHtml(cell)}</${tag}>`;
+                }).join('')}
               </tr>
             `
             )
@@ -118,6 +122,14 @@ const renderBlock = (block = {}, isContract = false) => {
     const text = cleanText(block.text || '');
 
     switch (type) {
+        case 'text': {
+            const content = cleanText(block.content || '');
+            if (!content) return '';
+            return String(block.style || '').toLowerCase() === 'heading'
+                ? `<h2 class="ocr-section-heading">${escapeHtml(content)}</h2>`
+                : renderParagraphs(content);
+        }
+
         case 'title':
             return text ? `<h1 class="ocr-title">${escapeHtml(text)}</h1>` : '';
 
@@ -154,7 +166,10 @@ const renderBlock = (block = {}, isContract = false) => {
             return renderList(block.items || splitLines(text), true, 'ocr-list ocr-list-ordered');
 
         case 'table':
-            return renderTable(block);
+            return renderTable({
+                ...block,
+                rows: Array.isArray(block.rows) ? block.rows : block.content,
+            });
 
         case 'divider':
         case 'horizontal_rule':

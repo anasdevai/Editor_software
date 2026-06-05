@@ -31,6 +31,8 @@ class ActionRuntime:
     llm: object
     fallback_llm: object
     collection_name: str
+    retrieval_available: bool = True
+    retrieval_status: str = "ready"
 
 
 class _NoContextRetriever:
@@ -122,6 +124,8 @@ def create_action_runtime() -> ActionRuntime:
             llm=_get_action_llm(),
             fallback_llm=_get_action_fallback_llm(),
             collection_name=os.getenv("COLLECTION_SOPS", "docs_sops"),
+            retrieval_available=False,
+            retrieval_status=f"unavailable: {type(qdrant_exc).__name__}",
         )
 
     # 2. Initialize Reranker with standalone try/except to protect retrieval path

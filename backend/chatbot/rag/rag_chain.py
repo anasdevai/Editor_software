@@ -167,6 +167,37 @@ def _prompt_requests_active_sop_scope(prompt: str) -> bool:
     return bool(re.search(r"\bSCOPE=ACTIVE_SOP_ONLY\b", str(prompt or ""), re.IGNORECASE))
 
 
+def _sanitize_editor_context_for_rag(block: str) -> str:
+    """Keep active/selected editor facts, but never turn full SOP body into RAG context."""
+    lines = str(block or "").splitlines()
+    out: List[str] = []
+    skipping_multiline_field = False
+    for line in lines:
+        stripped = line.strip()
+        low = stripped.lower()
+        if re.match(r"^(?:full_text|editor_full_text|document_full_text|sop_full_text)\s*:", stripped, re.IGNORECASE):
+            skipping_multiline_field = True
+            out.append("full_text: [omitted from RAG context]")
+            continue
+        if re.match(r'^"(?:full_text|editor_full_text|document_full_text|sop_full_text)"\s*:', stripped, re.IGNORECASE):
+            skipping_multiline_field = True
+            out.append('"full_text": "[omitted from RAG context]"')
+            continue
+        if skipping_multiline_field:
+            if (
+                not stripped
+                or re.match(r"^[A-Za-z0-9_ -]{2,60}\s*:", stripped)
+                or re.match(r'^"[A-Za-z0-9_ -]{2,60}"\s*:', stripped)
+                or low.startswith(("rag_hints", "planned_assistant_action", "selected_section", "active_sop"))
+            ):
+                skipping_multiline_field = False
+            else:
+                continue
+        if not skipping_multiline_field:
+            out.append(line)
+    return "\n".join(out).strip()
+
+
 def _strip_sources_footer_from_answer(text: str) -> str:
     """Remove trailing 'Sources:' / '📎 Sources:' blocks so UI + citations are single source."""
     s = (text or "").strip()
@@ -693,6 +724,7 @@ def _editor_context_documents_from_prompt(full_prompt: str) -> List[Document]:
     for end_marker in ("\n\nRAG_HINTS:", "\n\nPLANNED_ASSISTANT_ACTION:"):
         if end_marker in block:
             block = block.split(end_marker, 1)[0]
+    block = _sanitize_editor_context_for_rag(block)
     text = f"{marker}\n{block.strip()}"
     if len(text.strip()) < 24:
         return []
@@ -1454,6 +1486,7 @@ class SmartRAGChain:
         active_scope: dict | None = None,
     ) -> dict:
         t0 = time.time()
+        run_id = uuid.uuid4().hex[:12]
         query_for_routing = _strip_injected_context_blocks(query)
         full_ctx_query = (query or "").strip()
         scoped_sop_id = ""
@@ -1465,7 +1498,8 @@ class SmartRAGChain:
             self._clear_scope_cache_if_switched(scoped_sop_id)
         llm_cfg = get_local_llm_config()
         logger.info(
-            "[rag-invoke] provider=%s model=%s retrieval_query_preview=%s",
+            "[rag-invoke] run_id=%s provider=%s model=%s retrieval_query_preview=%s",
+            run_id,
             llm_cfg.provider,
             llm_cfg.model,
             _console_safe(_truncate_text(query_for_routing or query, 240)),
@@ -1531,8 +1565,31 @@ class SmartRAGChain:
             )
 
         routed_label = describe_route(target_sections)
+        pipeline_meta = {
+            "pipeline_version": "production_rag_v2",
+            "run_id": run_id,
+            "router": {
+                "routed_to": routed_label,
+                "target_sections": list(target_sections),
+                "forced_category": bool(forced_category),
+                "inventory_mode": sop_inventory_mode,
+                "metadata_filters": dict(metadata_filters or {}),
+                "editor_scoped": bool(editor_scoped),
+            },
+            "retrieval": {
+                "mode": "hybrid_dense_bm25_rerank",
+                "strict_inventory": bool(sop_inventory_mode),
+                "active_scope": bool(scoped_sop_id),
+            },
+            "generation": {
+                "provider": llm_cfg.provider,
+                "model": llm_cfg.model,
+                "base_url": llm_cfg.base_url,
+            },
+        }
         logger.info(
-            "[rag-routing] query='%s' sections=%s filters=%s",
+            "[rag-routing] run_id=%s query='%s' sections=%s filters=%s",
+            run_id,
             (query_for_routing or "")[:120],
             target_sections,
             metadata_filters,
@@ -1563,6 +1620,8 @@ class SmartRAGChain:
                     "total_docs": 0,
                     "latency_ms": round((time.time() - t0) * 1000, 1),
                     "strict_mode": True,
+                    "pipeline": pipeline_meta,
+                    "run_id": run_id,
                 }
                 return strict_resp
             strict_resp = _strict_sop_inventory_response(
@@ -1578,6 +1637,8 @@ class SmartRAGChain:
                 "total_docs": 0,
                 "latency_ms": round((time.time() - t0) * 1000, 1),
                 "strict_mode": True,
+                "pipeline": pipeline_meta,
+                "run_id": run_id,
             }
             return strict_resp
 
@@ -1701,6 +1762,8 @@ class SmartRAGChain:
                     "failure_stage": "no_retrieval",
                     "elapsed_ms": round((time.time() - t0) * 1000, 1),
                     "refusal_reason": "zero_chunks_after_filters",
+                    "pipeline": pipeline_meta,
+                    "run_id": run_id,
                 },
                 "routed_to": routed_label,
                 "refusal_reason": "zero_chunks_after_filters",
@@ -1721,6 +1784,8 @@ class SmartRAGChain:
                 "total_docs": len(all_docs),
                 "latency_ms": round((time.time() - t0) * 1000, 1),
                 "strict_mode": True,
+                "pipeline": pipeline_meta,
+                "run_id": run_id,
             }
             return strict_resp
 
@@ -1843,6 +1908,8 @@ class SmartRAGChain:
                     "llm_source": llm_source,
                     "failure_stage": stage,
                     "elapsed_ms": latency_ms,
+                    "pipeline": pipeline_meta,
+                    "run_id": run_id,
                 },
                 "routed_to": routed_label,
                 "cached": False,
@@ -1976,6 +2043,8 @@ class SmartRAGChain:
                 "llm_base_url": llm_cfg.base_url,
                 "llm_source":   llm_source,
                 "failure_stage": None,
+                "pipeline": pipeline_meta,
+                "run_id": run_id,
             },
             "routed_to":   routed_label,
             "cached":      False,

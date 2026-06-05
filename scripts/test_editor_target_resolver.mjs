@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { captureEditorSelectionForAction } from '../frontend/src/utils/editScopeInference.js'
-import { resolveTargetInEditor } from '../frontend/src/utils/editorTargetResolver.js'
+import { buildEditorSectionIndex, resolveTargetInEditor } from '../frontend/src/utils/editorTargetResolver.js'
 
 function makeNode(text, type = 'paragraph', attrs = {}) {
   return {
@@ -106,9 +106,9 @@ const headingSelectionEditor = {
   },
 }
 const capturedCapa = captureEditorSelectionForAction(headingSelectionEditor)
-assert.equal(capturedCapa.from, capaHeadingBlock.pos)
-assert.match(capturedCapa.selectedText, /CAPA-IT-011/)
-assert.match(capturedCapa.selectedText, /CAPA-IT-012/)
+assert.equal(capturedCapa.from, capaHeadingBlock.pos + 1)
+assert.equal(capturedCapa.selectedText, capaHeadingBlock.text)
+assert.doesNotMatch(capturedCapa.selectedText, /CAPA-IT-011/)
 assert.doesNotMatch(capturedCapa.selectedText, /DEC-IT-001/)
 
 const zweckHeadingBlock = doc._blocks.find((block) => block.text === '1. Zweck')
@@ -125,7 +125,7 @@ const zweckSelectionEditor = {
 }
 const capturedZweck = captureEditorSelectionForAction(zweckSelectionEditor)
 assert.match(capturedZweck.selectedText, /1\. Zweck/)
-assert.match(capturedZweck.selectedText, /Schutz des Produktionsnetzwerks/)
+assert.doesNotMatch(capturedZweck.selectedText, /Schutz des Produktionsnetzwerks/)
 
 const embeddedDoc = makeDoc([
   { text: 'SOP-IT-003 - Notfallzugriff (Break-Glass-Verfahren)' },
@@ -174,8 +174,9 @@ const selectedEmbeddedCapa = resolveTargetInEditor(selectedEmbeddedHeadingEditor
   selection: selectedEmbeddedHeadingEditor.state.selection,
   targetScope: 'selection',
 })
-assert.match(selectedEmbeddedCapa.text, /CAPA-IT-021/)
-assert.match(selectedEmbeddedCapa.text, /CAPA-IT-022/)
+assert.match(selectedEmbeddedCapa.text, /CAPAs/)
+assert.doesNotMatch(selectedEmbeddedCapa.text, /CAPA-IT-021/)
+assert.doesNotMatch(selectedEmbeddedCapa.text, /CAPA-IT-022/)
 assert.doesNotMatch(selectedEmbeddedCapa.text, /DEC-IT-001/)
 
 const enrichedSidebar = `rewrite the capas sections
@@ -189,8 +190,9 @@ const classifierSelectionScope = resolveTargetInEditor(selectedEmbeddedHeadingEd
   selection: selectedEmbeddedHeadingEditor.state.selection,
   targetScope: 'selection',
 })
-assert.match(classifierSelectionScope.text, /CAPA-IT-021/)
-assert.ok(classifierSelectionScope.text.length > '🟠 CAPAs (zugehörig zu SOP-IT-003)'.length + 40)
+assert.match(classifierSelectionScope.text, /CAPAs/)
+assert.doesNotMatch(classifierSelectionScope.text, /CAPA-IT-021/)
+assert.ok(classifierSelectionScope.text.length <= embeddedCapaMarker.text.length)
 
 const sop002CapaBlock = doc._blocks.find((block) => block.text.includes('CAPAs'))
 const sop002Editor = {
@@ -207,12 +209,112 @@ const sop002Editor = {
 const capaSectionPrompt = resolveTargetInEditor(sop002Editor, {
   prompt: 'rewrite the capa section',
   userPrompt: 'rewrite the capa section',
-  targetScope: 'selection',
+  targetScope: 'section',
 })
 assert.match(capaSectionPrompt.text, /CAPA-IT-011/)
 assert.match(capaSectionPrompt.text, /CAPA-IT-012/)
 assert.ok(capaSectionPrompt.text.length > 200)
 assert.ok(capaSectionPrompt.from < capaSectionPrompt.to)
+
+const englishDoc = makeDoc([
+  { text: 'SOP-QA-100 - Batch Release' },
+  { text: 'Purpose', type: 'heading', attrs: { level: 2 } },
+  { text: 'Define the controlled process for batch release and QA approval.' },
+  { text: 'Scope', type: 'heading', attrs: { level: 2 } },
+  { text: 'Applies to commercial batches released by Quality Assurance.' },
+  { text: '2.1 Responsibilities', type: 'heading', attrs: { level: 3 } },
+  { text: 'QA reviews the batch record and Manufacturing resolves open deviations.' },
+  { text: 'Procedure', type: 'heading', attrs: { level: 2 } },
+  { text: 'Review records, confirm acceptance criteria, and document the final decision.' },
+])
+const englishEditor = { isDestroyed: false, state: { doc: englishDoc } }
+
+const purposeBodyBlock = englishDoc._blocks.find((block) => block.text.includes('batch release'))
+const batchIndex = purposeBodyBlock.text.indexOf('batch')
+const wordSelectionEditor = {
+  isDestroyed: false,
+  state: {
+    doc: englishDoc,
+    selection: {
+      from: purposeBodyBlock.pos + 1 + batchIndex,
+      to: purposeBodyBlock.pos + 1 + batchIndex + 'batch'.length,
+      empty: false,
+    },
+  },
+}
+const selectedWord = resolveTargetInEditor(wordSelectionEditor, {
+  prompt: 'rewrite selected word',
+  userPrompt: 'rewrite selected word',
+  selection: wordSelectionEditor.state.selection,
+  targetScope: 'selection',
+})
+assert.equal(selectedWord.text, 'batch')
+assert.equal(selectedWord.sectionType, 'Word')
+
+const purpose = resolveTargetInEditor(englishEditor, {
+  prompt: 'rewrite the Purpose section',
+  userPrompt: 'rewrite the Purpose section',
+  targetScope: 'section',
+})
+assert.match(purpose.text, /Purpose/)
+assert.match(purpose.text, /batch release/)
+assert.doesNotMatch(purpose.text, /Applies to commercial/)
+assert.ok(purpose.confidence >= 0.58)
+
+const scopeSummary = resolveTargetInEditor(englishEditor, {
+  prompt: 'summarize the scope section',
+  userPrompt: 'summarize the scope section',
+  targetScope: 'section',
+})
+assert.match(scopeSummary.text, /Scope/)
+assert.match(scopeSummary.text, /commercial batches/)
+assert.doesNotMatch(scopeSummary.text, /QA reviews/)
+
+const numberedSubsection = resolveTargetInEditor(englishEditor, {
+  prompt: 'explain section 2.1',
+  userPrompt: 'explain section 2.1',
+  targetScope: 'section',
+})
+assert.match(numberedSubsection.text, /2\.1 Responsibilities/)
+assert.match(numberedSubsection.text, /Manufacturing resolves/)
+
+const followupSameSection = resolveTargetInEditor(englishEditor, {
+  prompt: 'make it shorter',
+  userPrompt: 'make it shorter',
+  sectionHint: 'Procedure',
+  targetScope: 'section',
+})
+assert.match(followupSameSection.text, /Procedure/)
+assert.match(followupSameSection.text, /acceptance criteria/)
+
+const sectionIndex = buildEditorSectionIndex(englishEditor)
+assert.ok(sectionIndex.some((section) => section.sectionName === 'Purpose'))
+assert.ok(sectionIndex.some((section) => section.sectionName === '2.1 Responsibilities'))
+
+const ambiguousDoc = makeDoc([
+  { text: 'Risk Assessment', type: 'heading', attrs: { level: 2 } },
+  { text: 'Risk assessment body.' },
+  { text: 'Risk Analysis', type: 'heading', attrs: { level: 2 } },
+  { text: 'Risk analysis body.' },
+])
+const ambiguousEditor = { isDestroyed: false, state: { doc: ambiguousDoc } }
+assert.throws(
+  () => resolveTargetInEditor(ambiguousEditor, {
+    prompt: 'rewrite the risk section',
+    userPrompt: 'rewrite the risk section',
+    targetScope: 'section',
+  }),
+  /multiple matching sections|exact heading/i,
+)
+
+assert.throws(
+  () => resolveTargetInEditor(englishEditor, {
+    prompt: 'rewrite the validation section',
+    userPrompt: 'rewrite the validation section',
+    targetScope: 'section',
+  }),
+  /could not find that section/i,
+)
 
 console.log(JSON.stringify({
   ok: true,
@@ -220,4 +322,7 @@ console.log(JSON.stringify({
   zweck: { sectionName: zweck.sectionName, chars: zweck.text.length },
   decisions: { sectionName: decisions.sectionName, chars: decisions.text.length },
   embeddedCapa: { sectionName: embeddedCapa.sectionName, chars: embeddedCapa.text.length },
+  purpose: { sectionName: purpose.sectionName, chars: purpose.text.length },
+  scopeSummary: { sectionName: scopeSummary.sectionName, chars: scopeSummary.text.length },
+  numberedSubsection: { sectionName: numberedSubsection.sectionName, chars: numberedSubsection.text.length },
 }, null, 2))

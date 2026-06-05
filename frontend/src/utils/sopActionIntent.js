@@ -35,7 +35,9 @@ const LABEL_STOPWORDS = new Set([
 ])
 
 export function wantsFullSopIntent(promptText = '') {
-  return FULL_SOP_INTENT_RE.test(String(promptText || '').trim())
+  const text = String(promptText || '').trim()
+  if (/\b(?:the\s+)?procedure\s+section\b|\bsection\s+procedure\b/i.test(text)) return false
+  return FULL_SOP_INTENT_RE.test(text)
 }
 
 const REGISTER_FIELD_LINE_RE =

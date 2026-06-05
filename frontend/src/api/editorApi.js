@@ -440,9 +440,10 @@ export async function performAIAction(payload) {
   // calling /api/ai/action directly avoids a wasted request and a bug where the abort
   // timer was cleared after the first fetch, leaving the follow-up with no time limit.
   const controller = new AbortController()
-  const timeoutMs = 120000
+  const timeoutMs = 140000
+  const rewriteTimeoutMs = 320000
   const normalizedAction = String(payload?.action || '').trim().toLowerCase().replace(/-/g, '_')
-  const requestTimeoutMs = normalizedAction === 'rewrite' ? 300000 : timeoutMs
+  const requestTimeoutMs = normalizedAction === 'rewrite' ? rewriteTimeoutMs : timeoutMs
   const actionTimer = setTimeout(() => controller.abort(), requestTimeoutMs)
 
   try {

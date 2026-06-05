@@ -66,7 +66,7 @@ from .services.sop_metadata_extractor import strip_invalid_control_chars
 from .services.semantic_jobs import schedule_semantic_reindex
 from .services.webhook_service import entities_for_link
 from .utils.tiptap_text import extract_plain_text_from_tiptap
-from .services.sop_profile_storage_service import analyze_and_store_sop_profile
+from .services.sop_profile_storage_service import analyze_and_store_sop_profile, cleanup_profile_for_deleted_sop
 from .client_profile_routes import save_profile_version_from_accepted_suggestion
 
 # ==========================================
@@ -787,16 +787,55 @@ def _metadata_debug_sources(structured: dict) -> dict:
     }
 
 
-def _build_extract_response(text: str, blocks: list, structured: dict) -> dict:
+def _blocks_to_elements(blocks: list) -> list:
+    elements = []
+    for block in blocks or []:
+        if not isinstance(block, dict):
+            continue
+        btype = str(block.get("type", "")).lower()
+        if btype in {"section_heading", "heading", "title"}:
+            text = str(block.get("text") or "").strip()
+            if text:
+                elements.append({"type": "text", "style": "heading", "content": text})
+        elif btype in {"paragraph", "line", "note"}:
+            text = str(block.get("text") or "").strip()
+            if text:
+                elements.append({"type": "text", "style": "paragraph", "content": text})
+        elif btype in {"two_column_row", "key_value"}:
+            left = str(block.get("left") or "").strip()
+            right = str(block.get("right") or "").strip()
+            text = f"{left}: {right}".strip(": ").strip()
+            if text:
+                elements.append({"type": "text", "style": "paragraph", "content": text})
+        elif btype in {"bullet_list", "numbered_list", "list", "ordered_list"}:
+            for item in block.get("items") or []:
+                text = str(item).strip()
+                if text:
+                    elements.append({"type": "text", "style": "paragraph", "content": text})
+        elif btype == "table":
+            rows = block.get("rows") or []
+            if rows:
+                elements.append({
+                    "type": "table",
+                    "content": rows,
+                    "header_rows": int(block.get("header_rows") or 0),
+                })
+    return elements
+
+
+def _build_extract_response(text: str, blocks: list, structured: dict, elements: list | None = None, scanned_pdf: bool = False) -> dict:
     from .services.document_structure import blocks_to_structured_document
     from .services.sop_metadata_extractor import to_frontend_sop_metadata
 
     sop_ui = to_frontend_sop_metadata(structured)
     public_meta = {k: v for k, v in structured.items() if not str(k).startswith("_")}
     structured_document = blocks_to_structured_document(blocks, public_meta)
+    resolved_elements = elements if elements is not None else _blocks_to_elements(blocks)
     response = {
         "text": (text or "").strip(),
         "blocks": blocks,
+        "elements": resolved_elements,
+        "scanned_pdf": bool(scanned_pdf),
         "structured_document": structured_document,
         "sop_metadata": public_meta,
         "sop_metadata_ui": sop_ui,
@@ -813,7 +852,7 @@ def _build_extract_response(text: str, blocks: list, structured: dict) -> dict:
     logger.info("[ocr-import] metadata sources: %s", response["metadata_sources"])
     logger.info(
         "[ocr-import] final response sent to frontend: %s",
-        {**response, "text": response["text"][:300], "blocks": f"{len(blocks)} blocks"},
+        {**response, "text": response["text"][:300], "blocks": f"{len(blocks)} blocks", "elements": f"{len(resolved_elements)} elements"},
     )
     return response
 
@@ -966,36 +1005,22 @@ def health():
 @router.post("/api/extract-text")
 async def extract_text_from_upload(file: UploadFile = File(...)):
     """
-    Extract plain text from a small text file or PDF (editor import / OCR path).
-    Includes structured SOP metadata inferred from content (rules + optional LLM fallback).
+    Extract text from an uploaded SOP file.
+    Returns legacy blocks plus reading-order elements for stronger PDF/OCR rendering.
     """
-    from .services.document_structure import enrich_metadata_text, refine_blocks, structure_blocks_from_text
-    from .services.pdf_extractor import extract_docx_bytes, extract_pdf_bytes_robust
+    from .services.document_structure import enrich_metadata_text, structure_blocks_from_text
+    from .services.sequential_import import extract_sequential_upload
     from .services.sop_metadata_extractor import extract_sop_metadata_from_text
 
     name = (file.filename or "").lower()
     try:
-        if name.endswith(".pdf"):
-            raw_pdf = await file.read()
-            blocks, text = extract_pdf_bytes_robust(raw_pdf)
-            text = strip_invalid_control_chars(text)
-            meta_text = enrich_metadata_text(text, blocks)
-            structured = extract_sop_metadata_from_text(meta_text, blocks)
-            return _build_extract_response(text, blocks, structured)
-        elif name.endswith(".docx"):
-            raw_docx = await file.read()
-            blocks, text = extract_docx_bytes(raw_docx)
-            text = strip_invalid_control_chars(text)
-            meta_text = enrich_metadata_text(text, blocks)
-            structured = extract_sop_metadata_from_text(meta_text, blocks)
-            return _build_extract_response(text, blocks, structured)
-        elif name.endswith((".txt", ".md", ".csv", ".json")):
+        if name.endswith((".pdf", ".docx", ".txt", ".md", ".csv", ".json")):
             raw = await file.read()
-            text = strip_invalid_control_chars(raw.decode("utf-8", errors="replace"))
-            blocks = structure_blocks_from_text(text)
+            elements, blocks, text, scanned_pdf = extract_sequential_upload(raw, name)
+            text = strip_invalid_control_chars(text)
             meta_text = enrich_metadata_text(text, blocks)
             structured = extract_sop_metadata_from_text(meta_text, blocks)
-            return _build_extract_response(text, blocks, structured)
+            return _build_extract_response(text, blocks, structured, elements=elements, scanned_pdf=scanned_pdf)
         else:
             # Best-effort UTF-8 for unknown extensions
             raw = await file.read()
@@ -1307,6 +1332,8 @@ def delete_document(
     if not sop:
         raise HTTPException(status_code=404, detail="Document not found")
 
+    profile_cleanup = cleanup_profile_for_deleted_sop(db, sop.id)
+
     # Collect directly linked entities before removing link rows.
     linked_deviation_ids = [
         row[0]
@@ -1412,7 +1439,7 @@ def delete_document(
     for decision_id in orphan_decision_ids:
         SemanticPipelineService.purge_entity_artifacts("decision", decision_id)
 
-    return {"status": "deleted", "id": doc_id}
+    return {"status": "deleted", "id": doc_id, "profile_cleanup": profile_cleanup}
 
 
 @router.get("/api/editor/docs/{doc_id}/versions", response_model=List[EditorVersionResponse])

@@ -66,17 +66,23 @@ def check_ocr_setup() -> Dict[str, Any]:
 
 
 def _run_ocr_on_page(file_bytes: bytes, page_num: int) -> str:
+    lines = _run_ocr_lines_on_page(file_bytes, page_num)
+    return "\n".join(lines)
+
+
+def _run_ocr_lines_on_page(file_bytes: bytes, page_num: int) -> List[str]:
+    """OCR with line grouping so scanned SOPs keep useful section/list breaks."""
     if not HAS_OCR_DEPS:
         logger.warning("OCR dependencies are not installed; scanned PDF page skipped.")
-        return ""
+        return []
 
     setup = check_ocr_setup()
     if not setup["tesseract_binary"]:
         logger.error("Tesseract binary not found at %s; OCR skipped.", setup["tesseract_path"])
-        return ""
+        return []
     if not setup["poppler_binaries"]:
         logger.error("Poppler binaries not found; OCR skipped.")
-        return ""
+        return []
 
     try:
         images = convert_from_bytes(
@@ -86,11 +92,36 @@ def _run_ocr_on_page(file_bytes: bytes, page_num: int) -> str:
             poppler_path=POPPLER_PATH,
         )
         if not images:
-            return ""
-        return pytesseract.image_to_string(images[0]) or ""
+            return []
+        config = "--psm 6 -c preserve_interword_spaces=1"
+        data = pytesseract.image_to_data(images[0], config=config, output_type=pytesseract.Output.DICT)
+        line_map: Dict[tuple[int, int], List[str]] = {}
+        for i, txt in enumerate(data.get("text") or []):
+            word = (txt or "").strip()
+            if not word:
+                continue
+            try:
+                conf = int(float(data.get("conf", [])[i]))
+            except Exception:
+                conf = -1
+            if 0 <= conf < 35:
+                continue
+            key = (int(data.get("block_num", [0])[i]), int(data.get("line_num", [0])[i]))
+            line_map.setdefault(key, []).append(word)
+
+        lines: List[str] = []
+        for key in sorted(line_map.keys()):
+            merged = _clean_line(" ".join(line_map[key]))
+            if merged:
+                lines.append(merged)
+        if lines:
+            return lines
+
+        fallback = pytesseract.image_to_string(images[0], config=config) or ""
+        return [_clean_line(ln) for ln in fallback.splitlines() if _clean_line(ln)]
     except Exception as exc:
         logger.exception("OCR failed for page %s: %s", page_num, exc)
-        return ""
+        return []
 
 
 def extract_traceable_text(file_path_or_obj) -> List[Dict[str, Any]]:
@@ -147,11 +178,11 @@ def _read_pdf_source_bytes(file_path_or_obj) -> bytes | None:
 def _is_likely_heading(text: str) -> bool:
     if len(text) > 100:
         return False
+    if re.match(r"^\d+[\)\.]\s+", text):
+        return _is_numbered_section_heading(text)
     if re.match(r"^(\d+\.)+\s+[A-ZÄÖÜ]", text):
         return True
     if text.isupper() and len(text.split()) < 6:
-        return True
-    if re.match(r"^\d+\.\s+[A-ZÄÖÜ]", text):
         return True
     keywords = ["PURPOSE", "SCOPE", "RESPONSIBILITIES", "PROCEDURE", "REFERENCES", "HISTORY", "APPROVAL"]
     return any(k in text.upper() for k in keywords) and len(text.split()) < 4
@@ -166,8 +197,30 @@ def sanitize_extracted_text(text: str) -> str:
     return strip_invalid_control_chars(text or "")
 
 
+def _is_numbered_section_heading(line: str) -> bool:
+    """Single-number lines like '1. Purpose' / '2. Zweck' (not procedural steps)."""
+    m = re.match(r"^(\d+(?:\.\d+)*)\.\s+(.+)$", line.strip())
+    if not m:
+        return False
+    title = m.group(2).strip()
+    words = title.split()
+    if len(title) > 72 or len(words) > 7:
+        return False
+    upper = title.upper()
+    section_keywords = (
+        "PURPOSE", "SCOPE", "RESPONSIBILITIES", "PROCEDURE", "REFERENCES",
+        "DEFINITIONS", "APPROVAL", "HISTORY", "ZWECK", "GELTUNG", "VERFAHREN",
+        "DOKUMENTATION", "ANHANG", "CAPA", "DEVIATION", "AUDIT", "DECISION",
+    )
+    if any(k in upper for k in section_keywords):
+        return True
+    return title.isupper() and len(words) <= 5
+
+
 def _is_numbered_heading(line: str) -> bool:
-    return bool(re.match(r"^\d+(?:\.\d+)*[\)\.]?\s+[A-ZÄÖÜ]", line))
+    if re.match(r"^\d+\.\d+", line):
+        return bool(re.match(r"^\d+(?:\.\d+)+[\)\.]?\s+\S+", line))
+    return _is_numbered_section_heading(line)
 
 
 def _is_bullet_item(line: str) -> bool:
@@ -175,7 +228,9 @@ def _is_bullet_item(line: str) -> bool:
 
 
 def _is_numbered_item(line: str) -> bool:
-    return bool(re.match(r"^\d+[\)\.]\s+.+", line))
+    if not re.match(r"^\d+[\)\.]\s+.+", line):
+        return False
+    return not _is_numbered_section_heading(line)
 
 
 def _is_key_value_line(line: str) -> bool:
@@ -221,6 +276,26 @@ def _pypdf_full_text(pdf_bytes: bytes) -> str:
         return sanitize_extracted_text("\n\n".join(chunks).strip())
     except Exception:
         return ""
+
+
+def _pdf_has_native_text_layer(pdf_bytes: bytes, min_chars: int = 40) -> bool:
+    """Probe first pages for selectable text so scanned PDFs can route to OCR."""
+    if PdfReader is None:
+        return False
+    try:
+        reader = PdfReader(BytesIO(pdf_bytes))
+        total = 0
+        for page in reader.pages[: min(3, len(reader.pages))]:
+            total += len((page.extract_text() or "").strip())
+            if total >= min_chars:
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _pdf_is_scanned(pdf_bytes: bytes) -> bool:
+    return not _pdf_has_native_text_layer(pdf_bytes)
 
 
 def extract_pdf_bytes_robust(pdf_bytes: bytes) -> Tuple[List[Dict[str, Any]], str]:

@@ -8,16 +8,22 @@ export const SOP_IMPORT_ACCEPT = '.pdf,.docx,.txt,.md'
 
 export async function extractSOPImport(file) {
   const response = await extractText(file)
+  const elements = Array.isArray(response?.elements) && response.elements.length
+    ? response.elements
+    : null
   const blocks = Array.isArray(response?.blocks) ? response.blocks : []
+  const contentSource = elements ?? blocks
   const text = response?.text || ''
   const metadata = normalizeSOPImportMetadata(response?.sop_metadata_ui)
 
   return {
     response,
-    blocks,
+    blocks: contentSource,
+    elements: elements ?? [],
+    rawBlocks: blocks,
     text,
     metadata,
-    hasContent: Boolean(text.trim() || blocks.length),
+    hasContent: Boolean(text.trim() || contentSource.length),
   }
 }
 

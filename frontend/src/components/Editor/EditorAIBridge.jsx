@@ -18,7 +18,7 @@ import {
   clearInlineAiSuggestion,
   setInlineAiSuggestion,
 } from '../../utils/editorInlineSuggestionPlugin'
-import { resolveTargetInEditor } from '../../utils/editorTargetResolver'
+import { buildEditorSectionIndex, collectSectionRanges, resolveTargetInEditor } from '../../utils/editorTargetResolver'
 import {
   AI_ACTION_TRIGGERED_BY,
   EDITOR_AI_ACTIONS,
@@ -495,6 +495,7 @@ const EditorAIBridge = ({
           requestId,
           ok: true,
           target,
+          sectionIndex: collectSectionRanges(state.doc),
           fullText: state.doc.textBetween(0, state.doc.content.size, '\n'),
           docSize: state.doc.content.size,
           selection: selectionPayload,
@@ -506,6 +507,12 @@ const EditorAIBridge = ({
           requestId,
           ok: false,
           error: err?.message || 'Could not resolve target in editor.',
+          code: err?.code || 'target_resolution_error',
+          candidates: Array.isArray(err?.candidates)
+            ? err.candidates
+            : buildEditorSectionIndex(liveEditor).slice(0, 8),
+          targetPhrase: err?.targetPhrase || '',
+          confidence: err?.confidence ?? null,
         })
       }
     })

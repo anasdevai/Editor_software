@@ -68,6 +68,8 @@ distro==1.9.0
     # via openai
 dnspython==2.8.0
     # via email-validator
+docling==2.97.0
+    # via cybrain-qs
 ecdsa==0.19.2
     # via python-jose
 email-validator==2.3.0
@@ -300,6 +302,8 @@ propcache==0.4.1
 protobuf==7.34.1
     # via qdrant-client
 psycopg2-binary==2.9.12
+    # via cybrain-qs
+pymupdf==1.27.2
     # via cybrain-qs
 pyasn1==0.6.3
     # via
