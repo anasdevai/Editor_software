@@ -5188,6 +5188,31 @@ def _finalize_target_response(
     return result
 
 
+def _score_candidate(query: str, label: str, text: str = "", owning_section: str = "") -> float:
+    q_norm = _normalize_target_text(query)
+    lbl_norm = _normalize_target_text(label)
+    if not q_norm:
+        return 0.0
+
+    # Direct substring matches
+    if lbl_norm and (lbl_norm in q_norm or q_norm in lbl_norm):
+        return 0.9
+
+    # Owning section matches
+    own_norm = _normalize_target_text(owning_section)
+    if own_norm and (own_norm in q_norm or q_norm in own_norm):
+        return 0.8
+
+    # Token overlap score
+    q_tokens = set(q_norm.split())
+    candidate_words = lbl_norm.split() + own_norm.split() + _normalize_target_text(text).split()
+    cand_tokens = set(w for w in candidate_words if len(w) >= 3)
+    if not q_tokens or not cand_tokens:
+        return 0.0
+    hits = len(q_tokens.intersection(cand_tokens))
+    return hits / max(len(q_tokens), len(cand_tokens))
+
+
 @ai_router.post("/api/ai/analyze-sop-target")
 async def analyze_sop_target(payload: dict):
     user_query = str(payload.get("user_query") or payload.get("message") or "").strip()
@@ -5208,10 +5233,42 @@ async def analyze_sop_target(payload: dict):
     paragraphs = _compact_target_items(payload.get("paragraph_index"), 160)
     document_tree = _compact_target_items(payload.get("document_tree"), 220)
 
+    # Dynamic relevance filtering to prevent context overload and random LLM target selections
+    scored_sections = [
+        (s, _score_candidate(user_query, s.get("label", ""), s.get("text_excerpt", "")))
+        for s in sections
+    ]
+    filtered_sections = [s for s, score in sorted(scored_sections, key=lambda x: x[1], reverse=True) if score > 0.15]
+    if not filtered_sections:
+        filtered_sections = sections[:8]
+    else:
+        filtered_sections = filtered_sections[:15]
+
+    scored_tables = [
+        (t, _score_candidate(user_query, t.get("label", ""), t.get("text_excerpt", ""), t.get("owning_section", "")))
+        for t in tables
+    ]
+    filtered_tables = [t for t, score in sorted(scored_tables, key=lambda x: x[1], reverse=True) if score > 0.15]
+    if not filtered_tables:
+        filtered_tables = tables[:6]
+    else:
+        filtered_tables = filtered_tables[:10]
+
+    scored_paras = [
+        (p, _score_candidate(user_query, p.get("label", ""), p.get("text_excerpt", ""), p.get("owning_section", "")))
+        for p in paragraphs
+    ]
+    filtered_paras = [p for p, score in sorted(scored_paras, key=lambda x: x[1], reverse=True) if score > 0.18]
+    filtered_paras = filtered_paras[:8]
+
+    allowed_ids = {item.get("id") for item in filtered_sections + filtered_tables + filtered_paras}
+    allowed_ids.add("doc_root")
+    filtered_tree = [node for node in document_tree if node.get("id") in allowed_ids]
+
     deterministic = _deterministic_target_analysis(
         user_query=user_query,
-        sections=sections,
-        tables=tables,
+        sections=filtered_sections,
+        tables=filtered_tables,
         selection=selection,
         active_scope=active_scope,
     )
@@ -5222,7 +5279,7 @@ async def analyze_sop_target(payload: dict):
             "source": "fallback",
         }
     else:
-        generic_candidates = _candidate_pool_for_prompt(user_query, sections, tables, paragraphs)
+        generic_candidates = _candidate_pool_for_prompt(user_query, filtered_sections, filtered_tables, filtered_paras)
         fallback = {
             "target_type": "full_document" if re.search(r"\b(full|whole|entire|complete)\s+(sop|document|doc)\b", user_query, re.I) else "section",
             "target_id": "doc_root" if re.search(r"\b(full|whole|entire|complete)\s+(sop|document|doc)\b", user_query, re.I) else None,
@@ -5241,10 +5298,10 @@ async def analyze_sop_target(payload: dict):
                 resolve_sop_target_with_deep_agent,
                 user_query=user_query,
                 action=action,
-                sections=sections,
-                tables=tables,
-                paragraphs=paragraphs,
-                document_tree=document_tree,
+                sections=filtered_sections,
+                tables=filtered_tables,
+                paragraphs=filtered_paras,
+                document_tree=filtered_tree,
                 selection=selection,
                 active_scope=active_scope,
                 sop_metadata=sop_metadata,
@@ -5285,12 +5342,11 @@ async def analyze_sop_target(payload: dict):
         "sop_metadata": sop_metadata,
         "selection": selection,
         "active_scope": active_scope,
-        "section_index": sections,
-        "table_index": tables,
-        "paragraph_index": paragraphs,
-        "document_tree": document_tree,
+        "section_index": filtered_sections,
+        "table_index": filtered_tables,
+        "paragraph_index": filtered_paras,
+        "document_tree": filtered_tree,
         "document_schema": document_schema,
-        "document_excerpt": document_excerpt,
         "full_text": full_text,
         "rules": [
             "Choose target_id from section_index, table_index, paragraph_index, or document_tree whenever possible.",
