@@ -7,6 +7,7 @@ Keep this module so existing imports (`app.ai_routes`) continue to work.
 
 from chatbot.routes.ai_routes import *  # noqa: F401,F403
 from html import escape
+import json
 import re
 import os
 import math
@@ -15,6 +16,7 @@ import threading
 import asyncio
 import uuid
 import logging
+import unicodedata
 from typing import Any
 from datetime import datetime
 
@@ -85,12 +87,25 @@ from .services.sop_version_metadata_compact import (
     log_metadata_load,
     log_metadata_merge,
 )
+from .services.agent_orchestrator import (
+    DeepAgentExecutionError,
+    compare_sops as consultant_compare_sops,
+    create_sop_draft as consultant_create_sop_draft,
+    generate_sop_preview as consultant_generate_sop_preview,
+    learn_template as consultant_learn_template,
+    run_sidebar_deep_agent,
+)
+from .services.target_resolver_agent import (
+    TargetResolverAgentError,
+    resolve_sop_target_with_deep_agent,
+)
 try:
     from openai import BadRequestError
 except Exception:  # pragma: no cover
     BadRequestError = Exception  # type: ignore[misc,assignment]
 from chatbot.llm.provider import (
     check_local_llm_api_health,
+    create_chat_llm,
     get_chat_pipeline_timeout_seconds,
     get_local_llm_config,
     get_local_llm_timeout_seconds,
@@ -117,6 +132,8 @@ CHATBOT_USE_LOCAL_DB = os.getenv("CHATBOT_USE_LOCAL_DB", "false").strip().lower(
 CHATBOT_ALLOW_LOCAL_DB_PRIMARY = os.getenv("CHATBOT_ALLOW_LOCAL_DB_PRIMARY", "false").strip().lower() == "true"
 logger = logging.getLogger(__name__)
 ACTION_INTENT_CREATE = re.compile(r"\b(create|new|generate|draft)\b.*\b(sop)\b", re.IGNORECASE)
+TARGET_DEEP_AGENT_TIMEOUT_SECONDS = float(os.getenv("TARGET_DEEP_AGENT_TIMEOUT_SECONDS", "12"))
+TARGET_LLM_FALLBACK_TIMEOUT_SECONDS = float(os.getenv("TARGET_LLM_FALLBACK_TIMEOUT_SECONDS", "12"))
 ACTION_INTENT_DELETE = re.compile(r"\b(delete|remove)\b.*\b(sop|this sop|current sop)\b", re.IGNORECASE)
 ACTION_INTENT_UPDATE = re.compile(
     r"\b(update|edit|modify|revise)\b.*\b(sop|this sop|current sop)\b|"
@@ -2796,6 +2813,24 @@ def _run_dynamic_ai_action(payload: AIActionRequest, action: str) -> AIActionRes
         if explicit_style_override
         else None,
         "used_target_sop_version": sop_ctx.get("version_number"),
+        "profile_md_used": bool((profile_md or "").strip()),
+        "profile_md_chars": len(profile_md or ""),
+        "profile_parameter_keys": sorted(profile_json.keys()) if isinstance(profile_json, dict) else [],
+        "profile_parameters_used": {
+            "preferred_style": (profile_json or {}).get("preferred_style") if isinstance(profile_json, dict) else None,
+            "terminology": (profile_json or {}).get("terminology") if isinstance(profile_json, dict) else None,
+            "modal_language": (profile_json or {}).get("modal_language") if isinstance(profile_json, dict) else None,
+            "rewrite_rules": (profile_json or {}).get("rewrite_rules") if isinstance(profile_json, dict) else None,
+            "structure_patterns": (profile_json or {}).get("structure_patterns") if isinstance(profile_json, dict) else None,
+            "workflow_patterns": (profile_json or {}).get("workflow_patterns") if isinstance(profile_json, dict) else None,
+        },
+        "cross_profile_style_only": bool(explicit_style_override),
+        "content_source": "current_open_sop_target_text",
+        "style_source": "explicit_profile_md" if explicit_style_override else "active_sop_profile_md",
+        "profile_fact_import_guard": (
+            "Profile/profile.md supplies style, terminology, modal verbs, structure and rewrite rules only. "
+            "Facts, IDs, dates, controls, roles, standards and requirements stay from the open SOP target text."
+        ),
     }
 
     bypass = _try_client_structured_ai_response(payload, action, request, style_profile)
@@ -4308,6 +4343,338 @@ def _execute_sop_action(
     return None
 
 
+def _consultant_workflow_kind(question: str) -> str | None:
+    q = (question or "").lower()
+    has_sop = bool(re.search(r"\bsops?\b|standard operating procedure", q))
+    if re.search(r"\b(compare|comparison|differences?|similarities?|gegenuberstellen|vergleichen)\b", q) and has_sop:
+        return "compare_sops"
+    if re.search(r"\b(learn|extract|build|create|save)\b[\s\S]{0,80}\b(template|client style|client profile|style template)\b", q) and has_sop:
+        return "learn_template"
+    if re.search(r"\b(generate|draft|create|new)\b[\s\S]{0,80}\bsop\b", q) and re.search(r"\b(from|based on|using|learned|template|these|multiple)\b", q):
+        return "generate_sop_preview"
+    if re.search(r"\b(create|save)\b[\s\S]{0,60}\b(draft|preview)\b", q):
+        return "create_sop_draft"
+    return None
+
+
+def _consultant_title_from_question(question: str) -> str:
+    q = (question or "").strip()
+    quoted = re.search(r'["\']([^"\']{3,140})["\']', q)
+    if quoted:
+        return quoted.group(1).strip()
+    titled = re.search(r"\b(?:title|named|called|for)\s*[:\-]?\s*([A-Za-z0-9 _/\-]{4,140})", q, re.IGNORECASE)
+    if titled:
+        value = re.sub(r"\b(from|using|based on|with)\b[\s\S]*$", "", titled.group(1), flags=re.IGNORECASE).strip(" .:-")
+        if value:
+            return value[:140]
+    return _title_from_question(question)
+
+
+def _consultant_source_sop_ids(question: str, assistant_context: dict | None) -> list[str]:
+    ctx = assistant_context or {}
+    found: list[str] = []
+    db = SessionLocal()
+    try:
+        for ref in SOP_REF_PATTERN.findall(question or ""):
+            sop = db.query(SOP).filter(SOP.sop_number.ilike(ref), SOP.is_active == True).first()  # noqa: E712
+            if sop and str(sop.id) not in found:
+                found.append(str(sop.id))
+
+        if len(found) < 2:
+            for row in _ctx_list(ctx.get("opened_tabs")):
+                if not isinstance(row, dict):
+                    continue
+                raw_id = str(row.get("id") or row.get("doc_id") or row.get("sop_id") or "").strip()
+                if not raw_id:
+                    continue
+                try:
+                    sop = db.query(SOP).filter(SOP.id == uuid.UUID(raw_id), SOP.is_active == True).first()  # noqa: E712
+                except Exception:
+                    sop = None
+                if sop and str(sop.id) not in found:
+                    found.append(str(sop.id))
+
+        current = ctx.get("current_sop") if isinstance(ctx.get("current_sop"), dict) else {}
+        active_id = str(ctx.get("active_sop_id") or ctx.get("current_document_id") or current.get("id") or "").strip()
+        if active_id:
+            try:
+                sop = db.query(SOP).filter(SOP.id == uuid.UUID(active_id), SOP.is_active == True).first()  # noqa: E712
+            except Exception:
+                sop = None
+            if sop and str(sop.id) not in found:
+                found.append(str(sop.id))
+    finally:
+        db.close()
+    return found
+
+
+def _consultant_sources_from_trace(traceability: list[dict[str, Any]]) -> list[dict[str, str]]:
+    sources = []
+    seen = set()
+    for item in traceability or []:
+        refs = item.get("source_refs") if isinstance(item, dict) and isinstance(item.get("source_refs"), list) else [item]
+        for ref in refs:
+            if not isinstance(ref, dict):
+                continue
+            sid = str(ref.get("source_sop_id") or ref.get("sop_id") or ref.get("source_sop_number") or ref.get("sop_number") or "")
+            label = str(ref.get("source_sop_number") or ref.get("sop_number") or ref.get("title") or "Source SOP")
+            if sid and sid not in seen:
+                seen.add(sid)
+                sources.append({"id": sid, "type": "sop", "label": label})
+    return sources
+
+
+def _consultant_citations_from_trace(traceability: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    citations = []
+    for item in traceability or []:
+        label = str(item.get("source_sop_number") or item.get("sop_number") or item.get("title") or "Source SOP")
+        if item.get("generated_section"):
+            excerpt = "Generated section: " + str(item.get("generated_section"))
+            if item.get("source_sops"):
+                label = ", ".join(str(x) for x in (item.get("source_sops") or [])[:4]) or label
+        else:
+            excerpt = ", ".join(str(h) for h in (item.get("sample_sections") or item.get("headings") or [])[:5])
+        citations.append({
+            "ref": label,
+            "title": str(item.get("title") or label),
+            "type": "sop",
+            "excerpt": excerpt or "Source SOP profile and headings used.",
+            "score": 1.0,
+        })
+    return citations
+
+
+def _consultant_chat_response(question: str, assistant_context: dict | None, surface: str, assistant_mode: str) -> dict[str, Any] | None:
+    kind = _consultant_workflow_kind(question)
+    if not kind:
+        return None
+    source_sop_ids = _consultant_source_sop_ids(question, assistant_context)
+    if kind != "create_sop_draft" and len(source_sop_ids) < 2:
+        return {
+            "answer": "I need at least two source SOPs for this consultant workflow. Mention the SOP numbers in the sidebar chat, for example: compare SOP-IT-001 and SOP-IT-002.",
+            "sources": [],
+            "citations": [],
+            "retrieval_debug": [],
+            "suggestions": ["Compare SOP-IT-001 and SOP-IT-002", "Learn a template from SOP-IT-001, SOP-IT-002, SOP-IT-003"],
+            "retrieval_stats": {
+                "total_docs": 0,
+                "source": "consultant_workflow_guard",
+                "surface": surface,
+                "assistant_mode": assistant_mode,
+                "strict_mode": "needs_two_source_sops",
+            },
+            "routed_to": "consultant_workflow_guard",
+            "assistant_action": {"type": kind, "ok": False, "reason": "needs_two_source_sops"},
+        }
+
+    db = SessionLocal()
+    try:
+        if kind == "create_sop_draft":
+            ctx = assistant_context or {}
+            preview = (
+                ctx.get("approved_generation_preview")
+                or ctx.get("generation_preview")
+                or ctx.get("last_generation_preview")
+                or ctx.get("preview")
+            )
+            if not isinstance(preview, dict):
+                return {
+                    "answer": "I can create the draft only after an approved generation preview is provided in the sidebar context.",
+                    "sources": [],
+                    "citations": [],
+                    "retrieval_debug": [],
+                    "suggestions": ["Generate a new SOP preview first", "Approve the preview, then ask to create the draft"],
+                    "retrieval_stats": {
+                        "total_docs": 0,
+                        "source": "consultant_orchestrator",
+                        "surface": surface,
+                        "assistant_mode": assistant_mode,
+                        "strict_mode": "create_draft_requires_preview",
+                    },
+                    "routed_to": "consultant_create_sop_draft",
+                    "assistant_action": {"type": kind, "ok": False, "requires_confirmation": True, "reason": "missing_approved_preview"},
+                }
+            target = preview.get("target") if isinstance(preview.get("target"), dict) else {}
+            result = consultant_create_sop_draft(
+                db,
+                preview=preview,
+                title=_consultant_title_from_question(question) or target.get("title") or "Generated SOP",
+                department=target.get("department") or "Quality",
+                client_name=str((preview.get("learned_profile") or {}).get("client_name") or "Client"),
+            )
+            db.commit()
+            answer = (
+                "Generated SOP draft created.\n"
+                f"- SOP: {result.get('sop_number')}\n"
+                f"- Version ID: {result.get('version_id')}\n"
+                f"- Profile generated: {result.get('profile_generated')}\n"
+                f"- RAG indexing scheduled: {result.get('rag_indexed')}\n"
+                f"- Tables: {result.get('table_count')}"
+            )
+            return {
+                "answer": answer,
+                "sources": _consultant_sources_from_trace(preview.get("source_traceability") or []),
+                "citations": _consultant_citations_from_trace(preview.get("source_traceability") or []),
+                "retrieval_debug": [],
+                "suggestions": ["Open the generated SOP draft", "Run a gap check on the generated draft"],
+                "retrieval_stats": {
+                    "total_docs": result.get("source_traceability_count") or 0,
+                    "source": "consultant_orchestrator",
+                    "surface": surface,
+                    "assistant_mode": assistant_mode,
+                    "strict_mode": "created_generation_draft",
+                    "sop_id": result.get("sop_id"),
+                    "version_id": result.get("version_id"),
+                    "table_count": result.get("table_count"),
+                },
+                "routed_to": "consultant_create_sop_draft",
+                "assistant_action": {"type": kind, "ok": True, "result": result},
+            }
+
+        if kind == "compare_sops":
+            result = consultant_compare_sops(db, source_sop_ids, query=question)
+            trace = result.get("source_traceability") or []
+            answer = (
+                "Cross-SOP comparison completed.\n"
+                f"- Sources compared: {result.get('source_count', len(source_sop_ids))}\n"
+                f"- Common headings: {', '.join(result.get('common_headings') or []) or 'None detected'}\n"
+                f"- Different/unique headings: {', '.join((result.get('different_or_unique_headings') or [])[:10]) or 'None detected'}\n"
+                f"- Shared terms: {', '.join((result.get('shared_terms') or [])[:10]) or 'None detected'}\n"
+                f"- Shared standards: {', '.join((result.get('shared_standards') or [])[:8]) or 'None detected'}"
+            )
+            return {
+                "answer": answer,
+                "sources": _consultant_sources_from_trace(trace),
+                "citations": _consultant_citations_from_trace(trace),
+                "retrieval_debug": result.get("rag_evidence", {}).get("chunks", []),
+                "suggestions": ["Learn a reusable template from these SOPs", "Generate a new SOP preview from these SOPs"],
+                "retrieval_stats": {
+                    "total_docs": len(trace),
+                    "source": "consultant_orchestrator",
+                    "surface": surface,
+                    "assistant_mode": assistant_mode,
+                    "strict_mode": "cross_sop_comparison",
+                    "answer_basis": "profiles_headings_and_relevant_chunks",
+                },
+                "routed_to": "consultant_compare_sops",
+                "assistant_action": {"type": kind, "ok": True, "result": result},
+            }
+
+        if kind == "learn_template":
+            result = consultant_learn_template(
+                db,
+                source_sop_ids,
+                client_name="Client",
+                template_name=_consultant_title_from_question(question),
+                persist=True,
+            )
+            db.commit()
+            trace = result.get("source_traceability") or []
+            profile = result.get("learned_profile") or {}
+            answer = (
+                "Reusable SOP template learned and stored in the backend.\n"
+                f"- Template ID: {result.get('template_id')}\n"
+                f"- Sources learned: {len(trace)}\n"
+                f"- Common structure: {', '.join(str(x.get('heading')) for x in (result.get('template_outline') or [])[:8] if isinstance(x, dict)) or 'None detected'}\n"
+                f"- Terminology: {', '.join((profile.get('terminology') or [])[:10]) or 'None detected'}\n"
+                f"- Compliance standards: {', '.join((profile.get('compliance_standards') or [])[:8]) or 'None detected'}"
+            )
+            return {
+                "answer": answer,
+                "sources": _consultant_sources_from_trace(trace),
+                "citations": _consultant_citations_from_trace(trace),
+                "retrieval_debug": (result.get("comparison_summary") or {}).get("rag_evidence", {}).get("chunks", []),
+                "suggestions": ["Generate a new SOP preview from this learned template", "Compare these SOPs for missing sections"],
+                "retrieval_stats": {
+                    "total_docs": len(trace),
+                    "source": "consultant_orchestrator",
+                    "surface": surface,
+                    "assistant_mode": assistant_mode,
+                    "strict_mode": "template_learning",
+                    "template_id": result.get("template_id"),
+                },
+                "routed_to": "consultant_learn_template",
+                "assistant_action": {"type": kind, "ok": True, "template_id": result.get("template_id"), "result": result},
+            }
+
+        if kind == "generate_sop_preview":
+            title = _consultant_title_from_question(question)
+            result = consultant_generate_sop_preview(
+                db,
+                source_sop_ids=source_sop_ids,
+                target_title=title,
+                target_department="Quality",
+                target_sop_type="Generated SOP",
+                language="de" if re.search(r"\b(german|deutsch|de)\b", question, re.IGNORECASE) else "en",
+                requirements=question,
+                client_name="Client",
+            )
+            db.commit()
+            trace = result.get("source_traceability") or []
+            preview = str(result.get("generated_text") or "").strip()
+            answer = (
+                "Generated SOP preview prepared. I have not saved it as a draft yet.\n"
+                f"- Preview ID: {result.get('preview_id')}\n"
+                f"- Template ID: {result.get('template_id')}\n"
+                f"- Target title: {title}\n"
+                f"- Generation engine: {result.get('generation_engine')}\n"
+                f"- Tables: {result.get('table_count', 0)}\n"
+                f"- Source traceability rows: {len(trace)}\n\n"
+                f"{preview[:3500]}"
+            )
+            warnings = result.get("warnings") or []
+            if warnings:
+                answer += "\n\nWarnings:\n" + "\n".join(f"- {w}" for w in warnings)
+            return {
+                "answer": answer,
+                "sources": _consultant_sources_from_trace(result.get("source_traceability") or []),
+                "citations": _consultant_citations_from_trace(result.get("source_traceability") or []),
+                "retrieval_debug": (result.get("rag_evidence") or {}).get("chunks", []),
+                "suggestions": ["Create the generated SOP draft after approval", "Run compliance review on this generated preview"],
+                "retrieval_stats": {
+                    "total_docs": len(source_sop_ids),
+                    "source": "consultant_orchestrator",
+                    "surface": surface,
+                    "assistant_mode": assistant_mode,
+                    "strict_mode": "generation_preview_only",
+                    "template_id": result.get("template_id"),
+                    "preview_id": result.get("preview_id"),
+                    "generation_engine": result.get("generation_engine"),
+                    "fallback_reason": result.get("fallback_reason"),
+                    "table_count": result.get("table_count"),
+                    "warnings": warnings,
+                },
+                "routed_to": "consultant_generate_sop_preview",
+                "assistant_action": {
+                    "type": kind,
+                    "ok": True,
+                    "requires_confirmation": True,
+                    "preview": result,
+                    "message": "Preview only. Use /api/agents/create-sop-draft after approval to save it.",
+                },
+            }
+    except ValueError as exc:
+        db.rollback()
+        return {
+            "answer": str(exc),
+            "sources": [],
+            "citations": [],
+            "retrieval_debug": [],
+            "suggestions": [],
+            "retrieval_stats": {
+                "total_docs": 0,
+                "source": "consultant_orchestrator_error",
+                "surface": surface,
+                "assistant_mode": assistant_mode,
+            },
+            "routed_to": "consultant_workflow_error",
+            "assistant_action": {"type": kind, "ok": False, "error": str(exc)},
+        }
+    finally:
+        db.close()
+    return None
+
+
 @ai_router.post("/api/ai/action", response_model=AIActionResponse)
 async def perform_ai_action(payload: AIActionRequest):
     """
@@ -4535,6 +4902,496 @@ async def update_ai_suggestion_status(suggestion_id: uuid.UUID, payload: dict):
         db.close()
 
 
+def _extract_json_object_from_text(raw: object) -> dict[str, Any]:
+    text = str(raw or "").strip()
+    if not text:
+        return {}
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text, flags=re.IGNORECASE | re.MULTILINE).strip()
+    try:
+        parsed = json.loads(text)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start >= 0 and end > start:
+        candidate = re.sub(r",\s*([}\]])", r"\1", text[start : end + 1])
+        try:
+            parsed = json.loads(candidate)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _compact_target_items(items: object, limit: int = 80) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        return []
+    out: list[dict[str, Any]] = []
+    for item in items[:limit]:
+        if not isinstance(item, dict):
+            continue
+        out.append({
+            "id": str(item.get("id") or item.get("target_id") or "")[:120],
+            "label": str(item.get("sectionName") or item.get("title") or item.get("heading") or item.get("caption") or item.get("label") or "")[:180],
+            "type": str(item.get("target_type") or item.get("sectionType") or item.get("type") or ("table" if item.get("rowCount") is not None else "section")),
+            "target_type": str(item.get("target_type") or item.get("type") or item.get("sectionType") or ("table" if item.get("rowCount") is not None else "section")),
+            "from": item.get("from"),
+            "to": item.get("to"),
+            "owning_section": str(item.get("owningSection") or item.get("owning_section") or "")[:180],
+            "text_excerpt": re.sub(r"\s+", " ", str(item.get("text") or ""))[:500],
+            "row_count": item.get("rowCount") or item.get("row_count") or 0,
+            "column_count": item.get("columnCount") or item.get("column_count") or 0,
+        })
+    return out
+
+
+def _normalize_target_text(value: object) -> str:
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = text.lower()
+    text = re.sub(r"[\u2010-\u2015]", "-", text)
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _is_bad_editor_target_label(label: object, text_excerpt: object = "", is_table: bool = False) -> bool:
+    lbl_norm = _normalize_target_text(label)
+    bad_labels = {
+        "table of contents",
+        "inhaltsverzeichnis",
+    }
+    if lbl_norm in bad_labels:
+        return True
+
+    if is_table:
+        return False
+
+    normalized = _normalize_target_text(f"{label} {text_excerpt}")
+    if not normalized:
+        return True
+
+    bad_patterns = [
+        r"\bpage \d+ of \d+\b",
+        r"\bseite \d+ von \d+\b",
+        r"\bsop [a-z0-9]+ page\b",
+    ]
+    if any(re.search(pattern, normalized) for pattern in bad_patterns):
+        return True
+
+    generic_or_empty_label = not lbl_norm or lbl_norm in {"table", "section", "paragraph", "heading"}
+    if generic_or_empty_label or any(re.search(p, lbl_norm) for p in [r"\bversion\b", r"\bdate\b"]):
+        bad_excerpts = [
+            r"\beffective date\b",
+            r"\breview date\b",
+            r"\bversion \d+\b",
+        ]
+        if any(re.search(pattern, normalized) for pattern in bad_excerpts):
+            return True
+
+    return False
+
+
+def _strip_leading_numbering(text: str) -> str:
+    # Remove leading numbering like "4.", "4.1", "4.1.2", "IV.", "A.", etc.
+    return re.sub(r"^\s*(?:[0-9a-zA-Z]+(?:\.[0-9a-zA-Z]+)*|[IVXLCDMivxlcdm]+)[.)\]:-]?\s+", "", text).strip()
+
+
+def _deterministic_target_analysis(
+    *,
+    user_query: str,
+    sections: list[dict[str, Any]],
+    tables: list[dict[str, Any]],
+    selection: dict[str, Any],
+    active_scope: dict[str, Any],
+) -> dict[str, Any] | None:
+    q_norm = _normalize_target_text(user_query)
+
+    # 1. Full document pre-check (completely multilingual / typo tolerant)
+    if re.search(r"\b(full|whole|entire|complete)\s+(sop|document|doc)\b", user_query, re.I) or any(w in q_norm for w in ["ganze", "vollständige", "komplette"]):
+        return {
+            "target_type": "full_document",
+            "target_id": "doc_root",
+            "target_label": None,
+            "owning_section": None,
+            "confidence": 0.98,
+            "requires_clarification": False,
+            "candidate_targets": [],
+            "reasoning_summary": "The request explicitly targets the full SOP/document.",
+            "source": "deterministic_map",
+        }
+
+    # 2. Selection pre-check (completely multilingual / typo tolerant)
+    selected_text = str(selection.get("text") or selection.get("selectedText") or "").strip()
+    selection_empty = selection.get("empty")
+    if selected_text and selection_empty is not True and any(w in q_norm for w in ["selected", "selection", "highlighted", "auswahl", "markiert"]):
+        return {
+            "target_type": "selection",
+            "target_id": "selection",
+            "target_label": None,
+            "owning_section": None,
+            "confidence": 0.96,
+            "requires_clarification": False,
+            "candidate_targets": [],
+            "reasoning_summary": "The user referred to the current editor selection.",
+            "source": "deterministic_map",
+        }
+
+    # 3. Direct label substring match (completely language-agnostic and typo tolerant for designators)
+    candidates = []
+
+    # Tables matching
+    for table in tables:
+        label = str(table.get("label") or "").strip()
+        excerpt = str(table.get("text_excerpt") or "")
+        if not label or _is_bad_editor_target_label(label, excerpt, is_table=True):
+            continue
+        # Match by table's own label
+        label_norm = _normalize_target_text(_strip_leading_numbering(label))
+        if len(label_norm) >= 4 and label_norm in q_norm:
+            candidates.append(("table", table))
+            continue
+        # Match by table's owning section if query specifies a table
+        owning = str(table.get("owning_section") or "").strip()
+        if owning:
+            owning_norm = _normalize_target_text(_strip_leading_numbering(owning))
+            table_words = ["table", "tabelle", "tabular", "matrix", "tablwe", "tbale", "tbl", "tabele", "tabell", "tabel"]
+            has_table_word = any(re.search(rf"\b{w}\b", q_norm) for w in table_words)
+            if has_table_word and len(owning_norm) >= 4 and owning_norm in q_norm:
+                candidates.append(("table", table))
+
+    # Sections matching
+    for section in sections:
+        label = str(section.get("label") or "").strip()
+        excerpt = str(section.get("text_excerpt") or "")
+        if not label or _is_bad_editor_target_label(label, excerpt, is_table=False):
+            continue
+        label_norm = _normalize_target_text(_strip_leading_numbering(label))
+        if len(label_norm) >= 4 and label_norm in q_norm:
+            candidates.append(("section", section))
+
+    # If exactly one unique label (stripped) matched the query, return it.
+    # If there are multiple matches (collision), return None to let the LLM / Deep Agent resolve the ambiguity dynamically.
+    if len(candidates) == 1:
+        target_type, item = candidates[0]
+        return {
+            "target_type": target_type,
+            "target_id": item.get("id"),
+            "target_label": item.get("label"),
+            "owning_section": item.get("owning_section") or item.get("owningSection"),
+            "confidence": 0.98,
+            "requires_clarification": False,
+            "candidate_targets": [],
+            "reasoning_summary": f"Direct substring match resolved target: {item.get('label')}",
+            "source": "deterministic_map",
+        }
+
+    return None
+
+
+def _requested_target_type(user_query: str) -> str | None:
+    # Minimal language-agnostic helper to check if a query explicitly mentions a table or paragraph
+    q = str(user_query or "").lower()
+    if any(w in q for w in ["table", "tabelle", "tabular", "matrix", "tab"]):
+        return "table"
+    if any(w in q for w in ["paragraph", "para", "absatz"]):
+        return "paragraph"
+    if any(w in q for w in ["section", "heading", "abschnitt", "kapitel"]):
+        return "section"
+    return None
+
+
+def _candidate_pool_for_prompt(user_query: str, sections: list[dict[str, Any]], tables: list[dict[str, Any]], paragraphs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # Dynamic language-agnostic candidate pool for fallback: return both sections and tables.
+    return sections + tables
+
+
+def _format_target_candidates(items: list[dict[str, Any]], reason: str, limit: int = 8) -> list[dict[str, Any]]:
+    return [
+        {
+            "id": item.get("id"),
+            "target_id": item.get("id"),
+            "label": item.get("label"),
+            "target_type": item.get("target_type") or item.get("type"),
+            "reason": reason,
+        }
+        for item in items[:limit]
+        if item.get("id") and item.get("label")
+    ]
+
+
+def _live_target_map(*groups: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    live: dict[str, dict[str, Any]] = {}
+    for group in groups:
+        for item in group:
+            item_id = str(item.get("id") or "").strip()
+            if item_id:
+                live[item_id] = item
+    live.setdefault("doc_root", {"id": "doc_root", "label": "Current SOP", "target_type": "full_document"})
+    live.setdefault("selection", {"id": "selection", "label": "Selected text", "target_type": "selection"})
+    return live
+
+
+def _finalize_target_response(
+    response: dict[str, Any],
+    *,
+    user_query: str,
+    sections: list[dict[str, Any]],
+    tables: list[dict[str, Any]],
+    paragraphs: list[dict[str, Any]],
+    document_tree: list[dict[str, Any]],
+    source: str | None = None,
+) -> dict[str, Any]:
+    result = dict(response or {})
+    if source:
+        result["source"] = source
+    live_targets = _live_target_map(sections, tables, paragraphs, document_tree)
+    target_id = str(result.get("target_id") or "").strip()
+    target_type = str(result.get("target_type") or "").strip().lower()
+
+    if target_id and target_id not in live_targets:
+        try:
+            confidence = float(result.get("confidence") or 0)
+        except Exception:
+            confidence = 0.0
+        candidates = _format_target_candidates(
+            sections + tables,
+            "live candidate",
+        )
+        result.update({
+            "target_id": None,
+            "target_label": None,
+            "owning_section": None,
+            "confidence": min(confidence, 0.35),
+            "requires_clarification": True,
+            "candidate_targets": candidates,
+            "reasoning_summary": f"Target id '{target_id}' was not present in the live editor snapshot.",
+        })
+    elif target_id:
+        live = live_targets[target_id]
+        live_type = str(live.get("target_type") or live.get("type") or target_type).strip().lower()
+        result["target_type"] = live_type or target_type
+        result["target_label"] = result.get("target_label") or live.get("label")
+        result["owning_section"] = result.get("owning_section") or live.get("owning_section")
+        result["requires_clarification"] = False
+        result["candidate_targets"] = []
+
+    logger.info(
+        "[analyze-sop-target] decision query=%r target_id=%s target_type=%s confidence=%s clarification=%s source=%s",
+        user_query[:240],
+        result.get("target_id"),
+        result.get("target_type"),
+        result.get("confidence"),
+        result.get("requires_clarification"),
+        result.get("source"),
+    )
+    return result
+
+
+@ai_router.post("/api/ai/analyze-sop-target")
+async def analyze_sop_target(payload: dict):
+    user_query = str(payload.get("user_query") or payload.get("message") or "").strip()
+    if not user_query:
+        raise HTTPException(status_code=422, detail="user_query is required")
+
+    action = str(payload.get("action") or "").strip().lower() or "rewrite"
+    full_text = re.sub(r"\s+\n", "\n", str(payload.get("full_text") or ""))[:60000]
+    document_excerpt = re.sub(r"\s+", " ", str(payload.get("document_excerpt") or ""))[:8000]
+    document_schema = str(payload.get("document_schema") or "")[:12000]
+    sop_metadata = payload.get("sop_metadata") if isinstance(payload.get("sop_metadata"), dict) else {}
+    selection = payload.get("selection") if isinstance(payload.get("selection"), dict) else {}
+    active_scope = payload.get("active_scope") if isinstance(payload.get("active_scope"), dict) else {}
+    if payload.get("cursor_block_id") and not active_scope.get("cursor_block_id"):
+        active_scope = {**active_scope, "cursor_block_id": str(payload.get("cursor_block_id"))}
+    sections = _compact_target_items(payload.get("section_index"), 100)
+    tables = _compact_target_items(payload.get("table_index"), 60)
+    paragraphs = _compact_target_items(payload.get("paragraph_index"), 160)
+    document_tree = _compact_target_items(payload.get("document_tree"), 220)
+
+    deterministic = _deterministic_target_analysis(
+        user_query=user_query,
+        sections=sections,
+        tables=tables,
+        selection=selection,
+        active_scope=active_scope,
+    )
+    if deterministic:
+        fallback = {
+            **deterministic,
+            "candidate_targets": deterministic.get("candidate_targets") if isinstance(deterministic.get("candidate_targets"), list) else [],
+            "source": "fallback",
+        }
+    else:
+        generic_candidates = _candidate_pool_for_prompt(user_query, sections, tables, paragraphs)
+        fallback = {
+            "target_type": "full_document" if re.search(r"\b(full|whole|entire|complete)\s+(sop|document|doc)\b", user_query, re.I) else "section",
+            "target_id": "doc_root" if re.search(r"\b(full|whole|entire|complete)\s+(sop|document|doc)\b", user_query, re.I) else None,
+            "target_label": None,
+            "owning_section": None,
+            "confidence": 0.35,
+            "requires_clarification": True,
+            "candidate_targets": _format_target_candidates(generic_candidates, "available live candidate"),
+            "reasoning_summary": "LLM target analysis unavailable; clarification required.",
+            "source": "fallback",
+        }
+
+    try:
+        deep_result = await asyncio.wait_for(
+            asyncio.to_thread(
+                resolve_sop_target_with_deep_agent,
+                user_query=user_query,
+                action=action,
+                sections=sections,
+                tables=tables,
+                paragraphs=paragraphs,
+                document_tree=document_tree,
+                selection=selection,
+                active_scope=active_scope,
+                sop_metadata=sop_metadata,
+                document_excerpt=document_excerpt,
+                document_schema=document_schema,
+                full_text=full_text,
+            ),
+            timeout=TARGET_DEEP_AGENT_TIMEOUT_SECONDS,
+        )
+        if deep_result and isinstance(deep_result, dict):
+            return _finalize_target_response(
+                deep_result,
+                user_query=user_query,
+                sections=sections,
+                tables=tables,
+                paragraphs=paragraphs,
+                document_tree=document_tree,
+            )
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[analyze-sop-target] deep_agent_target_timeout seconds=%s",
+            TARGET_DEEP_AGENT_TIMEOUT_SECONDS,
+        )
+    except (TargetResolverAgentError, DeepAgentExecutionError) as exc:
+        logger.warning("[analyze-sop-target] deep_agent_target_failed error=%s", exc)
+    except Exception as exc:
+        logger.warning("[analyze-sop-target] deep_agent_target_unexpected error=%s", exc)
+
+    system = (
+        "You are a target-analysis agent for an SOP rich-text editor. "
+        "Read the full SOP context and choose what the user wants to target. "
+        "Do not rewrite content. Return only strict JSON."
+    )
+    user = {
+        "user_query": user_query,
+        "action": action,
+        "allowed_target_type": ["full_document", "section", "table", "table_section", "paragraph", "selection"],
+        "sop_metadata": sop_metadata,
+        "selection": selection,
+        "active_scope": active_scope,
+        "section_index": sections,
+        "table_index": tables,
+        "paragraph_index": paragraphs,
+        "document_tree": document_tree,
+        "document_schema": document_schema,
+        "document_excerpt": document_excerpt,
+        "full_text": full_text,
+        "rules": [
+            "Choose target_id from section_index, table_index, paragraph_index, or document_tree whenever possible.",
+            "Never invent target_id. If no real candidate fits, set requires_clarification=true.",
+            "If user explicitly says full/whole/entire/complete SOP, target_type=full_document.",
+            "Do not treat 'current SOP style' as full_document; that phrase describes style, not target scope.",
+            "If user names a section heading, target_type=section and target_label must be the exact best heading from section_index.",
+            "Prefer the most specific child heading over a broader parent heading.",
+            "Do not choose a mixed parent heading such as 'Abbreviations and Definitions' when the user asks only for 'Definitions' and a child 'Definitions' heading exists.",
+            "If user names a table only, target_type=table and target_label must be the exact caption/table label.",
+            "If user says table ... section, target_type=table_section and owning_section must be the parent section heading.",
+            "For rewrite/improve of a named heading, never choose the first paragraph that merely contains the same word.",
+            "If user says selected text/this paragraph and selection is non-empty, use selection or paragraph.",
+            "Do not choose Table of Contents, page header/footer, metadata footer, or page label artifacts.",
+            "If multiple candidates are plausible, requires_clarification=true and list candidate_targets.",
+        ],
+        "json_schema": {
+            "target_type": "full_document|section|table|table_section|paragraph|selection",
+            "target_id": "exact candidate id or null",
+            "target_label": "string or null",
+            "owning_section": "string or null",
+            "confidence": "number 0..1",
+            "requires_clarification": "boolean",
+            "candidate_targets": [{"id": "string", "label": "string", "target_type": "string", "reason": "string"}],
+            "reasoning_summary": "short string",
+        },
+    }
+
+    try:
+        llm = create_chat_llm(temperature=0, max_output_tokens=700, max_retries=0)
+        message = await asyncio.wait_for(
+            asyncio.to_thread(
+                llm.invoke,
+                [("system", system), ("user", json.dumps(user, ensure_ascii=False))],
+            ),
+            timeout=TARGET_LLM_FALLBACK_TIMEOUT_SECONDS,
+        )
+        parsed = _extract_json_object_from_text(getattr(message, "content", str(message)))
+    except asyncio.TimeoutError:
+        logger.warning(
+            "[analyze-sop-target] llm_fallback_timeout seconds=%s",
+            TARGET_LLM_FALLBACK_TIMEOUT_SECONDS,
+        )
+        return _finalize_target_response(
+            fallback,
+            user_query=user_query,
+            sections=sections,
+            tables=tables,
+            paragraphs=paragraphs,
+            document_tree=document_tree,
+            source="fallback",
+        )
+    except Exception as exc:
+        logger.warning("[analyze-sop-target] llm_failed error=%s", exc)
+        return _finalize_target_response(
+            fallback,
+            user_query=user_query,
+            sections=sections,
+            tables=tables,
+            paragraphs=paragraphs,
+            document_tree=document_tree,
+            source="fallback",
+        )
+
+    target_type = str(parsed.get("target_type") or "").strip().lower()
+    if target_type not in {"full_document", "section", "table", "table_section", "paragraph", "selection"}:
+        target_type = fallback["target_type"]
+    try:
+        confidence = max(0.0, min(1.0, float(parsed.get("confidence", 0))))
+    except Exception:
+        confidence = 0.0
+    candidates = parsed.get("candidate_targets") if isinstance(parsed.get("candidate_targets"), list) else []
+
+    if len(candidates) == 1 and (parsed.get("requires_clarification") or confidence >= 0.45):
+        only = candidates[0] or {}
+        target_type = str(only.get("target_type") or only.get("type") or target_type or fallback["target_type"]).strip().lower()
+        target_id = str(only.get("target_id") or only.get("id") or parsed.get("target_id") or "").strip() or None
+        target_label = str(only.get("label") or only.get("target_label") or parsed.get("target_label") or "").strip() or None
+        owning_section = str(only.get("owning_section") or only.get("owningSection") or parsed.get("owning_section") or "").strip() or None
+        confidence = max(confidence, 0.62)
+        candidates = []
+        parsed["requires_clarification"] = False
+    else:
+        target_id = str(parsed.get("target_id") or "").strip() or None
+        target_label = str(parsed.get("target_label") or "").strip() or None
+        owning_section = str(parsed.get("owning_section") or "").strip() or None
+
+    return _finalize_target_response({
+        "target_type": target_type,
+        "target_id": target_id,
+        "target_label": target_label,
+        "owning_section": owning_section,
+        "confidence": confidence,
+        "requires_clarification": bool(parsed.get("requires_clarification")) or confidence < 0.45,
+        "candidate_targets": candidates[:8],
+        "reasoning_summary": str(parsed.get("reasoning_summary") or "LLM target analysis completed.")[:600],
+        "source": "local_llm",
+        "llm_model": get_local_llm_config().model,
+    }, user_query=user_query, sections=sections, tables=tables, paragraphs=paragraphs, document_tree=document_tree)
+
+
 @ai_router.post("/api/ai/classify-intent")
 async def classify_intent(payload: dict):
     """
@@ -4556,39 +5413,108 @@ async def classify_intent(payload: dict):
     if not message:
         raise HTTPException(status_code=422, detail="message is required")
 
+    frontend_ctx = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    if frontend_ctx and not isinstance(payload.get("assistant_context"), dict):
+        active_sop = frontend_ctx.get("activeSop") if isinstance(frontend_ctx.get("activeSop"), dict) else {}
+        payload = dict(payload)
+        payload["assistant_context"] = {
+            "route": frontend_ctx.get("path") or frontend_ctx.get("route") or "",
+            "active_sop_id": active_sop.get("id") or active_sop.get("sopId") or "",
+            "current_document_id": active_sop.get("id") or active_sop.get("sopId") or "",
+            "current_sop": {
+                "id": active_sop.get("id") or active_sop.get("sopId") or "",
+                "title": active_sop.get("title") or active_sop.get("name") or "",
+                "sop_number": active_sop.get("number") or active_sop.get("documentId") or active_sop.get("id") or "",
+                "current_section": active_sop.get("currentSection") or "",
+            },
+        }
+        payload["has_active_sop"] = True
+
     prep = prepare_message_context(payload)
 
     def _classify_return_llm(raw: dict) -> dict:
         return finalize_classify_response(raw, prep, user_message=message)
 
+    early_ctx = payload.get("assistant_context") if isinstance(payload.get("assistant_context"), dict) else {}
+    early_has_active_sop = bool(payload.get("has_active_sop")) or bool(
+        str(early_ctx.get("active_sop_id") or early_ctx.get("current_document_id") or "").strip()
+        or isinstance(early_ctx.get("current_sop"), dict)
+    )
+    early_action_match = re.search(
+        r"\b(rewrite|re-?write|umschreiben|neu\s+formulieren|improve|verbessern?|gap\s*check|compliance\s+check|analy[sz]e)\b",
+        message,
+        re.IGNORECASE,
+    )
+    if early_has_active_sop and early_action_match:
+        action_word = early_action_match.group(1).lower()
+        early_action = (
+            "gap_check" if re.search(r"gap|compliance", action_word, re.I)
+            else "analyze" if re.search(r"analy", action_word, re.I)
+            else "improve" if re.search(r"improve|verbesser", action_word, re.I)
+            else "rewrite"
+        )
+        quoted = re.search(r"['\"]([^'\"]{2,160})['\"]", message)
+        section_after_word = re.search(r"\b(?:section|abschnitt)\s+([A-Za-z0-9 _./&()-]{2,120})", message, re.I)
+        section_hint = (quoted.group(1) if quoted else (section_after_word.group(1) if section_after_word else "")).strip(" .:-")
+        if section_hint:
+            section_hint = re.sub(r"\b(im|in|with|using|nach|according|current|aktuellen?)\b[\s\S]*$", "", section_hint, flags=re.I).strip(" .:-")
+        return _classify_return_llm({
+            "flow": "editor_action",
+            "action": early_action,
+            "target_scope": "section" if section_hint else "current_section",
+            "section_hint": section_hint or None,
+            "target_resolution": {
+                "target_scope": "section" if section_hint else "current_section",
+                "section_hint": section_hint or None,
+                "prefer_full_section": True,
+            },
+            "linked_entity_types": [],
+            "constraints": {},
+            "requires_selection": False,
+            "requires_confirmation": True,
+            "confidence": 0.95 if section_hint else 0.82,
+            "reasoning": "deterministic_editor_action_precheck",
+            "sidebar_intent": "action",
+            "run_editor_action": True,
+            "run_query": False,
+        })
+
     if use_llm_orchestrator():
         invoke_ctx = build_intent_classifier_invoke_context(payload, prep)
-        result = await asyncio.to_thread(
-            classify_assistant_intent,
-            message,
-            has_active_sop=invoke_ctx["has_active_sop"],
-            has_editor_selection=invoke_ctx["has_editor_selection"],
-            route=invoke_ctx["route"],
-            active_sop_title=invoke_ctx["active_sop_title"],
-            active_sop_number=invoke_ctx["active_sop_number"],
-            selected_section_summary=invoke_ctx["selected_section_summary"],
-            available_sections=invoke_ctx["available_sections"],
-            previous_action_summary=invoke_ctx["previous_action_summary"],
-            recent_conversation=invoke_ctx["recent_conversation"],
-            active_scope=invoke_ctx.get("active_scope"),
-            instruction_memory=invoke_ctx.get("instruction_memory"),
-            frustration_signal=invoke_ctx.get("frustration_signal"),
-            repetition_detected=invoke_ctx["repetition_detected"],
-            repetition_instruction=invoke_ctx.get("repetition_instruction"),
-            resolved_scope_hint=invoke_ctx.get("resolved_scope_hint") or "-",
-            query_analysis_hint=invoke_ctx.get("query_analysis_hint") or "-",
-        )
-        raw = result.model_dump()
-        raw["reasoning"] = raw.get("reasoning") or "llm_orchestrator"
-        prev = invoke_ctx.get("previous_action")
-        if prev:
-            raw["previous_action"] = prev
-        return _classify_return_llm(raw)
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    classify_assistant_intent,
+                    message,
+                    has_active_sop=invoke_ctx["has_active_sop"],
+                    has_editor_selection=invoke_ctx["has_editor_selection"],
+                    route=invoke_ctx["route"],
+                    active_sop_title=invoke_ctx["active_sop_title"],
+                    active_sop_number=invoke_ctx["active_sop_number"],
+                    selected_section_summary=invoke_ctx["selected_section_summary"],
+                    available_sections=invoke_ctx["available_sections"],
+                    previous_action_summary=invoke_ctx["previous_action_summary"],
+                    recent_conversation=invoke_ctx["recent_conversation"],
+                    active_scope=invoke_ctx.get("active_scope"),
+                    instruction_memory=invoke_ctx.get("instruction_memory"),
+                    frustration_signal=invoke_ctx.get("frustration_signal"),
+                    repetition_detected=invoke_ctx["repetition_detected"],
+                    repetition_instruction=invoke_ctx.get("repetition_instruction"),
+                    resolved_scope_hint=invoke_ctx.get("resolved_scope_hint") or "-",
+                    query_analysis_hint=invoke_ctx.get("query_analysis_hint") or "-",
+                ),
+                timeout=min(12.0, max(4.0, get_local_llm_timeout_seconds())),
+            )
+            raw = result.model_dump()
+            raw["reasoning"] = raw.get("reasoning") or "llm_orchestrator"
+            prev = invoke_ctx.get("previous_action")
+            if prev:
+                raw["previous_action"] = prev
+            return _classify_return_llm(raw)
+        except (TimeoutError, asyncio.TimeoutError) as exc:
+            logger.warning("[classify-intent] llm_orchestrator_timeout fallback=deterministic error=%s", exc)
+        except Exception as exc:
+            logger.warning("[classify-intent] llm_orchestrator_failed fallback=deterministic error=%s", exc)
 
     if prep.get("early_response"):
         return finalize_classify_response(prep["early_response"], prep, user_message=message)
@@ -5263,10 +6189,29 @@ async def query_ai(
         guard["retrieval_stats"]["elapsed_ms_total"] = guard["elapsed_ms_total"]
         return await _merge_persisted(guard)
 
-    profile_context = _extract_profile_context(payload, assistant_context)
     intents = _query_intents(question)
+    profile_context = _extract_profile_context(payload, assistant_context)
     active_scope = _extract_active_sop_scope(assistant_context)
     context_summary = _summarize_live_context(assistant_context, question)
+    consultant_response = _consultant_chat_response(question, assistant_context, surface, assistant_mode)
+    if consultant_response:
+        consultant_response.setdefault("retrieval_stats", {})
+        consultant_response["retrieval_stats"].update(
+            {
+                "provider": "deterministic",
+                "model": "consultant_orchestrator",
+                "intents": sorted(intents),
+                "latency_ms_total": round((time.perf_counter() - t0) * 1000.0, 1),
+            }
+        )
+        consultant_response["elapsed_ms_total"] = round((time.perf_counter() - t0) * 1000.0, 1)
+        consultant_response["retrieval_stats"]["elapsed_ms_total"] = consultant_response["elapsed_ms_total"]
+        logger.info(
+            "[chatbot-response] source=consultant_orchestrator routed_to=%s latency_ms=%.1f",
+            consultant_response.get("routed_to", ""),
+            (time.perf_counter() - t0) * 1000.0,
+        )
+        return await _merge_persisted(consultant_response)
     explain_preview_response = _deterministic_explain_preview_response(question, assistant_context)
     if explain_preview_response:
         explain_preview_response["retrieval_stats"].update(
@@ -5355,8 +6300,66 @@ async def query_ai(
         and action_plan.get("type") == "delete_sop"
         and action_plan.get("requires_confirmation")
     )
-    question_for_rag = question
+    sidebar_agent_response = None
     context_hints: list[str] = []
+    if surface in {"kl_assistant", "global_chatbot", "knowledge_search", "sidebar"}:
+        def _run_sidebar_agent_thread() -> dict[str, Any] | None:
+            db_sidebar_agent = SessionLocal()
+            try:
+                return run_sidebar_deep_agent(
+                    db=db_sidebar_agent,
+                    question=question,
+                    assistant_context=assistant_context,
+                    surface=surface,
+                    assistant_mode=assistant_mode,
+                    category=str(category).strip() if category is not None else None,
+                    chat_history=chat_history if isinstance(chat_history, list) else [],
+                    intents=sorted(intents),
+                    action_plan=action_plan,
+                )
+            finally:
+                db_sidebar_agent.close()
+
+        try:
+            sidebar_agent_response = await asyncio.to_thread(
+                _run_sidebar_agent_thread
+            )
+        except DeepAgentExecutionError as exc:
+            logger.warning(
+                "[chatbot-response] sidebar_deep_agent_failed_fallback stage=deep_agent error=%s",
+                exc,
+            )
+            context_hints.append(
+                "SIDEBAR_DEEP_AGENT_FALLBACK=1; answer with the normal RAG/live-context pipeline because sidebar DeepAgent orchestration failed."
+            )
+        except Exception as exc:
+            logger.warning(
+                "[chatbot-response] sidebar_deep_agent_failed_fallback stage=unexpected type=%s error=%s",
+                type(exc).__name__,
+                exc,
+            )
+            context_hints.append(
+                "SIDEBAR_DEEP_AGENT_FALLBACK=1; answer with the normal RAG/live-context pipeline because sidebar DeepAgent orchestration failed."
+            )
+    if sidebar_agent_response:
+        sidebar_agent_response.setdefault("retrieval_stats", {})
+        sidebar_agent_response["retrieval_stats"].update(
+            {
+                "latency_ms_total": round((time.perf_counter() - t0) * 1000.0, 1),
+                "assistant_mode": assistant_mode,
+                "surface": surface,
+                "intents": sorted(intents),
+            }
+        )
+        sidebar_agent_response["elapsed_ms_total"] = round((time.perf_counter() - t0) * 1000.0, 1)
+        sidebar_agent_response["retrieval_stats"]["elapsed_ms_total"] = sidebar_agent_response["elapsed_ms_total"]
+        logger.info(
+            "[chatbot-response] source=sidebar_deep_agent routed_to=%s latency_ms=%.1f",
+            sidebar_agent_response.get("routed_to", ""),
+            (time.perf_counter() - t0) * 1000.0,
+        )
+        return await _merge_persisted(sidebar_agent_response)
+    question_for_rag = question
     rc_query = (
         assistant_context.get("response_constraints")
         if isinstance(assistant_context.get("response_constraints"), dict)
