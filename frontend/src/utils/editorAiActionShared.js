@@ -58,12 +58,23 @@ export function normalizeAiActionResult(action, apiResult) {
 /**
  * Content to insert on accept — mirrors AIAssistantBubbleMenu.buildAcceptedContent.
  */
-export function buildAcceptedInsertContent(aiResult, { selectedFraction = 0, isFullDoc = false } = {}) {
+export function buildAcceptedInsertContent(aiResult, { selectedFraction = 0, isFullDoc = false, preferRichBlock = false } = {}) {
   const action = String(aiResult?.action || '').toLowerCase()
   const structured = aiResult?.structured_data || {}
   const isPartialSelection = !isFullDoc && selectedFraction > 0 && selectedFraction < 0.85
+  const richHtml = formatAiSuggestionForUi({
+    action,
+    suggestedText: aiResult?.suggested_text,
+    structuredData: structured,
+  })
+  const hasRichTable = /<\/?(?:table|thead|tbody|tr|td|th)\b/i.test(richHtml)
+
+  if (preferRichBlock && (action === 'rewrite' || action === 'improve')) {
+    return richHtml || stripHtmlToPlain(structured.rewritten_text || structured.improved_text || aiResult?.suggested_text)
+  }
 
   if (isPartialSelection && (action === 'rewrite' || action === 'improve')) {
+    if (hasRichTable) return richHtml
     if (action === 'rewrite') {
       return stripHtmlToPlain(structured.rewritten_text || aiResult?.suggested_text)
     }
@@ -72,12 +83,7 @@ export function buildAcceptedInsertContent(aiResult, { selectedFraction = 0, isF
     }
   }
 
-  const html = formatAiSuggestionForUi({
-    action,
-    suggestedText: aiResult?.suggested_text,
-    structuredData: structured,
-  })
-  return html || stripHtmlToPlain(structured.rewritten_text || structured.improved_text || aiResult?.suggested_text)
+  return richHtml || stripHtmlToPlain(structured.rewritten_text || structured.improved_text || aiResult?.suggested_text)
 }
 
 /** Safe HTML for inline suggestion widget (no raw markdown). */

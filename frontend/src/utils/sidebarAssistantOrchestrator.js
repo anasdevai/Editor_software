@@ -54,6 +54,10 @@ export function buildTargetOptionsFromClassification(classification, userMessage
 
   return {
     userPrompt: String(userMessage || '').trim(),
+    targetId: String(tr.target_id || '').trim(),
+    targetType: String(tr.target_type || '').trim().toLowerCase(),
+    targetLabel: String(tr.target_label || tr.section_hint || classification?.section_hint || '').trim(),
+    owningSection: String(tr.owning_section || '').trim(),
     sectionHint: String(tr.section_hint || classification?.section_hint || classification?.record_id || '').trim(),
     targetScope: String(tr.target_scope || classification?.target_scope || 'selection').trim(),
     lineNumber: tr.line_number ?? classification?.line_number ?? null,

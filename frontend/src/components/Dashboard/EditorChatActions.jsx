@@ -34,6 +34,25 @@ const ACTION_TEXT_WARNING_CHARS = 7000
 const INLINE_SHOWN_EVENT = 'editor-actions-inline-shown'
 const INLINE_APPLIED_EVENT = 'editor-actions-inline-applied'
 
+const explicitlyFullDocumentPrompt = (value = '') =>
+  /\b(?:rewrite|improve|summari[sz]e|gap\s*check)\s+(?:the\s+|this\s+|current\s+)?(?:full|whole|entire|complete)?\s*(?:sop|document|doc)\b/i
+    .test(String(value || ''))
+  || /\b(?:full|whole|entire|complete)\s+(?:sop|document|doc)\b/i.test(String(value || ''))
+
+const namesStructuralTarget = (value = '') =>
+  /\b(?:section|sections|heading|table|tabelle|abschnitt|kapitel)\b/i.test(String(value || ''))
+  || /["'][^"']{2,160}["']/.test(String(value || ''))
+  || /\b\d+(?:\.\d+)+\b/.test(String(value || ''))
+
+const structuralScopeFromPrompt = (value = '') => {
+  const text = String(value || '')
+  if (!namesStructuralTarget(text) || explicitlyFullDocumentPrompt(text)) return ''
+  if (/\b(?:table|tabelle|tabular|matrix)\b/i.test(text)) {
+    return /\b(?:section|sections|abschnitt|kapitel)\b/i.test(text) ? 'table_section' : 'table'
+  }
+  return 'section'
+}
+
 /**
  * Runs rewrite / improve / gap_check from chat (via dispatchActionsTabRun) and
  * shows accept/reject review UI inside the KI Assistant chat panel.
@@ -104,14 +123,25 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
   const runInlineContentAction = useCallback(async (action, instructionText = '', targetOptions = {}) => {
     const documentId = getActiveEditorDocumentId()
     const instruction = String(instructionText || '').trim()
+    const forcedStructuralScope =
+      structuralScopeFromPrompt(instruction)
+      || (!explicitlyFullDocumentPrompt(instruction) && targetOptions.sectionHint ? 'section' : '')
+      || (!explicitlyFullDocumentPrompt(instruction) && ['section', 'table', 'table_section'].includes(String(targetOptions.targetScope || '').toLowerCase())
+        ? String(targetOptions.targetScope || '').toLowerCase()
+        : '')
     const snapshot = await requestEditorSnapshot({
+      action,
       prompt: instruction,
       userPrompt: targetOptions.userPrompt || '',
       sectionHint: targetOptions.sectionHint || '',
-      targetScope: targetOptions.targetScope || '',
+      targetScope: forcedStructuralScope || targetOptions.targetScope || '',
+      targetId: targetOptions.targetId || '',
+      targetType: targetOptions.targetType || '',
+      targetLabel: targetOptions.targetLabel || '',
+      owningSection: targetOptions.owningSection || '',
       lineNumber: targetOptions.lineNumber ?? null,
       recordId: targetOptions.recordId || '',
-      preferFullSection: Boolean(targetOptions.preferFullSection),
+      preferFullSection: Boolean(targetOptions.preferFullSection || forcedStructuralScope),
     })
     let target = snapshot.target
     if (target?.from == null || target?.to == null || !target?.text) {
@@ -128,7 +158,12 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
       }
     }
 
-    if (selectionLooksLikeFormattedAiReport(target.text)) {
+    const isNamedStructuralTarget = Boolean(forcedStructuralScope)
+    const isFullDocumentTarget = !isNamedStructuralTarget && (Boolean(target.isFullDoc) || wantsFullSopIntent(instruction))
+    if (isNamedStructuralTarget && target.isFullDoc) {
+      throw new Error('The request names a section or table, but the editor resolved the full SOP. Use the exact heading/table name or clear the stale selection.')
+    }
+    if (!isFullDocumentTarget && selectionLooksLikeFormattedAiReport(target.text)) {
       throw new Error('That region looks like AI report output. Select original SOP prose instead.')
     }
 
@@ -146,19 +181,36 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
         : target.isFullDoc
           ? 1
           : 0.3
+    const targetResolution = snapshot.targetResolution || snapshot.targetAudit || null
+    const targetContext = snapshot.targetContext || null
+    const containsTableTarget = Boolean(targetResolution?.contains_table || targetContext?.contains_table || target.sectionType === 'Table')
+    const resolvedTargetType = String(
+      targetResolution?.target_type
+      || target.resolved_target_type
+      || (containsTableTarget ? 'table_section' : ''),
+    ).toLowerCase()
+    const tableOutputInstruction = resolvedTargetType === 'table_section'
+      ? 'The resolved target is one complete SOP section containing a heading, optional explanatory paragraphs, and a real table. Return the complete section in the same order. Use valid HTML for the heading, paragraphs, and <table>; keep the table column count unchanged. Never return only the prose or only the table.'
+      : 'The resolved target is a real editor table. Return one valid HTML <table> or a Markdown table with the same column count. Rewrite/improve cell values only; do not flatten the table into bold paragraphs or prose.'
+    const actionInstruction = containsTableTarget
+      ? [
+          instruction,
+          tableOutputInstruction,
+        ].filter(Boolean).join('\n\n')
+      : instruction
 
     const result = await performAIAction({
       action,
       text: target.text,
       document_id: documentId,
-      instruction,
+      instruction: actionInstruction,
       section_id: `${target.from}-${target.to}`,
       sop_title: snapshot.sopTitle || 'Untitled SOP',
       section_name: target.sectionName || 'Selected text',
-      section_type: target.isFullDoc || wantsFullSopIntent(instruction)
+      section_type: isFullDocumentTarget
         ? 'Full Document'
         : target.sectionType || 'Paragraph',
-      edit_scope: target.isFullDoc || wantsFullSopIntent(instruction)
+      edit_scope: isFullDocumentTarget
         ? 'full_document'
         : inferEditScope({
             text: target.text,
@@ -170,6 +222,9 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
       sop_entity_id: documentId,
       triggered_by: AI_ACTION_TRIGGERED_BY.KL_ASSISTANT,
       learn_to_profile: /\b(?:learn|save|update)\b[\s\S]*\b(?:profile|style)\b/i.test(instruction),
+      target_resolution: targetResolution,
+      resolved_target: targetResolution,
+      target_context: targetContext,
     })
 
     const normalized = normalizeAiActionResult(action, result)
@@ -180,6 +235,7 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
     const acceptedContent = buildAcceptedInsertContent(normalized.raw, {
       selectedFraction,
       isFullDoc: Boolean(target.isFullDoc),
+      preferRichBlock: containsTableTarget || target.sectionType !== 'Word',
     })
     const inlineHtml = buildInlineSuggestionHtml(normalized)
     const requestId = `actions-${Date.now().toString(36)}`
@@ -206,6 +262,7 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
         suggestedHtml: inlineHtml,
         structuredData: normalized.structured,
         action,
+        targetType: resolvedTargetType,
         isFullDoc: Boolean(target.isFullDoc),
         acceptedContent,
         selectedFraction,
@@ -303,6 +360,10 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
       userPrompt,
       sectionHint,
       targetScope,
+      targetId,
+      targetType,
+      targetLabel,
+      owningSection,
       lineNumber,
       recordId,
       preferFullSection,
@@ -320,6 +381,10 @@ function EditorChatActions({ onRunStart, onRunComplete, onRunError }) {
         userPrompt: userPrompt || '',
         sectionHint: sectionHint || recordId || '',
         targetScope: targetScope || '',
+        targetId: targetId || '',
+        targetType: targetType || '',
+        targetLabel: targetLabel || '',
+        owningSection: owningSection || '',
         lineNumber: lineNumber ?? null,
         recordId: recordId || '',
         preferFullSection: Boolean(preferFullSection),

@@ -251,12 +251,15 @@ def _scope_directive(request: ActionRequest, action: str) -> str:
     if scope == "full_document":
         return f"""EDIT_SCOPE: FULL_DOCUMENT
 - Task: {action_label} the COMPLETE SOP body in TEXT (entire document provided below).
+- Output MUST be a proper complete SOP replacement, not an AI report, commentary, or loose paragraph.
 - Output MUST start at the very beginning of TEXT (title/metadata, section 1 Purpose/Zweck, etc.) and continue through ALL sections in the same order as TEXT.
+- Keep a professional SOP document shape: title/metadata if present, numbered headings, section body text, tables/registers/appendices if present.
+- Preserve table/register layout in plain text form when JSON cannot represent tables; do not collapse tables into a single paragraph.
 - FORBIDDEN: starting at DEVIATIONS, CAPAs, audit/decision registers, or any mid-document traceability block unless that block is literally the first content in TEXT.
 - Use NLP_STRUCTURE_AND_PARAMETERS for document-wide style, domain, roles, sections, compliance refs, risks, and rewrite_improve_parameters.
-- For FULL_DOCUMENT only: add standard backbone sections only when TEXT lacks them: Purpose, Scope, Responsibilities, Procedure, Documentation, Review/Approval.
+- For FULL_DOCUMENT only: if TEXT is incomplete or lacks a normal SOP backbone, create a complete SOP backbone using bracketed placeholders for missing facts: Purpose, Scope, Responsibilities, Definitions, Procedure, Risk/Control Requirements, Records, Training, Deviations/CAPA handling, Review/Approval.
 - Preserve every ID (SOP-*, DEV-*, CAPA-*, AUD-*, DEC-*), register line, deviation/CAPA/audit/decision block, and trailing traceability content.
-- Output can be longer than input only when required to add missing backbone sections for FULL_DOCUMENT scope."""
+- Output may be longer than input when required to produce a complete SOP-shaped rewrite for FULL_DOCUMENT scope."""
 
     from chatbot.assistant.context_intelligence import extract_format_constraints
 
@@ -527,6 +530,13 @@ def _format_nlp_profile_context(
     detected_nlp: dict | None = None,
 ) -> str:
     blocks = []
+    if (profile_md and profile_md.strip()) or profile_json:
+        blocks.append(
+            "### PROFILE PARAMETER CONTRACT:\n"
+            "- profile.md / profile JSON are parameter sheets only: use them for style, terminology, "
+            "structure preferences, modal language, and rewrite rules; never import facts, IDs, dates, "
+            "controls, roles, standards, or requirements from the profile source SOP."
+        )
     if profile_md and profile_md.strip():
         blocks.append(f"### ACTIVE PROFILE RULES (profile.md):\n{profile_md.strip()}")
     if profile_json:
@@ -695,10 +705,15 @@ def build_rewrite_prompt(
     full_backbone = ""
     if scope == "full_document":
         full_backbone = """
-FULL SOP BACKBONE (add when missing from TEXT, in the active SOP/profile language):
+FULL SOP OUTPUT CONTRACT (mandatory for rewrite full SOP):
+  The value of rewritten_text MUST look like a complete SOP document that can replace the editor content.
+  It must not look like a chat answer, audit report, summary, or explanation.
+  If TEXT already has headings, preserve and rewrite all headings and bodies in order.
+  If TEXT is structurally weak or missing backbone sections, create the following SOP backbone in the active SOP/profile language.
+FULL SOP BACKBONE:
   Purpose/Zweck · Scope/Geltungsbereich · Responsibilities/Verantwortlichkeiten · Procedure/Verfahren ·
-  Acceptance Criteria · Documentation/Records · Review/Approval/Lifecycle ·
-  Training (if relevant) · Appendices/Traceability (if records present)
+  Definitions · Risk/Control Requirements · Documentation/Records · Training · Deviations/CAPA handling ·
+  Review/Approval/Lifecycle · Appendices/Traceability (if records present)
 """
     context_extra = _format_nlp_profile_context(profile_md, profile_json, detected_nlp)
     profile_usage = _build_profile_application_block(profile_md, profile_json, action="rewrite")
@@ -716,7 +731,7 @@ FULL SOP BACKBONE (add when missing from TEXT, in the active SOP/profile languag
 {_THREE_C_REWRITE_STANDARD}
 {full_backbone}
 REWRITE RULES:
-- STRICT STRUCTURE LOCK: preserve the current SOP structure exactly as it appears in TEXT. Do not add, remove, rename, merge, split, or reorder headings, subheadings, numbered items, lists, tables, register blocks, or appendices.
+- STRICT STRUCTURE LOCK: preserve the current SOP structure exactly as it appears in TEXT. Do not remove, merge, or reorder headings, subheadings, numbered items, lists, tables, register blocks, or appendices.
 - FACT ANCHOR LOCK: preserve record IDs, dates, system names, thresholds, and register line inventory. You MAY change how requirements, controls, responsibilities, and sensitive procedures are expressed when ACTIVE PROFILE RULES require it.
 - Follow EDIT_SCOPE strictly: SECTION_ONLY → never emit a full SOP; FULL_DOCUMENT → rewrite from the first line of TEXT through the end in document order.
 - Follow Active Profile JSON, profile.md, and detected NLP parameters for terminology, RACI, workflow flow, control language, and rewrite_improve_parameters on **substance and style**.
@@ -724,7 +739,7 @@ REWRITE RULES:
 - Single section/heading (e.g. CAPAs, DEVIATIONS, Procedure): rewrite only lines in TEXT; never swap CAPAs for DEVIATIONS or vice versa.
 - Use bracketed placeholders only for missing controls clearly implied by TEXT or profile rewrite_rules inside that section.
 - Apply rewrite_improve_parameters for tone, formality, numbering, domain vocabulary, **and** procedural/control patterns defined in the profile.
-- FULL_DOCUMENT default behavior: keep the same section set and same order as TEXT. Do not add standard SOP backbone sections unless the user explicitly asks to restructure the SOP.
+- FULL_DOCUMENT behavior: output a complete SOP-shaped document. Keep the same section set and same order when TEXT is already complete; add missing backbone sections with bracketed placeholders when TEXT is incomplete, structurally weak, or the user asks to rewrite the full SOP.
 - Self-check: if output reads like TEXT with minor synonym changes, deepen the rewrite per profile until procedures and controls match the profile's SOP standard.
 
 LANGUAGE & STYLE:

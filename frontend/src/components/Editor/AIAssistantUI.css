@@ -490,3 +490,25 @@
 .ai-inline-diff-added-block.tiptap p:last-child {
   margin-bottom: 0;
 }
+
+.ai-inline-diff-added-block.tiptap table {
+  width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  margin: 4px 0;
+  background: #ffffff;
+}
+
+.ai-inline-diff-added-block.tiptap th,
+.ai-inline-diff-added-block.tiptap td {
+  border: 1px solid #86efac;
+  padding: 8px 10px;
+  text-align: left;
+  vertical-align: top;
+  white-space: normal;
+}
+
+.ai-inline-diff-added-block.tiptap th {
+  background: #dcfce7;
+  font-weight: 600;
+}

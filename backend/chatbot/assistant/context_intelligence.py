@@ -164,6 +164,13 @@ def is_summarize_into_document(
 def message_targets_full_document(message: str) -> bool:
     """User refers to the whole open SOP (edit or read)."""
     msg = str(message or "")
+    # A named "Procedure section" is a section heading target, not shorthand for
+    # "standard operating procedure". Keep full-document routing for explicit
+    # SOP/document wording only.
+    if re.search(r"\b(?:section|abschnitt)\b", msg, re.IGNORECASE):
+        token = extract_section_name_token_from_message(msg)
+        if token:
+            return False
     if _FULL_DOCUMENT_SCOPE_RE.search(msg):
         return True
     if _EDIT_VERB_RE.search(msg) and re.search(
@@ -249,24 +256,61 @@ def default_active_scope() -> dict[str, Any]:
     }
 
 
+FAILED_TURN_STATUSES = frozenset({
+    "error",
+    "failed",
+    "failure",
+    "cancelled",
+    "canceled",
+    "rejected",
+    "invalid",
+    "target_resolution_error",
+})
+
+
+def _is_failed_turn(value: Any) -> bool:
+    """Return true when a response/memory row must not become follow-up scope."""
+    if not isinstance(value, dict):
+        return False
+    status = str(value.get("status") or value.get("state") or "").strip().lower()
+    if status in FAILED_TURN_STATUSES:
+        return True
+    if value.get("is_error") is True or value.get("isError") is True:
+        return True
+    if value.get("ok") is False:
+        return True
+    if value.get("error") or value.get("llm_error") or value.get("failure_stage"):
+        return True
+    code = str(value.get("code") or "").strip().lower()
+    return bool(code and ("error" in code or "failed" in code or "invalid" in code))
+
+
+def _clean_persisted_active_scope(stored: dict[str, Any]) -> dict[str, Any]:
+    active = default_active_scope()
+    if not isinstance(stored, dict) or _is_failed_turn(stored):
+        return active
+    active.update(
+        {
+            "section_id": stored.get("section_id"),
+            "section_label": stored.get("section_label"),
+            "last_action": stored.get("last_action"),
+            "last_result": stored.get("last_result"),
+            "last_result_length": int(stored.get("last_result_length") or 0),
+        }
+    )
+    return active
+
+
 def build_session_from_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Hydrate session state from client payload (TASK 1)."""
     ctx = payload.get("assistant_context") if isinstance(payload.get("assistant_context"), dict) else {}
     stored = ctx.get("active_scope") if isinstance(ctx.get("active_scope"), dict) else {}
     last_action = ctx.get("last_action") if isinstance(ctx.get("last_action"), dict) else {}
 
-    active_scope = default_active_scope()
+    active_scope = _clean_persisted_active_scope(stored)
     if stored:
-        active_scope.update(
-            {
-                "section_id": stored.get("section_id"),
-                "section_label": stored.get("section_label"),
-                "last_action": stored.get("last_action"),
-                "last_result": stored.get("last_result"),
-                "last_result_length": int(stored.get("last_result_length") or 0),
-            }
-        )
-    elif last_action:
+        pass
+    elif last_action and not _is_failed_turn(last_action):
         active_scope.update(
             {
                 "section_id": last_action.get("section_id") or last_action.get("sop_id"),
@@ -342,9 +386,35 @@ def _semantic_roots_for_token(token: str) -> set[str]:
     roots: set[str] = set()
     if root:
         roots.add(root)
+
+    def _edit_distance(left: str, right: str) -> int:
+        if left == right:
+            return 0
+        previous = list(range(len(right) + 1))
+        for i, left_char in enumerate(left, start=1):
+            current = [i]
+            for j, right_char in enumerate(right, start=1):
+                current.append(min(
+                    current[-1] + 1,
+                    previous[j] + 1,
+                    previous[j - 1] + (left_char != right_char),
+                ))
+            previous = current
+        return previous[-1]
+
     for key, aliases in ALIAS_MAP.items():
         pool = {key.lower(), *[str(a).lower() for a in aliases]}
-        if root in pool or any(root and (root in item or item in root) for item in pool):
+        exact_alias = root in pool
+        typo_alias = bool(
+            len(root) >= 5
+            and any(
+                len(item) >= 5
+                and abs(len(root) - len(item)) <= 1
+                and _edit_distance(root, item) <= 1
+                for item in pool
+            )
+        )
+        if exact_alias or typo_alias:
             roots.add(key.lower())
             for alias in aliases:
                 alias_root = _section_root_label(str(alias))
@@ -406,6 +476,13 @@ def extract_section_name_token_from_message(message: str) -> str:
         if not match:
             continue
         token = re.sub(r"\s+", " ", match.group(1).strip(" .:-\"'"))
+        token = re.sub(
+            r"^(?:rewrite|re-?write|improve|revise|summarize|explain|gap\s*check|"
+            r"umschreib\w*|verbesser\w*|zusammenfass\w*)\s+(?:the|den|die|das)?\s*",
+            "",
+            token,
+            flags=re.IGNORECASE,
+        ).strip(" .:-\"'")
         if token and token.lower() not in stop and len(token) >= 2:
             return token
     known = re.search(
@@ -613,6 +690,22 @@ def pick_section_by_user_hint(token: str, sections: list[dict[str, Any]]) -> dic
     if not hint:
         return None
     want_num = _leading_section_number(hint)
+    hint_root = _section_root_label(hint)
+    ranked: list[tuple[int, dict[str, Any]]] = []
+
+    def _distance(left: str, right: str) -> int:
+        previous = list(range(len(right) + 1))
+        for i, left_char in enumerate(left, start=1):
+            current = [i]
+            for j, right_char in enumerate(right, start=1):
+                current.append(min(
+                    current[-1] + 1,
+                    previous[j] + 1,
+                    previous[j - 1] + (left_char != right_char),
+                ))
+            previous = current
+        return previous[-1]
+
     for section in enrich_sections_with_aliases(sections):
         label = str(section.get("label") or section.get("name") or "").strip()
         if not label:
@@ -620,12 +713,38 @@ def pick_section_by_user_hint(token: str, sections: list[dict[str, Any]]) -> dic
         have_num = _leading_section_number(label)
         if want_num and have_num and want_num != have_num:
             continue
-        if _semantic_section_tokens_match(hint, label):
-            return section
-        for alias in section.get("label_aliases") or []:
-            if _semantic_section_tokens_match(hint, str(alias)):
-                return section
-    return None
+        label_root = _section_root_label(label)
+        score = 0
+        if want_num and have_num == want_num:
+            score += 30
+        if hint_root and hint_root == label_root:
+            score += 100
+        elif (
+            len(hint_root) >= 5
+            and len(label_root) >= 5
+            and abs(len(hint_root) - len(label_root)) <= 1
+            and _distance(hint_root, label_root) <= 1
+        ):
+            score += 90
+        else:
+            alias_roots = {
+                _section_root_label(str(alias))
+                for alias in section.get("label_aliases") or []
+                if _section_root_label(str(alias))
+            }
+            if hint_root in alias_roots:
+                score += 75
+            elif _semantic_section_tokens_match(hint, label):
+                score += 50
+        if score:
+            ranked.append((score, section))
+
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    top_score = ranked[0][0]
+    top = [section for score, section in ranked if score == top_score]
+    return top[0] if len(top) == 1 else None
 
 
 def _word_count(text: str) -> int:
@@ -764,6 +883,20 @@ def resolve_scope_from_message(
             }
 
     # TASK 4 — full document scope (rewrite/improve entire SOP or read-only overview)
+    named_section_token = extract_section_name_token_from_message(msg)
+    if named_section_token and re.search(r"\b(?:section|abschnitt)\b", msg, re.IGNORECASE):
+        picked = pick_section_by_user_hint(named_section_token, sections)
+        if picked:
+            label = str(picked.get("label") or picked.get("name") or "").strip()
+            return {
+                "level": "section",
+                "section_id": picked.get("id") or label,
+                "section_label": label,
+                "resolved_from": "SECTION_PHRASE",
+                "target_scope": "section",
+                "prefer_full_section_body": True,
+            }
+
     if message_targets_full_document(msg):
         return {
             "level": "full",
@@ -808,7 +941,7 @@ def resolve_scope_from_message(
                     cand = str(candidate or "").strip()
                     if len(cand) < 2:
                         continue
-                    if hint.lower() in cand.lower() or cand.lower() in hint.lower():
+                    if _semantic_section_tokens_match(hint, cand):
                         return {
                             "level": "section",
                             "section_id": section.get("id") or label,
@@ -2099,9 +2232,10 @@ def analyze_turn_pipeline(
         use_editor_action = True
         section_hint = _section_hint_from_scope(resolved, previous_action)
         target_scope = "full_document" if resolved and resolved.get("level") == "full" else (
+            "selection" if resolved and resolved.get("level") == "selection" else
             "section" if section_hint or (resolved and resolved.get("target_scope") == "section") else "previous_suggestion"
         )
-        if resolved and resolved.get("level") == "line":
+        if resolved and resolved.get("level") in {"line", "selection"}:
             target_scope = "selection"
         early = {
             "flow": "follow_up_action",
@@ -2133,9 +2267,10 @@ def analyze_turn_pipeline(
             resolved = resolve_scope_from_message(msg, sections, has_editor_selection=has_editor_selection)
         section_hint = _section_hint_from_scope(resolved, previous_action)
         target_scope = "full_document" if resolved and resolved.get("level") == "full" else (
+            "selection" if resolved and resolved.get("level") == "selection" else
             "section" if section_hint or (resolved and resolved.get("target_scope") == "section") else "selection"
         )
-        if resolved and resolved.get("level") == "line":
+        if resolved and resolved.get("level") in {"line", "selection"}:
             target_scope = "selection"
         early = {
             "flow": "editor_action",
@@ -2312,9 +2447,12 @@ def apply_prep_to_classification(
             out["section_hint"] = resolved.get("section_label")
         elif resolved.get("resolved_from") == "SESSION_MEMORY" and resolved.get("section_label"):
             out["section_hint"] = resolved.get("section_label")
-        if resolved.get("level") == "line":
+        if resolved.get("level") in {"line", "selection"}:
             out["target_scope"] = "selection"
-            out["line_number"] = resolved.get("line_number")
+            if resolved.get("line_number") is not None:
+                out["line_number"] = resolved.get("line_number")
+            if resolved.get("level") == "selection":
+                out["section_hint"] = None
         if resolved.get("level") == "record":
             out["target_scope"] = "selection"
             out["record_id"] = resolved.get("record_id")
@@ -2368,9 +2506,12 @@ def apply_llm_scope_enrichment(out: dict[str, Any], prep: dict[str, Any]) -> dic
                 merged["section_hint"] = resolved.get("section_label")
             if not merged.get("target_scope") or merged.get("target_scope") == "selection":
                 merged["target_scope"] = resolved.get("target_scope") or "section"
-        elif level == "line":
+        elif level in {"line", "selection"}:
             merged["target_scope"] = "selection"
-            merged["line_number"] = resolved.get("line_number")
+            if resolved.get("line_number") is not None:
+                merged["line_number"] = resolved.get("line_number")
+            if level == "selection":
+                merged["section_hint"] = None
         if resolved.get("record_id"):
             merged["record_id"] = resolved.get("record_id")
 
@@ -2582,12 +2723,15 @@ def persist_session_after_response(
     """TASK 1 — update session after each turn."""
     active = dict(session.get("active_scope") or default_active_scope())
     scope_before = session.get("scope_before_full_doc") or active.copy()
+    response_failed = _is_failed_turn(response)
 
-    if preserve_scope and response.get("flow") == "chat" and response.get("target_scope") == "full_document":
+    if response_failed:
+        active = dict(scope_before)
+    elif preserve_scope and response.get("flow") == "chat" and response.get("target_scope") == "full_document":
         active = dict(scope_before)
     else:
         updated = response.get("updated_active_scope")
-        if isinstance(updated, dict):
+        if isinstance(updated, dict) and not _is_failed_turn(updated):
             active.update(updated)
         elif response.get("flow") in {"editor_action", "follow_up_action"}:
             active["last_action"] = response.get("action")
@@ -2616,15 +2760,16 @@ def persist_session_after_response(
     conversation_history = list(session.get("conversation_history") or [])
     if user_message:
         conversation_history.append({"role": "user", "content": user_message[:2400]})
-        instruction_memory.append(
-            {
-                "role": "user",
-                "content": user_message[:400],
-                "action": response.get("action"),
-                "section": active.get("section_label"),
-                "target_scope": response.get("target_scope") or active.get("target_scope"),
-            }
-        )
+        if not response_failed:
+            instruction_memory.append(
+                {
+                    "role": "user",
+                    "content": user_message[:400],
+                    "action": response.get("action"),
+                    "section": active.get("section_label"),
+                    "target_scope": response.get("target_scope") or active.get("target_scope"),
+                }
+            )
     assistant_summary = response.get("assistant_message") or response.get("reasoning") or ""
     if assistant_summary:
         conversation_history.append(
@@ -2663,7 +2808,11 @@ def derive_sidebar_intent(out: dict[str, Any], *, has_active_sop: bool) -> str:
     return "sop_query"
 
 
-def build_target_resolution(out: dict[str, Any]) -> dict[str, Any]:
+def build_target_resolution(
+    out: dict[str, Any],
+    *,
+    prep: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Explicit editor target hints — client only maps positions in TipTap."""
     resolved = out.get("resolved_scope") if isinstance(out.get("resolved_scope"), dict) else {}
     section_hint = str(out.get("section_hint") or resolved.get("section_label") or "").strip() or None
@@ -2678,13 +2827,113 @@ def build_target_resolution(out: dict[str, Any]) -> dict[str, Any]:
         or "full_section_body" in str(constraints.get("detail_level") or "").lower()
         or bool(resolved.get("prefer_full_section_body"))
     )
+    target_id = None
+    target_type = None
+    target_label = None
+    owning_section = None
+    assistant_context = (prep or {}).get("assistant_context") if isinstance((prep or {}).get("assistant_context"), dict) else {}
+    contract = assistant_context.get("editor_context_contract") if isinstance(assistant_context.get("editor_context_contract"), dict) else {}
+    targets = contract.get("targets") if isinstance(contract.get("targets"), dict) else {}
+
+    def _target_norm(value: object) -> str:
+        text = re.sub(r"\s+", " ", str(value or "").strip()).lower()
+        return re.sub(r"^\d+(?:\.\d+)*[.)\]:-]?\s*", "", text).strip()
+
+    if target_scope == "full_document":
+        target_id, target_type, target_label = "doc_root", "full_document", "Current SOP"
+    elif line_number and (level == "line" or target_scope in {"paragraph", "sentence", "line", "selection"}):
+        paragraph_rows = targets.get("paragraphs") if isinstance(targets.get("paragraphs"), list) else []
+        try:
+            requested_order = int(line_number)
+        except (TypeError, ValueError):
+            requested_order = 0
+        indexed = [
+            row for row in paragraph_rows
+            if isinstance(row, dict) and int(row.get("order") or 0) == requested_order
+        ]
+        if len(indexed) == 1:
+            row = indexed[0]
+            target_id = str(row.get("id") or "").strip() or None
+            target_type = "paragraph"
+            target_label = str(row.get("label") or f"P{line_number}").strip()
+            owning_section = str(row.get("owning_section") or "").strip() or None
+    elif target_scope == "selection":
+        target_id, target_type, target_label = "selection", "selection", "Selected text"
+    elif section_hint:
+        requested = _target_norm(section_hint)
+        groups = []
+        if target_scope in {"table", "table_section"}:
+            groups = [("table", targets.get("tables"))]
+        elif target_scope in {"paragraph", "sentence", "line"}:
+            groups = [("paragraph", targets.get("paragraphs"))]
+        else:
+            groups = [("section", targets.get("sections"))]
+        matches: list[tuple[str, dict[str, Any]]] = []
+        for kind, rows in groups:
+            for row in rows if isinstance(rows, list) else []:
+                if not isinstance(row, dict) or not str(row.get("id") or "").strip():
+                    continue
+                label_norm = _target_norm(row.get("label"))
+                if requested and label_norm and requested == label_norm:
+                    matches.append((kind, row))
+        exact = [(kind, row) for kind, row in matches if _target_norm(row.get("label")) == requested]
+        chosen = exact[0] if len(exact) == 1 else (matches[0] if len(matches) == 1 else None)
+        if chosen:
+            target_type, row = chosen
+            target_id = str(row.get("id") or "").strip() or None
+            target_label = str(row.get("label") or section_hint).strip() or None
+            owning_section = str(row.get("owning_section") or "").strip() or None
     return {
         "target_scope": target_scope,
         "section_hint": section_hint,
+        "target_id": target_id,
+        "target_type": target_type,
+        "target_label": target_label,
+        "owning_section": owning_section,
         "line_number": line_number,
         "record_id": record_id,
         "prefer_full_section": prefer_full_section,
         "resolved_from": resolved.get("resolved_from"),
+    }
+
+
+def build_orchestrator_metadata(out: dict[str, Any], *, has_active_sop: bool) -> dict[str, Any]:
+    """Auditable contract for what the sidebar orchestrator understood."""
+    constraints = out.get("constraints") if isinstance(out.get("constraints"), dict) else {}
+    target_resolution = out.get("target_resolution") if isinstance(out.get("target_resolution"), dict) else build_target_resolution(out)
+    action = str(out.get("action") or "").strip().lower() or None
+    sidebar_intent = str(out.get("sidebar_intent") or derive_sidebar_intent(out, has_active_sop=has_active_sop))
+    rag_used = bool(out.get("run_query")) or sidebar_intent in {"rag", "sop_query"}
+    return {
+        "primary_action": action or out.get("chat_submode") or sidebar_intent,
+        "target_scope": target_resolution.get("target_scope"),
+        "target_hint": out.get("section_hint") or target_resolution.get("section_hint"),
+        "resolved_section": target_resolution.get("section_hint"),
+        "resolved_range": None,
+        "length_constraint": {
+            "type": "lines" if constraints.get("line_count") else constraints.get("length"),
+            "value": constraints.get("line_count") or constraints.get("word_count"),
+        },
+        "style_constraint": {
+            "profile_reference": out.get("editorial_profile_reference"),
+            "style_only": bool(out.get("editorial_profile_reference") and action in {"rewrite", "improve"}),
+        },
+        "rag": {
+            "used": rag_used,
+            "chunk_count": None,
+            "citations": [],
+        },
+        "agent_mode": "llm_orchestrator" if use_llm_orchestrator() else "deterministic_fallback",
+        "subagent_used": (
+            "rewrite_improve_agent" if action in {"rewrite", "improve"}
+            else "compliance_agent" if action == "gap_check"
+            else "rag_evidence_agent" if rag_used
+            else "sop_orchestrator"
+        ),
+        "requires_approval": bool(out.get("requires_confirmation") or out.get("run_editor_action")),
+        "run_editor_action": bool(out.get("run_editor_action")),
+        "run_query": bool(out.get("run_query")),
+        "resolved_from": target_resolution.get("resolved_from"),
     }
 
 
@@ -2881,7 +3130,8 @@ def attach_sidebar_routing(
     out["run_editor_action"] = run_editor
     out["run_query"] = run_query
     out["enriched_instruction"] = build_enriched_instruction(user_message, out, prep=prep)
-    out["target_resolution"] = build_target_resolution(out)
+    out["target_resolution"] = build_target_resolution(out, prep=prep)
+    out["orchestrator_metadata"] = build_orchestrator_metadata(out, has_active_sop=has_active_sop)
     return out
 
 

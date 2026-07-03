@@ -43,10 +43,29 @@ from app.models import SOP, Deviation, Capa, AuditFinding, Decision
 load_dotenv(Path(__file__).resolve().parents[2] / ".env", override=False)
 
 
-MAX_QUERY_CHARS = int(os.getenv("RAG_MAX_QUERY_CHARS", "3000"))
-MAX_CONTEXT_CHARS = int(os.getenv("RAG_MAX_CONTEXT_CHARS", "8000"))
-MAX_HISTORY_MESSAGE_CHARS = int(os.getenv("RAG_MAX_HISTORY_MESSAGE_CHARS", "600"))
-MAX_HISTORY_MESSAGES = int(os.getenv("RAG_MAX_HISTORY_MESSAGES", "6"))
+def _env_int(name: str, default: int, *, min_value: int = 1, max_value: int | None = None) -> int:
+    try:
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    value = max(min_value, value)
+    if max_value is not None:
+        value = min(max_value, value)
+    return value
+
+
+def _rag_context_char_cap() -> int:
+    model_context_tokens = _env_int("ACTION_MODEL_CONTEXT_TOKENS", 4096, min_value=2048)
+    # Leave room for system prompt, chat history, question, citations, and completion.
+    derived_cap = max(1200, min(8000, int(model_context_tokens * 0.42)))
+    configured = _env_int("RAG_MAX_CONTEXT_CHARS", derived_cap, min_value=800)
+    return min(configured, derived_cap)
+
+
+MAX_QUERY_CHARS = _env_int("RAG_MAX_QUERY_CHARS", 1200, min_value=300, max_value=3000)
+MAX_CONTEXT_CHARS = _rag_context_char_cap()
+MAX_HISTORY_MESSAGE_CHARS = _env_int("RAG_MAX_HISTORY_MESSAGE_CHARS", 300, min_value=100, max_value=800)
+MAX_HISTORY_MESSAGES = _env_int("RAG_MAX_HISTORY_MESSAGES", 4, min_value=0, max_value=8)
 RAG_DEBUG_RETRIEVAL = os.getenv("RAG_DEBUG_RETRIEVAL", "false").strip().lower() == "true"
 RAG_DEBUG_MAX_CHUNKS = int(os.getenv("RAG_DEBUG_MAX_CHUNKS", "8"))
 logger = logging.getLogger(__name__)

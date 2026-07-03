@@ -1,5 +1,5 @@
 import { extractText } from '../api/editorApi'
-import { mapBlocksToTipTapDoc } from './editorUtils'
+import { isEditorContentEmpty, mapBlocksToTipTapDoc } from './editorUtils'
 import { formatOCRText } from './formatOCRText'
 import { mapOCRBlocksToHTML } from './mapOCRBlocksToHTML'
 import { DEFAULT_SOP_VERSION_METADATA } from './sopConstants'
@@ -33,6 +33,20 @@ export function validateSOPImportContent(importResult, message = 'No text conten
   }
 }
 
+function buildImportDocJson(importResult) {
+  const docJson = mapBlocksToTipTapDoc(importResult?.blocks, importResult?.text)
+  if (!isEditorContentEmpty(docJson)) {
+    return docJson
+  }
+
+  const fallbackDocJson = mapBlocksToTipTapDoc([], importResult?.text)
+  if (!isEditorContentEmpty(fallbackDocJson)) {
+    return fallbackDocJson
+  }
+
+  throw new Error('No editor-readable content extracted from file.')
+}
+
 export function normalizeSOPImportMetadata(rawMetadata) {
   if (!rawMetadata || typeof rawMetadata !== 'object') return {}
   const source =
@@ -56,6 +70,11 @@ export function normalizeSOPImportMetadata(rawMetadata) {
     sop_version: 'sopVersion',
     sop_status: 'sopStatus',
     status: 'sopStatus',
+    client_id: 'clientId',
+    client: 'clientName',
+    client_name: 'clientName',
+    document_family: 'documentFamily',
+    family: 'documentFamily',
     effective_date: 'effectiveDate',
     date: 'effectiveDate',
     review_date: 'reviewDate',
@@ -113,9 +132,12 @@ export function applySOPImportMetadata(previousMetadata, importedMetadata = {}) 
   const managedFields = [
     'documentId',
     'title',
+    'clientId',
+    'clientName',
     'department',
     'docType',
     'category',
+    'documentFamily',
     'sopVersion',
     'effectiveDate',
     'reviewDate',
@@ -154,6 +176,7 @@ export function applySOPImportMetadata(previousMetadata, importedMetadata = {}) 
   next.title = normalizeSOPTitleForDisplay(next.title, next.documentId)
 
   if (!next.docType) next.docType = 'SOP'
+  if (!next.documentFamily) next.documentFamily = next.docType || 'SOP'
   return next
 }
 
@@ -177,7 +200,7 @@ export function prepareSOPMetadataJson(importedMetadata = {}, overrides = {}) {
 export async function prepareEditorSOPImport(file) {
   const importResult = await extractSOPImport(file)
   validateSOPImportContent(importResult, 'No text content found in uploaded file.')
-  const docJson = mapBlocksToTipTapDoc(importResult.blocks, importResult.text)
+  const docJson = buildImportDocJson(importResult)
   const html = importResult.blocks.length
     ? mapOCRBlocksToHTML(importResult.blocks, 'sop')
     : formatOCRText(importResult.text)
@@ -203,7 +226,7 @@ export async function prepareNewSOPImport(file) {
     importResult.metadata.title || '',
     importResult.metadata.documentId || '',
   ) || fallbackTitle
-  const docJson = mapBlocksToTipTapDoc(importResult.blocks, importResult.text)
+  const docJson = buildImportDocJson(importResult)
 
   return {
     ...importResult,

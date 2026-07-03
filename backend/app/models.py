@@ -142,6 +142,10 @@ class SOP(Base):
     sop_number = Column(String(100), nullable=False, unique=True)
     title = Column(String(255), nullable=False)
     department = Column(String(100), nullable=True)
+    client_id = Column(String(120), nullable=True, index=True)
+    client_name = Column(String(255), nullable=True, index=True)
+    category = Column(String(120), nullable=True, index=True)
+    document_family = Column(String(160), nullable=True, index=True)
     source_system = Column(String(100), nullable=True)
     is_active = Column(Boolean, default=True)
     
@@ -388,6 +392,27 @@ class KnowledgeChunk(Base):
     chunk_order = Column(Integer, nullable=False)
     metadata_json = Column(JSONB, nullable=True)
     created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+
+
+class SOPGenerationTemplate(Base):
+    __tablename__ = "sop_generation_templates"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False, index=True)
+    client_name = Column(String(255), nullable=False, default="Client", index=True)
+    name = Column(String(255), nullable=False)
+    source_sop_ids = Column(JSONB, nullable=False, default=list)
+    learned_structure_json = Column(JSONB, nullable=True)
+    style_profile_json = Column(JSONB, nullable=True)
+    terminology_json = Column(JSONB, nullable=True)
+    compliance_patterns_json = Column(JSONB, nullable=True)
+    source_traceability_json = Column(JSONB, nullable=True)
+    comparison_summary_json = Column(JSONB, nullable=True)
+    generated_draft_sop_ids = Column(JSONB, nullable=False, default=list)
+    created_by = Column(UUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL"), nullable=True)
+    created_at = Column(TIMESTAMP, server_default=func.now(), nullable=False)
+    updated_at = Column(TIMESTAMP, server_default=func.now(), onupdate=func.now(), nullable=False)
+
 
 class LifecycleConfig(Base):
     __tablename__ = "lifecycle_configs"

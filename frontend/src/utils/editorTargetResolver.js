@@ -40,6 +40,7 @@ const FULL_SOP_GAP_PATTERNS = [
 const DOC_ID_PATTERN = /\b([A-Z]{2,}(?:-[A-Z0-9]+)+)\b/g
 
 const RECORD_ENTRY_RE = /^\s*(?:DEV|CAPA|AUD|DEC)-[A-Z0-9]+-\d+/i
+const TABLE_OF_CONTENTS_HEADING_RE = /^(?:table\s+of\s+contents|contents|inhaltsverzeichnis)$/i
 
 const GAP_LABEL_PATTERNS = [
   /what\s+(?:is|are)\s+the\s+gaps?\s+(?:in|for)\s+(.+?)(?:\s+section)?\s*$/i,
@@ -75,10 +76,12 @@ function normalizeForMatch(value) {
 }
 
 const SECTION_ALIAS_MAP = {
+  abbreviations: ['abbreviations', 'abbreviation', 'abbrev', 'acronyms', 'abkuerzungen', 'abkuerzung'],
   purpose: ['purpose', 'zweck', 'ziel', 'aim', 'objective', 'sweck', 'zwect', 'zwek'],
   scope: ['scope', 'geltungsbereich', 'anwendungsbereich', 'bereich'],
   responsibilities: ['responsibilities', 'responsibility', 'verantwortlichkeiten', 'verantwortung', 'roles'],
   definitions: ['definitions', 'definitionen', 'begriffe', 'abkuerzungen', 'abkürzungen'],
+  definitions: ['definitions', 'definition', 'definitionen', 'begriffe', 'terms', 'term'],
   procedure: ['procedure', 'verfahren', 'prozess', 'process', 'steps', 'vorgehen'],
   deviations: ['deviations', 'deviation', 'abweichungen', 'abweichung', 'dev'],
   capas: ['capas', 'capa', 'cap', 'caps', 'corrective actions', 'corrective and preventive actions', 'korrekturmaßnahmen', 'korrekturmassnahmen'],
@@ -101,13 +104,19 @@ function aliasCandidates(label) {
 }
 
 function cleanLabel(raw) {
-  return String(raw || '')
+  const original = String(raw || '').trim()
+  const isTableSectionRequest = /^\s*(?:table|tabelle)\b/i.test(original) && /\bsections?\s*$/i.test(original)
+  const quoted = original.match(/["']([^"']{2,160})["']/)
+  const base = quoted?.[1] || original
+  return base
     .trim()
     .replace(/^["']+|["']+$/g, '')
     .replace(/^(?:ok(?:ay)?|now|then|please)\s+/i, '')
+    .replace(/\s+(?:in|using|with|for)\s+(?:the\s+)?(?:current\s+)?(?:sop|document|style)[\s\S]*$/i, '')
     .replace(/\s+sections?\s+only\s*$/i, '')
     .replace(/\s+only\s*$/i, '')
-    .replace(/\s*sections?\s*$/i, '')
+    .replace(/\s+(?:sections?\s+)?tables?\s*$/i, '')
+    .replace(isTableSectionRequest ? /\s*$/ : /\s*sections?\s*$/i, '')
     .replace(/\bfull\s+sop\b/gi, '')
     .replace(/[.!?]+$/, '')
     .trim()
@@ -131,6 +140,9 @@ function buildLabelCandidates(label) {
 
   const noParen = norm.replace(/\s*\([^)]*\)\s*/g, ' ').replace(/\s+/g, ' ').trim()
   if (noParen && !isGenericLabelToken(noParen)) candidates.add(noParen)
+
+  const withoutTrailingSection = norm.replace(/\s+sections?$/i, '').trim()
+  if (withoutTrailingSection && !isGenericLabelToken(withoutTrailingSection)) candidates.add(withoutTrailingSection)
 
   const kind = getTraceabilitySectionKind(cleaned)
   if (kind) candidates.add(kind)
@@ -232,6 +244,11 @@ function extractLabelsFromPrompt(promptText) {
 
   const firstLine = text.split(/\r?\n/)[0]?.trim() || text
 
+  const tableSection = firstLine.match(
+    /\b(?:rewrite|improve|rephrase|umschreiben|verbessern?|summarize|formalize|shorten|expand)\s+(?:this\s+)?(?:the\s+)?((?:table|tabelle)\s+\d+[\s\S]+?\s+sections?)\s*$/i,
+  )
+  if (tableSection?.[1]) labels.push(cleanLabel(tableSection[1]))
+
   for (const pattern of SECTION_LABEL_PATTERNS) {
     const match = firstLine.match(pattern)
     if (match?.[1]) labels.push(cleanLabel(match[1]))
@@ -285,7 +302,8 @@ const EMBEDDED_TRACEABILITY_MARKER_RE =
   /(?:[\u{1F534}\u{1F7E0}\u{1F7E1}\u{1F7E2}\u{1F535}\u{1F7E3}]\s*)?(?:DEVIATIONS?|ABWEICHUNGEN?|CAPAS?|AUDIT(?:\s+FINDINGS?)?|AUDITS?|DECISIONS?|ENTSCHEIDUNGEN?)\b(?:\s*\([^)]*SOP-[^)]+\))?/giu
 
 function isTraceabilitySectionTitle(text) {
-  return isTraceabilitySectionHeading(text)
+  const t = String(text || '').trim()
+  return Boolean(t && t.length < 160 && !/[.!?]$/u.test(t) && isTraceabilitySectionHeading(t))
 }
 
 function traceabilityKindForBlock(block) {
@@ -316,14 +334,31 @@ function numberedHeadingLevel(text) {
   return match[1].split('.').filter(Boolean).length
 }
 
+function isTableOfContentsHeading(text) {
+  return TABLE_OF_CONTENTS_HEADING_RE.test(normalizeForMatch(text))
+}
+
+function isLikelyTocEntry(text) {
+  const t = String(text || '').trim()
+  if (!t || t.length > 180) return false
+  if (!/^\d+(?:\.\d+)*[.)]?\s+\S/u.test(t)) return false
+  if (!/\s\d{1,4}\s*$/u.test(t)) return false
+  if (/[.!?]\s*$/u.test(t)) return false
+  const withoutPage = t.replace(/\s+\d{1,4}\s*$/u, '').trim()
+  if (withoutPage === t || withoutPage.length < 4) return false
+  return /^\d+(?:\.\d+)*[.)]?\s+\S/u.test(withoutPage)
+}
+
 function isSemanticSectionHeading(text) {
   const t = String(text || '').trim()
   if (!t || isRecordEntryLine(t) || REGISTER_FIELD_LINE_RE.test(t)) return false
+  if (isTableOfContentsHeading(t) || isLikelyTocEntry(t)) return false
   if (isTraceabilitySectionTitle(t)) return true
   if (numberedHeadingLevel(t) != null && t.length < 160) return true
   const norm = normalizeForMatch(t)
-  const knownSection = /\b(purpose|zweck|scope|geltungsbereich|responsibilities|verantwortlichkeiten|procedure|verfahren|definitions|definitionen|approval|records)\b/i.test(norm)
-  if (knownSection && t.length < 120) return true
+  const wordCount = norm.split(/\s+/).filter(Boolean).length
+  const knownSection = /\b(purpose|zweck|scope|geltungsbereich|responsibilities|verantwortlichkeiten|procedure|verfahren|process|definitions|definitionen|abbreviations|approval|records|training|deviation|deviations|capa|capas|review|history|references|appendix|annex)\b/i.test(norm)
+  if (knownSection && wordCount <= 6 && t.length < 120 && !/[.!?]$/u.test(t)) return true
   const isAllCaps = /^[A-ZÄÖÜ0-9\s/&().:-]{4,120}$/u.test(t)
   return isAllCaps && !/[.!?]$/.test(t)
 }
@@ -331,6 +366,7 @@ function isSemanticSectionHeading(text) {
 function isMajorSectionHeader(text, nodeType) {
   const t = String(text || '').trim()
   if (!t || isRecordEntryLine(t)) return false
+  if (nodeType === 'heading' && t.length < 180 && !/[.!?]$/u.test(t)) return true
   return isSemanticSectionHeading(t)
 }
 
@@ -422,17 +458,81 @@ function scoreSectionStartBlock(block, label) {
   return score
 }
 
+function isExactSemanticSectionLabel(label, blockText) {
+  const blockRoot = stripLeadingNumbering(blockText)
+  if (!blockRoot) return false
+  const candidates = new Set(aliasCandidates(label).map((item) => stripLeadingNumbering(item) || item))
+  const singularBlockRoot = blockRoot.replace(/s$/i, '')
+  for (const candidate of candidates) {
+    const candidateRoot = stripLeadingNumbering(candidate) || candidate
+    if (!candidateRoot) continue
+    if (blockRoot === candidateRoot) return true
+    if (candidateRoot.replace(/s$/i, '') === singularBlockRoot) return true
+    if (blockRoot.startsWith(`${candidateRoot} `) || blockRoot.startsWith(`${candidateRoot} &`)) {
+      const suffix = blockRoot.slice(candidateRoot.length).trim()
+      if (/^(?:&|\/|:|-|\(|terms?\b)/i.test(suffix)) return true
+    }
+  }
+  return false
+}
+
+function isTableCaptionText(text) {
+  return /^\s*(?:table|tabelle)\s*\d+[A-Za-z0-9.\-:)]*\b/i.test(String(text || '').trim())
+}
+
+function wantsParentSectionForTableLabel(label) {
+  const raw = String(label || '')
+  return isTableCaptionText(raw) && /\bsections?\b/i.test(raw)
+}
+
+function findOwningHeadingIndex(blocks, startIdx) {
+  for (let i = startIdx - 1; i >= 0; i -= 1) {
+    const block = blocks[i]
+    if (block.isTocBlock || !block.isSectionHeader) continue
+    if (isTableCaptionText(block.text)) continue
+    return i
+  }
+  return startIdx
+}
+
+function nextTableBlockIndex(blocks, startIdx) {
+  for (let i = startIdx + 1; i < blocks.length; i += 1) {
+    const block = blocks[i]
+    if (block.isTocBlock) continue
+    if (block.isTableBlock) return i
+    if (block.isSectionHeader && !isTableCaptionText(block.text)) return -1
+  }
+  return -1
+}
+
+function buildTableCaptionTargetFromBlocks(doc, blocks, startIdx, label = '') {
+  const tableIdx = nextTableBlockIndex(blocks, startIdx)
+  if (tableIdx < 0) return buildSectionTargetFromBlocks(doc, blocks, startIdx, { label })
+  const from = blocks[startIdx].start
+  const to = sectionRangeEndForBlock(blocks, tableIdx)
+  const text = doc.textBetween(from, to, '\n').trim()
+  if (!text) return null
+  return {
+    from,
+    to,
+    text,
+    isFullDoc: false,
+    sectionName: blocks[startIdx].text.slice(0, 160),
+    sectionType: 'Table',
+    confidence: 0.9,
+  }
+}
+
 function getHeadingLevel(node, text = '') {
   if (!node) return null
   const level = Number(node.attrs?.level)
   if (node.type?.name === 'heading') {
-    if (!isSemanticSectionHeading(text)) return null
     return Number.isFinite(level) && level >= 1 && level <= 6 ? level : numberedHeadingLevel(text) || 2
   }
   return numberedHeadingLevel(text)
 }
 
-function splitEmbeddedSectionBlocks({ node, pos, text, headingLevel, isSectionHeader, isRecordEntry }) {
+function splitEmbeddedSectionBlocks({ node, pos, text, headingLevel, isSectionHeader, isRecordEntry, isTocBlock = false, isTableBlock = false }) {
   const baseStart = pos + 1
   const matches = []
   EMBEDDED_TRACEABILITY_MARKER_RE.lastIndex = 0
@@ -442,9 +542,11 @@ function splitEmbeddedSectionBlocks({ node, pos, text, headingLevel, isSectionHe
     const marker = match[0] || ''
     const kind = getTraceabilitySectionKind(marker)
     const after = text.slice(index + marker.length, index + marker.length + 24)
+    const hasVisualMarker = /[\u{1F534}\u{1F7E0}\u{1F7E1}\u{1F7E2}\u{1F535}\u{1F7E3}]/u.test(marker)
+    const isStandaloneLineMarker = index === 0 || marker === marker.toUpperCase()
     const isRecordIdPrefix = /^[\s-]*[A-Z]{2,}-[A-Z0-9]+-\d+/i.test(after)
     const atBoundary = isEmbeddedMarkerAtBoundary(text, index)
-    if (kind && atBoundary && !isRecordIdPrefix) matches.push({ index, kind })
+    if (kind && atBoundary && !isRecordIdPrefix && (hasVisualMarker || isStandaloneLineMarker)) matches.push({ index, kind })
     match = EMBEDDED_TRACEABILITY_MARKER_RE.exec(text)
   }
   EMBEDDED_TRACEABILITY_MARKER_RE.lastIndex = 0
@@ -459,6 +561,8 @@ function splitEmbeddedSectionBlocks({ node, pos, text, headingLevel, isSectionHe
       headingLevel,
       isSectionHeader,
       isRecordEntry,
+      isTocBlock,
+      isTableBlock,
       embedded: false,
     }]
   }
@@ -476,6 +580,8 @@ function splitEmbeddedSectionBlocks({ node, pos, text, headingLevel, isSectionHe
         headingLevel,
         isSectionHeader,
         isRecordEntry: isRecordEntryLine(prefixText),
+        isTocBlock,
+        isTableBlock,
         embedded: false,
       })
     }
@@ -496,6 +602,8 @@ function splitEmbeddedSectionBlocks({ node, pos, text, headingLevel, isSectionHe
       headingLevel: null,
       isSectionHeader: true,
       isRecordEntry: false,
+      isTocBlock,
+      isTableBlock,
       embedded: true,
       markerIndex: item.index,
       sectionKind: item.kind,
@@ -541,8 +649,20 @@ function extendSectionEndIdx(blocks, startIdx, { label = '', targetKind = null }
     if (block.embedded && block.isSectionHeader && !blockMatchesLabel(block.text, label, block)) {
       break
     }
+    if (isTableCaptionText(block.text)) {
+      endIdx = j
+      continue
+    }
+    if (
+      startHeadingLevel != null
+      && block.isSectionHeader
+      && block.headingLevel == null
+      && !blockMatchesLabel(block.text, label, block)
+    ) {
+      break
+    }
     if (startHeadingLevel != null && block.headingLevel != null) {
-      if (block.headingLevel <= startHeadingLevel && !blockMatchesLabel(block.text, label, block)) {
+      if (endIdx > startIdx || (block.headingLevel <= startHeadingLevel && !blockMatchesLabel(block.text, label, block))) {
         break
       }
     } else if (block.isSectionHeader && !blockMatchesLabel(block.text, label, block)) {
@@ -619,6 +739,7 @@ function buildSectionTargetFromBlocks(doc, blocks, startIdx, { label = '', targe
     isFullDoc: false,
     sectionName: blocks[startIdx].text.slice(0, 160),
     sectionType: getTraceabilitySectionKind(blocks[startIdx].text) ? 'Section' : 'Heading',
+    confidence: targetKind ? 0.92 : 0.82,
   }
 }
 
@@ -637,6 +758,7 @@ function findSectionByTraceabilityKind(doc, kindOrLabel) {
   let bestScore = 0
   for (let i = 0; i < blocks.length; i += 1) {
     const block = blocks[i]
+    if (block.isTocBlock) continue
     if (!isRealTraceabilitySectionStart(block, targetKind)) continue
     let score = scoreSectionStartBlock(block, kindOrLabel) + 90
     if (/\bzugehörig zu\s+SOP-/i.test(block.text)) score += 30
@@ -651,8 +773,27 @@ function findSectionByTraceabilityKind(doc, kindOrLabel) {
 }
 
 function collectBlocks(doc) {
-  const blocks = []
+  const rawBlocks = []
   doc.descendants((node, pos) => {
+    const nodeName = node.type?.name
+    if (nodeName === 'table') {
+      const text = node.textContent.trim()
+      if (!text) return false
+      rawBlocks.push({
+        node,
+        pos,
+        start: pos + 1,
+        end: pos + node.nodeSize - 1,
+        text,
+        headingLevel: null,
+        isSectionHeader: false,
+        isRecordEntry: false,
+        isTocBlock: false,
+        isTableBlock: true,
+      })
+      return false
+    }
+    if (nodeName === 'tableRow' || nodeName === 'tableCell' || nodeName === 'tableHeader') return false
     if (!node.isBlock) return true
     const text = node.textContent.trim()
     if (!text) return true
@@ -666,10 +807,43 @@ function collectBlocks(doc) {
       headingLevel,
       isSectionHeader: isMajorSectionHeader(text, node.type.name),
       isRecordEntry: isRecordEntryLine(text),
+      isTocBlock: false,
     }
-    blocks.push(...splitEmbeddedSectionBlocks(block))
+    rawBlocks.push(block)
     return true
   })
+
+  const blocks = []
+  let insideToc = false
+  for (const block of rawBlocks) {
+    const isTocHeading = isTableOfContentsHeading(block.text)
+    const isTocEntry = isLikelyTocEntry(block.text)
+
+    if (isTocHeading) {
+      insideToc = true
+      blocks.push(...splitEmbeddedSectionBlocks({
+        ...block,
+        headingLevel: null,
+        isSectionHeader: false,
+        isTocBlock: true,
+      }))
+      continue
+    }
+
+    if (insideToc && isTocEntry) {
+      blocks.push(...splitEmbeddedSectionBlocks({
+        ...block,
+        headingLevel: null,
+        isSectionHeader: false,
+        isTocBlock: true,
+      }))
+      continue
+    }
+
+    if (insideToc && !isTocEntry) insideToc = false
+    blocks.push(...splitEmbeddedSectionBlocks(block))
+  }
+
   return blocks
 }
 
@@ -679,19 +853,41 @@ function findSectionByLabelInDoc(doc, label) {
 
   let startIdx = -1
   let bestScore = 0
+  const scored = []
   for (let i = 0; i < blocks.length; i += 1) {
     const block = blocks[i]
+    if (block.isTocBlock) continue
     if (!block.isSectionHeader) continue
     let score = scoreSectionStartBlock(block, label)
     if (block.headingLevel != null) score += 20
     if (block.isSectionHeader && block.headingLevel == null) score += 10
+    if (score >= 35) scored.push({ index: i, score, text: block.text })
     if (score > bestScore) {
       bestScore = score
       startIdx = i
     }
   }
+  const closeMatches = scored
+    .filter((item) => item.score >= bestScore - 8)
+    .filter((item, index, items) => items.findIndex((other) => normalizeForMatch(other.text) === normalizeForMatch(item.text)) === index)
+  if (closeMatches.length > 1) {
+    const exactSemanticMatches = closeMatches.filter((item) => isExactSemanticSectionLabel(label, item.text))
+    if (exactSemanticMatches.length === 1) {
+      startIdx = exactSemanticMatches[0].index
+    } else {
+      const choices = closeMatches.slice(0, 5).map((item) => `"${item.text.slice(0, 80)}"`).join(', ')
+      throw new Error(`Multiple matching sections found for "${label}": ${choices}. Use the exact heading.`)
+    }
+  }
   if (startIdx >= 0 && bestScore >= 35) {
     const startBlock = blocks[startIdx]
+    if (isTableCaptionText(startBlock.text)) {
+      if (wantsParentSectionForTableLabel(label)) {
+        const ownerIdx = findOwningHeadingIndex(blocks, startIdx)
+        return buildSectionTargetFromBlocks(doc, blocks, ownerIdx, { label: blocks[ownerIdx]?.text || label })
+      }
+      return buildTableCaptionTargetFromBlocks(doc, blocks, startIdx, label)
+    }
     const targetKind = getTraceabilitySectionKind(label) || getTraceabilitySectionKind(startBlock.text)
     return buildSectionTargetFromBlocks(doc, blocks, startIdx, { label, targetKind })
   }
@@ -700,6 +896,7 @@ function findSectionByLabelInDoc(doc, label) {
   if (numberedPrefix) {
     for (let i = 0; i < blocks.length; i += 1) {
       const block = blocks[i]
+      if (block.isTocBlock) continue
       if (!block.isSectionHeader) continue
       if (leadingSectionNumber(block.text) !== numberedPrefix) continue
       if (!semanticSectionRootsMatch(label, block.text)) continue
@@ -744,25 +941,39 @@ function resolveSelectionTarget(editor, selection, { preferFullSection = false }
   const text = doc.textBetween(from, to, '\n').trim()
   if (!text) return null
 
-  const shouldExpand =
-    preferFullSection
-    || isSemanticSectionHeading(text)
-    || isTraceabilitySectionTitle(text)
-    || (text.length < 180 && getTraceabilitySectionKind(text))
+  const shouldExpand = preferFullSection
+
+  const withTableAwareness = (target) => {
+    if (!target) return target
+    let containsTable = false
+    doc.descendants?.((node, pos) => {
+      if (node.type?.name !== 'table') return !containsTable
+      const tableFrom = pos
+      const tableTo = pos + (node.nodeSize || 0)
+      if (target.from < tableTo && tableFrom < target.to) containsTable = true
+      return !containsTable
+    })
+    return {
+      ...target,
+      contains_table: containsTable,
+      sectionType: containsTable ? 'Table Section' : target.sectionType,
+      resolved_target_type: containsTable ? 'table_section' : (target.resolved_target_type || 'selection'),
+    }
+  }
 
   if (shouldExpand) {
     const expanded = expandSelectionToSection(doc, { from, to, text })
-    if (expanded) return expanded
+    if (expanded) return withTableAwareness(expanded)
   }
 
-  return {
+  return withTableAwareness({
     from,
     to,
     text,
     isFullDoc: false,
     sectionName: inferSectionName(editor, from),
-    sectionType: 'Paragraph',
-  }
+    sectionType: /\s/.test(text) ? 'Paragraph' : 'Word',
+  })
 }
 
 function resolveFullDocument(doc) {
@@ -850,6 +1061,7 @@ function resolveNumberedSemanticSection(doc, label) {
   const blocks = collectBlocks(doc)
   for (let i = 0; i < blocks.length; i += 1) {
     const block = blocks[i]
+    if (block.isTocBlock) continue
     if (!block.isSectionHeader) continue
     if (leadingSectionNumber(block.text) !== wantNum) continue
     if (!semanticSectionRootsMatch(label, block.text)) continue
@@ -863,7 +1075,7 @@ export function collectSectionRanges(doc) {
   const blocks = collectBlocks(doc)
   const starts = blocks
     .map((block, index) => ({ ...block, index }))
-    .filter((block) => block.isSectionHeader)
+    .filter((block) => block.isSectionHeader && !block.isTocBlock)
 
   return starts.map((start, position) => {
     const next = starts[position + 1]
@@ -871,7 +1083,13 @@ export function collectSectionRanges(doc) {
     const from = start.start
     const to = endBlock.embedded ? endBlock.end : endBlock.pos + endBlock.node.nodeSize
     const text = doc.textBetween(from, to, '\n').trim()
+    const nodeAttrs = start.node?.attrs || {}
+    const nodeId = String(nodeAttrs.id || nodeAttrs.blockId || nodeAttrs.block_id || nodeAttrs['data-id'] || '').trim()
+    const embeddedSuffix = start.embedded
+      ? `::section:${start.sectionKind || 'embedded'}:${Number(start.markerIndex) || position + 1}`
+      : ''
     return {
+      id: nodeId ? `${nodeId}${embeddedSuffix}` : null,
       from,
       to,
       text,
@@ -885,9 +1103,26 @@ export function collectSectionRanges(doc) {
 export function buildEditorSectionIndex(editor) {
   const doc = editor?.state?.doc || editor
   if (!doc) return []
+  const headingIdsByPos = new Map()
+  doc.descendants?.((node, pos) => {
+    if (node.type?.name === 'heading') {
+      const attrs = node.attrs || {}
+      const id = String(attrs.id || attrs.blockId || attrs.block_id || attrs['data-id'] || '').trim()
+      if (id) headingIdsByPos.set(pos, id)
+    }
+    return true
+  })
+
+  const headingIdNear = (from) => {
+    if (headingIdsByPos.has(from)) return headingIdsByPos.get(from)
+    for (const [pos, id] of headingIdsByPos.entries()) {
+      if (Math.abs(Number(pos) - Number(from)) <= 1) return id
+    }
+    return null
+  }
 
   return collectSectionRanges(doc).map((section, index) => ({
-    id: `section-${index + 1}`,
+    id: section.id || headingIdNear(section.from) || `section-${index + 1}`,
     index,
     title: section.sectionName,
     heading: section.sectionName,
@@ -898,6 +1133,51 @@ export function buildEditorSectionIndex(editor) {
     text: section.text,
     confidence: 1,
   }))
+}
+
+export function buildEditorTableIndex(editor) {
+  const doc = editor?.state?.doc || editor
+  if (!doc) return []
+  const sections = collectSectionRanges(doc)
+  const tables = []
+
+  doc.descendants((node, pos) => {
+    if (node.type?.name !== 'table') return true
+    const from = pos
+    const to = pos + node.nodeSize
+    const text = node.textContent?.trim?.() || ''
+    const owningSection = [...sections]
+      .reverse()
+      .find((section) => section.from <= from && section.to >= to)
+      || [...sections].reverse().find((section) => section.from <= from)
+      || null
+    let rowCount = 0
+    let columnCount = 0
+    node.forEach?.((row) => {
+      rowCount += 1
+      let cells = 0
+      row.forEach?.(() => { cells += 1 })
+      columnCount = Math.max(columnCount, cells)
+    })
+    const previousSection = [...sections].reverse().find((section) => section.from < from)
+    const caption = previousSection && previousSection.to <= from + 2 && isTableCaptionText(previousSection.sectionName)
+      ? previousSection.sectionName
+      : ''
+    tables.push({
+      id: String(node.attrs?.id || node.attrs?.blockId || node.attrs?.block_id || node.attrs?.['data-id'] || '').trim() || `table-${tables.length + 1}`,
+      index: tables.length,
+      caption: caption || `Table ${tables.length + 1}`,
+      owningSection: owningSection?.sectionName || '',
+      from,
+      to,
+      text,
+      rowCount,
+      columnCount,
+    })
+    return false
+  })
+
+  return tables
 }
 
 function resolveOrdinalSectionTarget(doc, promptText) {
@@ -953,9 +1233,11 @@ function resolveSubheadingTarget(doc, subLabel) {
   if (!label) return null
   const blocks = collectBlocks(doc)
   const labelRe = new RegExp(`^\\s*${label.replace(/\./g, '\\.')}(?:[.)\]:-]|\\s+)`, 'i')
+  const normalizedLabel = normalizeForMatch(label)
   let startIdx = -1
   for (let i = 0; i < blocks.length; i += 1) {
-    if (labelRe.test(blocks[i].text) || normalizeForMatch(blocks[i].text).startsWith(normalizeForMatch(label))) {
+    if (blocks[i].isTocBlock) continue
+    if (labelRe.test(blocks[i].text) || (normalizedLabel && normalizeForMatch(blocks[i].text).startsWith(normalizedLabel))) {
       startIdx = i
       break
     }
@@ -966,6 +1248,7 @@ function resolveSubheadingTarget(doc, subLabel) {
   let endIdx = startIdx
   for (let j = startIdx + 1; j < blocks.length; j += 1) {
     const block = blocks[j]
+    if (block.isTocBlock) continue
     const level = numberedHeadingLevel(block.text)
     if (level != null && level <= startLevel) break
     if (block.isSectionHeader && isSemanticSectionHeading(block.text)) break
@@ -1026,6 +1309,9 @@ export function resolveTargetInEditor(editor, {
   selection,
   sectionHint = '',
   targetScope = '',
+  targetType = '',
+  targetLabel = '',
+  owningSection = '',
   lineNumber = null,
   recordId = '',
   preferFullSection: preferFullSectionOpt = false,
@@ -1036,6 +1322,9 @@ export function resolveTargetInEditor(editor, {
   const promptText = String(prompt || '').trim()
   const userText = String(userPrompt || '').trim() || stripAssistantConstraints(promptText)
   const scope = String(targetScope || '').trim().toLowerCase()
+  const semanticTargetType = String(targetType || '').trim().toLowerCase()
+  const semanticTargetLabel = String(targetLabel || '').trim()
+  const semanticOwningSection = String(owningSection || '').trim()
   const hint = String(sectionHint || '').trim()
   const backendScoped = Boolean(scope) || Boolean(hint) || Boolean(recordId) || Number.isFinite(lineNumber)
   const isGapRequest = !backendScoped && (GAP_CHECK_VERB.test(promptText) || GAP_CHECK_VERB.test(userText))
@@ -1044,7 +1333,7 @@ export function resolveTargetInEditor(editor, {
   const sectionIntent = !backendScoped && (wantsSectionScopeIntent(promptText) || wantsSectionScopeIntent(userText))
   const userLabels = extractLabelsFromPrompt(userText)
   const userTraceabilityKind = getTraceabilitySectionKind(userText)
-  let effectiveHint = String(hint || '').trim()
+  let effectiveHint = String(semanticTargetLabel || hint || '').trim()
   const hintKind = getTraceabilitySectionKind(effectiveHint)
   if (userTraceabilityKind && hintKind && userTraceabilityKind !== hintKind) {
     effectiveHint = ''
@@ -1052,10 +1341,16 @@ export function resolveTargetInEditor(editor, {
   const preferFullSection =
     Boolean(preferFullSectionOpt)
     || scope === 'section'
+    || semanticTargetType === 'section'
+    || semanticTargetType === 'table_section'
     || Boolean(effectiveHint || userTraceabilityKind || userLabels.length)
     || sectionIntent
 
   if (scope === 'full_document') {
+    return resolveFullDocument(doc)
+  }
+
+  if (semanticTargetType === 'full_document') {
     return resolveFullDocument(doc)
   }
 
@@ -1072,11 +1367,69 @@ export function resolveTargetInEditor(editor, {
   }
 
   const structuredHints = [
+    semanticTargetType === 'table_section' ? semanticOwningSection : '',
     effectiveHint,
     recordId,
     ...userLabels,
     ...(effectiveHint ? [] : extractLabelsFromPrompt(stripAssistantConstraints(promptText))),
   ].filter(Boolean)
+
+  const explicitNamedTarget =
+    ['section', 'table', 'table_section'].includes(semanticTargetType)
+    || Boolean(effectiveHint || userTraceabilityKind || userLabels.length || hint || recordId)
+  const explicitSelectionReference = /\b(?:selected\s+(?:text|word|paragraph|section|heading|line|content)|selection|highlighted|mark(?:ed)?\s+(?:text|section|heading))\b/i.test(`${userText}\n${promptText}`)
+
+  if (
+    scope === 'selection'
+    && selection
+    && !selection.empty
+    && explicitSelectionReference
+    && !['section', 'table', 'table_section'].includes(semanticTargetType)
+  ) {
+    return resolveSelectionTarget(editor, selection, { preferFullSection: Boolean(preferFullSectionOpt) })
+  }
+
+  if (scope === 'selection' && selection && !selection.empty && !explicitNamedTarget) {
+    return resolveSelectionTarget(editor, selection, { preferFullSection: Boolean(preferFullSectionOpt) })
+  }
+
+  if (semanticTargetType === 'selection' && selection && !selection.empty) {
+    return resolveSelectionTarget(editor, selection, { preferFullSection: false })
+  }
+
+  if (semanticTargetType === 'section' && semanticTargetLabel) {
+    const sectionTarget = findSectionByHints(doc, [semanticTargetLabel, semanticOwningSection].filter(Boolean))
+    if (sectionTarget) {
+      const fullSectionTarget = ensureFullSectionTarget(
+        doc,
+        sectionTarget,
+        [semanticTargetLabel, semanticOwningSection].filter(Boolean),
+      ) || sectionTarget
+      return {
+        ...fullSectionTarget,
+        resolved_target_type: 'section',
+        match_reason: 'llm_section_label',
+      }
+    }
+  }
+
+  if (semanticTargetType === 'table' && semanticTargetLabel) {
+    const tableTarget = findSectionByLabelInDoc(doc, semanticTargetLabel)
+    if (tableTarget) return {
+      ...tableTarget,
+      resolved_target_type: 'table',
+      match_reason: 'llm_table_label',
+    }
+  }
+
+  if (semanticTargetType === 'table_section' && (semanticOwningSection || semanticTargetLabel)) {
+    const section = findSectionByHints(doc, [semanticOwningSection, semanticTargetLabel].filter(Boolean))
+    if (section) return {
+      ...section,
+      resolved_target_type: 'table_section',
+      match_reason: 'llm_table_section',
+    }
+  }
 
   const trySectionByHints = () => {
     if (userTraceabilityKind) {
@@ -1100,8 +1453,8 @@ export function resolveTargetInEditor(editor, {
   const recordTarget = resolveRecordTarget(doc, recordHint)
   if (recordTarget) return finalizeSectionTarget(recordTarget)
 
-  const subMatch = userText.match(/\b(?:section\s+)?(\d+(?:\.\d+)+)(?:[.)\]:-]|\s+)/i)
-    || promptText.match(/\b(?:section\s+)?(\d+(?:\.\d+)+)(?:[.)\]:-]|\s+)/i)
+  const subMatch = userText.match(/\b(?:section\s+)?(\d+(?:\.\d+)+)(?=$|[.)\]:-]|\s)/i)
+    || promptText.match(/\b(?:section\s+)?(\d+(?:\.\d+)+)(?=$|[.)\]:-]|\s)/i)
   if (subMatch) {
     const subTarget = resolveSubheadingTarget(doc, subMatch[1])
     if (subTarget) return finalizeSectionTarget(subTarget)
@@ -1146,7 +1499,7 @@ export function resolveTargetInEditor(editor, {
       && (backendScoped || sectionIntent || isRewriteImprove || isGapRequest)
     )
 
-  if (selection && !selection.empty && !skipSelectionFallback) {
+  if (selection && !selection.empty && !skipSelectionFallback && (!explicitNamedTarget || explicitSelectionReference)) {
     const selected = finalizeSectionTarget(
       resolveSelectionTarget(editor, selection, { preferFullSection }),
     )
@@ -1180,7 +1533,7 @@ export function resolveTargetInEditor(editor, {
       : [...extractLabelsFromPrompt(promptText), ...extractLabelsFromPrompt(userText)]
     const missing = hint || labels[0] || 'that section'
     throw new Error(
-      `Could not find "${missing}" in the open SOP. Use the exact section heading (e.g. Purpose, Scope, Procedure) or select the section in the editor.`,
+      `Could not find that section ("${missing}") in the open SOP. Use the exact section heading (e.g. Purpose, Scope, Procedure) or select the section in the editor.`,
     )
   }
 

@@ -80,6 +80,11 @@ def _compact_items(items: list[dict[str, Any]], limit: int) -> list[dict[str, An
     for index, item in enumerate(items[:limit]):
         if not isinstance(item, dict):
             continue
+        item_id = str(item.get("id") or "").strip()
+        # IDs are issued by the live TipTap document. Never manufacture an ID
+        # in the backend because the editor could not validate or apply it.
+        if not item_id:
+            continue
         label = str(
             item.get("label")
             or item.get("caption")
@@ -90,7 +95,7 @@ def _compact_items(items: list[dict[str, Any]], limit: int) -> list[dict[str, An
         out.append(
             {
                 "index": index,
-                "id": item.get("id") or f"target-{index + 1}",
+                "id": item_id,
                 "label": label,
                 "target_type": item.get("target_type") or item.get("type") or "section",
                 "from": item.get("from"),
@@ -181,15 +186,6 @@ def _normalize_result(
             target_id = str(exact[0].get("id") or "").strip() or None
             confidence = max(confidence, 0.68)
 
-    if len(normalized_candidates) == 1 and confidence >= 0.45:
-        only = normalized_candidates[0]
-        target_type = only["target_type"] if only["target_type"] in ALLOWED_TARGET_TYPES else target_type
-        target_id = only.get("target_id") or target_id
-        parsed["target_label"] = parsed.get("target_label") or only["label"]
-        normalized_candidates = []
-        parsed["requires_clarification"] = False
-        confidence = max(confidence, 0.64)
-
     return {
         "target_type": target_type,
         "target_id": target_id,
@@ -229,11 +225,29 @@ def resolve_sop_target_with_deep_agent(
     selection_payload = selection if isinstance(selection, dict) else {}
     active_scope_payload = active_scope if isinstance(active_scope, dict) else {}
     metadata_payload = sop_metadata if isinstance(sop_metadata, dict) else {}
-    valid_targets = {
-        str(item.get("id")): item
-        for item in [*compact_sections, *compact_tables, *compact_paragraphs, *compact_tree]
-        if item.get("id")
-    }
+    valid_targets: dict[str, dict[str, Any]] = {}
+    for item in [*compact_sections, *compact_tables, *compact_paragraphs, *compact_tree]:
+        item_id = str(item.get("id") or "").strip()
+        if not item_id:
+            continue
+        existing = valid_targets.get(item_id)
+        if existing:
+            existing_signature = (
+                str(existing.get("target_type") or ""),
+                existing.get("from"),
+                existing.get("to"),
+            )
+            incoming_signature = (
+                str(item.get("target_type") or ""),
+                item.get("from"),
+                item.get("to"),
+            )
+            if existing_signature != incoming_signature:
+                raise TargetResolverAgentError(
+                    f"Live editor target ID collision for '{item_id}'. Refresh the editor target map."
+                )
+            continue
+        valid_targets[item_id] = item
     if selection_payload and selection_payload.get("empty") is not True:
         valid_targets.setdefault(
             "selection",
@@ -383,6 +397,7 @@ Do not rewrite or improve content.
 Critical behavior:
 - You must choose target_id from tool results. Never invent target IDs.
 - If no valid candidate ID is available, set requires_clarification=true.
+- Multilingual / Cross-Lingual matching: The user query may be in a different language (e.g., German) than the SOP's sections and headings (e.g., English), or vice-versa. Translate the target concept dynamically to match the live candidate labels (for example, "Geltungsbereich" maps to "Scope", "Änderungsverlauf" or "Dokumentenhistorie" maps to "Document History", etc.).
 - If the user asks for a named table, call list_editor_tables and choose target_type="table" with target_id from the table candidate.
 - "improve the document history table" must target the Document History table, never Scope.
 - If the user asks for a named section, call list_editor_sections and choose target_type="section" with target_id from the section candidate.

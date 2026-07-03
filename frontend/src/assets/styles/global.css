@@ -514,6 +514,25 @@ select {
   color: #253041;
 }
 
+.tiptap.tiptap-sop table.pm-table-selection-active,
+.tiptap.tiptap-sop table.ai-inline-diff-table-target {
+  outline: 2px solid #2563eb;
+  outline-offset: 2px;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.12);
+}
+
+.tiptap.tiptap-sop td.pm-table-selection-active__cell,
+.tiptap.tiptap-sop th.pm-table-selection-active__cell {
+  background: rgba(37, 99, 235, 0.10);
+  border-color: #2563eb;
+}
+
+.tiptap.tiptap-sop td.ai-inline-diff-table-target__cell,
+.tiptap.tiptap-sop th.ai-inline-diff-table-target__cell {
+  background: rgba(254, 226, 226, 0.72);
+  border-color: #dc2626;
+}
+
 .tiptap.tiptap-sop ul {
   list-style: disc;
 }

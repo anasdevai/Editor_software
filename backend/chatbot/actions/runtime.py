@@ -106,16 +106,8 @@ def build_action_runtime(
 
 
 def create_action_runtime() -> ActionRuntime:
-    # 1. Connect to Qdrant and Embedder
-    try:
-        client = QdrantClient(
-            url=os.getenv("QDRANT_URL"),
-            api_key=os.getenv("QDRANT_API_KEY"),
-        )
-        embedder = get_embedder()
-    except Exception as qdrant_exc:
-        # Keep editor actions responsive even when Qdrant is unavailable.
-        print(f"[startup] Qdrant/Embedder missing, using mock runtime: {qdrant_exc}", flush=True)
+    def unavailable_runtime(exc: Exception) -> ActionRuntime:
+        print(f"[startup] Retrieval unavailable, using no-context action runtime: {exc}", flush=True)
         return ActionRuntime(
             client=None,
             embedder=None,
@@ -125,18 +117,25 @@ def create_action_runtime() -> ActionRuntime:
             fallback_llm=_get_action_fallback_llm(),
             collection_name=os.getenv("COLLECTION_SOPS", "docs_sops"),
             retrieval_available=False,
-            retrieval_status=f"unavailable: {type(qdrant_exc).__name__}",
+            retrieval_status=f"unavailable: {type(exc).__name__}",
         )
 
-    # 2. Initialize Reranker with standalone try/except to protect retrieval path
-    reranker = None
+    # Qdrant validates the collection only when QdrantVectorStore is built, so
+    # the fallback boundary must include the complete retrieval construction.
     try:
-        reranker = CrossEncoderReranker(top_n=5)
-    except Exception as reranker_exc:
-        print(
-            f"[startup] Action reranker cache missing, continuing with no-op reranker: {reranker_exc}",
-            flush=True,
+        client = QdrantClient(
+            url=os.getenv("QDRANT_URL"),
+            api_key=os.getenv("QDRANT_API_KEY"),
         )
-        reranker = _NoopReranker()
-
-    return build_action_runtime(client=client, embedder=embedder, reranker=reranker)
+        embedder = get_embedder()
+        try:
+            reranker = CrossEncoderReranker(top_n=5)
+        except Exception as reranker_exc:
+            print(
+                f"[startup] Action reranker cache missing, continuing with no-op reranker: {reranker_exc}",
+                flush=True,
+            )
+            reranker = _NoopReranker()
+        return build_action_runtime(client=client, embedder=embedder, reranker=reranker)
+    except Exception as retrieval_exc:
+        return unavailable_runtime(retrieval_exc)

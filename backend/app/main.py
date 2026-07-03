@@ -31,6 +31,7 @@ from .chat_history_routes import router as chat_history_router
 from .profile_routes import router as profile_router
 from .client_profile_routes import router as client_profile_router
 from .webhook_routes import webhook_router
+from .agent_routes import agent_router
 from .services.semantic_pipeline import SemanticPipelineService
 from .services.webhook_config import validate_webhook_configuration
 
@@ -44,6 +45,9 @@ logger.setLevel(os.getenv("STARTUP_LOG_LEVEL", "INFO").upper())
 
 PERFORMANCE_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_sops_is_active_updated ON sops (is_active, updated_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_sops_client ON sops (client_name, is_active)",
+    "CREATE INDEX IF NOT EXISTS idx_sops_client_category ON sops (client_name, category, is_active)",
+    "CREATE INDEX IF NOT EXISTS idx_sops_client_family ON sops (client_name, document_family, is_active)",
     "CREATE INDEX IF NOT EXISTS idx_sop_versions_sop_created ON sop_versions (sop_id, created_at DESC)",
     "CREATE INDEX IF NOT EXISTS idx_sop_versions_sop_version ON sop_versions (sop_id, version_number)",
     "CREATE INDEX IF NOT EXISTS idx_sop_deviation_links_sop ON sop_deviation_links (sop_id)",
@@ -65,6 +69,14 @@ PERFORMANCE_INDEX_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS idx_sop_detected_parameters_sop ON sop_detected_parameters (sop_id)",
     "CREATE INDEX IF NOT EXISTS idx_profile_history_events_profile ON profile_history_events (client_profile_id)",
     "CREATE INDEX IF NOT EXISTS idx_profile_history_events_created ON profile_history_events (created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS idx_sop_generation_templates_client ON sop_generation_templates (tenant_id, client_name, created_at DESC)",
+)
+
+SCHEMA_COMPAT_ALTER_STATEMENTS = (
+    ("client_id", "VARCHAR(120)"),
+    ("client_name", "VARCHAR(255)"),
+    ("category", "VARCHAR(120)"),
+    ("document_family", "VARCHAR(160)"),
 )
 
 
@@ -79,6 +91,23 @@ def _bootstrap_database_schema() -> None:
     try:
         with engine.begin() as conn:
             conn.execute(text("SELECT 1"))
+            dialect = engine.dialect.name
+            existing_sop_columns: set[str] = set()
+            if dialect == "sqlite":
+                existing_sop_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(sops)")).fetchall()}
+            for column_name, column_type in SCHEMA_COMPAT_ALTER_STATEMENTS:
+                if dialect == "sqlite" and column_name in existing_sop_columns:
+                    continue
+                stmt = (
+                    f"ALTER TABLE sops ADD COLUMN {column_name} {column_type}"
+                    if dialect == "sqlite"
+                    else f"ALTER TABLE sops ADD COLUMN IF NOT EXISTS {column_name} {column_type}"
+                )
+                try:
+                    conn.execute(text(stmt))
+                    existing_sop_columns.add(column_name)
+                except Exception as alter_exc:
+                    logger.debug("[startup-db] schema compat skipped stmt=%s err=%s", stmt, alter_exc)
             for stmt in PERFORMANCE_INDEX_STATEMENTS:
                 conn.execute(text(stmt))
     except Exception as exc:  # pragma: no cover - surfaced in logs
@@ -215,6 +244,7 @@ app.include_router(auth_router)
 app.include_router(profile_router)
 app.include_router(client_profile_router)
 app.include_router(webhook_router)
+app.include_router(agent_router)
 
 
 @app.middleware("http")

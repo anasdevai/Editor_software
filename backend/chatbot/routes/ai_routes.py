@@ -1156,8 +1156,9 @@ def _render_gap_check_analysis_html(analysis: str) -> str:
             while i < len(block_lines) and block_lines[i] != "":
                 para_lines.append(block_lines[i])
                 i += 1
+            para_text = "\n".join(para_lines)
             html_parts.append(
-                f"<p>{escape('\n'.join(para_lines)).replace(chr(10), '<br />')}</p>"
+                f"<p>{escape(para_text).replace(chr(10), '<br />')}</p>"
             )
 
         return "".join(html_parts) if html_parts else render_paragraphs(block_lines)
@@ -1200,21 +1201,101 @@ async def classify_intent(payload: dict):
         raise HTTPException(status_code=422, detail="message is required")
 
     ctx = payload.get("assistant_context") if isinstance(payload.get("assistant_context"), dict) else {}
+    frontend_ctx = payload.get("context") if isinstance(payload.get("context"), dict) else {}
+    if not ctx and frontend_ctx:
+        active_sop = frontend_ctx.get("activeSop") if isinstance(frontend_ctx.get("activeSop"), dict) else {}
+        ctx = {
+            "route": frontend_ctx.get("path") or frontend_ctx.get("route") or "",
+            "current_sop": {
+                "id": active_sop.get("id") or active_sop.get("sopId") or "",
+                "title": active_sop.get("title") or active_sop.get("name") or "",
+                "sop_number": active_sop.get("number") or active_sop.get("documentId") or active_sop.get("id") or "",
+                "current_section": active_sop.get("currentSection") or "",
+            },
+        }
     current_sop = ctx.get("current_sop") if isinstance(ctx.get("current_sop"), dict) else {}
     has_active_sop = bool(payload.get("has_active_sop")) or bool(
         str(ctx.get("active_sop_id") or ctx.get("current_document_id") or current_sop.get("id") or "").strip()
     )
 
-    result = await asyncio.to_thread(
-        classify_assistant_intent,
+    action_match = re.search(
+        r"\b(rewrite|re-?write|umschreiben|neu\s+formulieren|improve|verbessern?|gap\s*check|compliance\s+check|analy[sz]e)\b",
         message,
-        has_active_sop=has_active_sop,
-        has_editor_selection=bool(payload.get("has_editor_selection")),
-        route=str(payload.get("route") or ctx.get("route") or "").strip(),
-        active_sop_title=str(current_sop.get("title") or "").strip(),
-        active_sop_number=str(current_sop.get("sop_number") or current_sop.get("documentId") or "").strip(),
+        re.IGNORECASE,
     )
-    return result.model_dump()
+    if has_active_sop and action_match:
+        action_word = action_match.group(1).lower()
+        action = (
+            "gap_check" if re.search(r"gap|compliance", action_word, re.I)
+            else "analyze" if re.search(r"analy", action_word, re.I)
+            else "improve" if re.search(r"improve|verbesser", action_word, re.I)
+            else "rewrite"
+        )
+        quoted = re.search(r"['\"]([^'\"]{2,160})['\"]", message)
+        section_after_word = re.search(r"\b(?:section|abschnitt)\s+([A-Za-z0-9 _./&()-]{2,120})", message, re.I)
+        section_hint = (quoted.group(1) if quoted else (section_after_word.group(1) if section_after_word else "")).strip(" .:-")
+        if section_hint:
+            section_hint = re.sub(
+                r"\b(im|in|with|using|nach|according|current|aktuellen?)\b[\s\S]*$",
+                "",
+                section_hint,
+                flags=re.I,
+            ).strip(" .:-")
+        return {
+            "flow": "editor_action",
+            "action": action,
+            "target_scope": "section" if section_hint else "current_section",
+            "section_hint": section_hint or None,
+            "target_resolution": {
+                "target_scope": "section" if section_hint else "current_section",
+                "section_hint": section_hint or None,
+                "prefer_full_section": True,
+            },
+            "linked_entity_types": [],
+            "constraints": {},
+            "requires_selection": False,
+            "requires_confirmation": True,
+            "confidence": 0.95 if section_hint else 0.82,
+            "reasoning": "deterministic_editor_action_precheck",
+            "sidebar_intent": "action",
+            "run_editor_action": True,
+            "run_query": False,
+        }
+
+    try:
+        result = await asyncio.wait_for(
+            asyncio.to_thread(
+                classify_assistant_intent,
+                message,
+                has_active_sop=has_active_sop,
+                has_editor_selection=bool(payload.get("has_editor_selection")),
+                route=str(payload.get("route") or ctx.get("route") or "").strip(),
+                active_sop_title=str(current_sop.get("title") or "").strip(),
+                active_sop_number=str(current_sop.get("sop_number") or current_sop.get("documentId") or "").strip(),
+            ),
+            timeout=min(12.0, max(4.0, get_local_llm_timeout_seconds())),
+        )
+        return result.model_dump()
+    except (TimeoutError, asyncio.TimeoutError) as exc:
+        logger.warning("[classify-intent] standalone_timeout fallback=chat error=%s", exc)
+    except Exception as exc:
+        logger.warning("[classify-intent] standalone_failed fallback=chat error=%s", exc)
+
+    return {
+        "flow": "chat",
+        "action": None,
+        "target_scope": None,
+        "section_hint": None,
+        "linked_entity_types": [],
+        "constraints": {},
+        "requires_selection": False,
+        "requires_confirmation": False,
+        "confidence": 0.35,
+        "reasoning": "classifier_fallback_after_error",
+        "sidebar_intent": "query",
+        "run_editor_action": False,
+        "run_query": True,
+    }
 
 
 @ai_router.get("/api/ai/llm-health")

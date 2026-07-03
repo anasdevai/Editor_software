@@ -142,6 +142,20 @@ function defaultGreeting() {
   ]
 }
 
+function toBackendChatHistory(rows = []) {
+  return (Array.isArray(rows) ? rows : [])
+    .filter((msg) => (
+      msg
+      && !msg.isError
+      && !msg._pendingBridge
+      && String(msg.text || '').trim()
+    ))
+    .map((msg) => ({
+      role: msg.role === 'ai' ? 'assistant' : 'user',
+      content: msg.text,
+    }))
+}
+
 function mapSourcesToWidgetTags(sources) {
   if (!Array.isArray(sources)) return []
   return sources.slice(0, 5).map((s, idx) => s?.label || s?.id || `Quelle ${idx + 1}`)
@@ -660,6 +674,10 @@ function AIWidget() {
         userPrompt: targetOpts.userPrompt,
         sectionHint: targetOpts.sectionHint || sectionHint,
         targetScope: targetOpts.targetScope || targetScope,
+        targetId: targetOpts.targetId,
+        targetType: targetOpts.targetType,
+        targetLabel: targetOpts.targetLabel,
+        owningSection: targetOpts.owningSection,
         lineNumber: targetOpts.lineNumber,
         recordId: targetOpts.recordId,
         preferFullSection: targetOpts.preferFullSection,
@@ -719,6 +737,10 @@ function AIWidget() {
       userPrompt: bridgeTarget.userPrompt,
       sectionHint: bridgeTarget.sectionHint || sectionHint,
       targetScope: bridgeTarget.targetScope || targetScope,
+      targetId: bridgeTarget.targetId,
+      targetType: bridgeTarget.targetType,
+      targetLabel: bridgeTarget.targetLabel,
+      owningSection: bridgeTarget.owningSection,
       lineNumber: bridgeTarget.lineNumber,
       recordId: bridgeTarget.recordId,
       preferFullSection: bridgeTarget.preferFullSection,
@@ -756,10 +778,7 @@ function AIWidget() {
         const turn = await prepareSidebarTurn({
           message: trimmed,
           pathname: location.pathname,
-          recentMessages: messagesRef.current.map((msg) => ({
-            role: msg.role === 'ai' ? 'assistant' : 'user',
-            content: msg.text,
-          })),
+          recentMessages: toBackendChatHistory(messagesRef.current),
         })
         setLiveAssistantContext(turn.assistantContext)
 
@@ -828,10 +847,7 @@ function AIWidget() {
       }
 
       const chatHistoryPayload = [
-        ...messagesRef.current.map((msg) => ({
-          role: msg.role === 'ai' ? 'assistant' : 'user',
-          content: msg.text,
-        })),
+        ...toBackendChatHistory(messagesRef.current),
         { role: 'user', content: trimmed },
       ]
       const sid = readSessionIdForPath(location.pathname)

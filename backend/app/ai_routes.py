@@ -4994,7 +4994,24 @@ def _is_bad_editor_target_label(label: object, text_excerpt: object = "", is_tab
 
 def _strip_leading_numbering(text: str) -> str:
     # Remove leading numbering like "4.", "4.1", "4.1.2", "IV.", "A.", etc.
-    return re.sub(r"^\s*(?:[0-9a-zA-Z]+(?:\.[0-9a-zA-Z]+)*|[IVXLCDMivxlcdm]+)[.)\]:-]?\s+", "", text).strip()
+    return re.sub(
+        r"^\s*(?:\d+(?:\.\d+)*(?:[.)\]:-])?|[IVXLCDMivxlcdm]+[.)\]:-]|[A-Za-z][.)\]:-])\s+",
+        "",
+        text,
+    ).strip()
+
+
+def _dedupe_target_label_words(text: str) -> str:
+    """Remove repeated label words caused by flattened parent/child headings."""
+    words = _normalize_target_text(text).split()
+    seen: set[str] = set()
+    compact: list[str] = []
+    for word in words:
+        if word in seen and word not in {"and", "or"}:
+            continue
+        seen.add(word)
+        compact.append(word)
+    return " ".join(compact)
 
 
 def _deterministic_target_analysis(
@@ -5006,6 +5023,7 @@ def _deterministic_target_analysis(
     active_scope: dict[str, Any],
 ) -> dict[str, Any] | None:
     q_norm = _normalize_target_text(user_query)
+    requested_type = _requested_target_type(user_query)
 
     # 1. Full document pre-check (completely multilingual / typo tolerant)
     if re.search(r"\b(full|whole|entire|complete)\s+(sop|document|doc)\b", user_query, re.I) or any(w in q_norm for w in ["ganze", "vollständige", "komplette"]):
@@ -5041,39 +5059,62 @@ def _deterministic_target_analysis(
     candidates = []
 
     # Tables matching
-    for table in tables:
+    for table in tables if requested_type in {None, "table"} else []:
         label = str(table.get("label") or "").strip()
         excerpt = str(table.get("text_excerpt") or "")
         if not label or _is_bad_editor_target_label(label, excerpt, is_table=True):
             continue
-        # Match by table's own label
-        label_norm = _normalize_target_text(_strip_leading_numbering(label))
-        if len(label_norm) >= 4 and label_norm in q_norm:
+        
+        # Match by table's own label (literal match)
+        label_norm = _dedupe_target_label_words(_strip_leading_numbering(label))
+        if not label_norm or len(label_norm) < 3:
+            continue
+            
+        if label_norm == q_norm or re.search(r'\b' + re.escape(label_norm) + r'\b', q_norm):
             candidates.append(("table", table))
             continue
+            
         # Match by table's owning section if query specifies a table
         owning = str(table.get("owning_section") or "").strip()
         if owning:
-            owning_norm = _normalize_target_text(_strip_leading_numbering(owning))
-            table_words = ["table", "tabelle", "tabular", "matrix", "tablwe", "tbale", "tbl", "tabele", "tabell", "tabel"]
-            has_table_word = any(re.search(rf"\b{w}\b", q_norm) for w in table_words)
-            if has_table_word and len(owning_norm) >= 4 and owning_norm in q_norm:
-                candidates.append(("table", table))
+            owning_norm = _dedupe_target_label_words(_strip_leading_numbering(owning))
+            if owning_norm and len(owning_norm) >= 3:
+                table_words = ["table", "tabelle", "tabular", "matrix", "tablwe", "tbale", "tbl", "tabele", "tabell", "tabel"]
+                has_table_word = any(re.search(rf"\b{w}\b", q_norm) for w in table_words)
+                if has_table_word:
+                    if owning_norm == q_norm or re.search(r'\b' + re.escape(owning_norm) + r'\b', q_norm):
+                        candidates.append(("table", table))
 
     # Sections matching
-    for section in sections:
+    for section in sections if requested_type in {None, "section"} else []:
         label = str(section.get("label") or "").strip()
         excerpt = str(section.get("text_excerpt") or "")
         if not label or _is_bad_editor_target_label(label, excerpt, is_table=False):
             continue
-        label_norm = _normalize_target_text(_strip_leading_numbering(label))
-        if len(label_norm) >= 4 and label_norm in q_norm:
+        
+        label_norm = _dedupe_target_label_words(_strip_leading_numbering(label))
+        if not label_norm or len(label_norm) < 3:
+            continue
+            
+        if label_norm == q_norm or re.search(r'\b' + re.escape(label_norm) + r'\b', q_norm):
             candidates.append(("section", section))
 
-    # If exactly one unique label (stripped) matched the query, return it.
-    # If there are multiple matches (collision), return None to let the LLM / Deep Agent resolve the ambiguity dynamically.
-    if len(candidates) == 1:
-        target_type, item = candidates[0]
+    # Prefer the most specific matching live label. This resolves a combined
+    # parent heading when the user names both concepts, while a request for only
+    # "Definitions" still resolves the exact child heading.
+    if candidates:
+        stop_words = {"and", "or", "the", "section", "table"}
+        ranked: list[tuple[int, int, str, dict[str, Any]]] = []
+        for candidate_type, item in candidates:
+            label_norm = _dedupe_target_label_words(str(item.get("label") or ""))
+            meaningful = [word for word in label_norm.split() if word not in stop_words]
+            ranked.append((len(set(meaningful)), len(label_norm), candidate_type, item))
+        ranked.sort(key=lambda row: (row[0], row[1]), reverse=True)
+        best_score = ranked[0][:2]
+        best = [row for row in ranked if row[:2] == best_score]
+        if len(best) != 1:
+            return None
+        _, _, target_type, item = best[0]
         return {
             "target_type": target_type,
             "target_id": item.get("id"),
@@ -5082,7 +5123,7 @@ def _deterministic_target_analysis(
             "confidence": 0.98,
             "requires_clarification": False,
             "candidate_targets": [],
-            "reasoning_summary": f"Direct substring match resolved target: {item.get('label')}",
+            "reasoning_summary": f"Direct match resolved target: {item.get('label')}",
             "source": "deterministic_map",
         }
 
@@ -5102,7 +5143,13 @@ def _requested_target_type(user_query: str) -> str | None:
 
 
 def _candidate_pool_for_prompt(user_query: str, sections: list[dict[str, Any]], tables: list[dict[str, Any]], paragraphs: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    # Dynamic language-agnostic candidate pool for fallback: return both sections and tables.
+    requested_type = _requested_target_type(user_query)
+    if requested_type == "table":
+        return tables
+    if requested_type == "paragraph":
+        return paragraphs
+    if requested_type == "section":
+        return sections
     return sections + tables
 
 
@@ -5194,7 +5241,11 @@ def _score_candidate(query: str, label: str, text: str = "", owning_section: str
     if not q_norm:
         return 0.0
 
-    # Direct substring matches
+    # 1. Exact match
+    if lbl_norm and lbl_norm == q_norm:
+        return 1.0
+
+    # 2. Direct substring matches
     if lbl_norm and (lbl_norm in q_norm or q_norm in lbl_norm):
         return 0.9
 
@@ -5203,12 +5254,13 @@ def _score_candidate(query: str, label: str, text: str = "", owning_section: str
     if own_norm and (own_norm in q_norm or q_norm in own_norm):
         return 0.8
 
-    # Token overlap score
-    q_tokens = set(q_norm.split())
-    candidate_words = lbl_norm.split() + own_norm.split() + _normalize_target_text(text).split()
-    cand_tokens = set(w for w in candidate_words if len(w) >= 3)
+    # 3. Content token overlap score (simple token overlap)
+    q_tokens = set(w for w in q_norm.split() if len(w) >= 3)
+    cand_tokens = set(w for w in (lbl_norm.split() + own_norm.split() + _normalize_target_text(text).split()) if len(w) >= 3)
+
     if not q_tokens or not cand_tokens:
         return 0.0
+        
     hits = len(q_tokens.intersection(cand_tokens))
     return hits / max(len(q_tokens), len(cand_tokens))
 
@@ -5233,33 +5285,16 @@ async def analyze_sop_target(payload: dict):
     paragraphs = _compact_target_items(payload.get("paragraph_index"), 160)
     document_tree = _compact_target_items(payload.get("document_tree"), 220)
 
-    # Dynamic relevance filtering to prevent context overload and random LLM target selections
-    scored_sections = [
-        (s, _score_candidate(user_query, s.get("label", ""), s.get("text_excerpt", "")))
-        for s in sections
-    ]
-    filtered_sections = [s for s, score in sorted(scored_sections, key=lambda x: x[1], reverse=True) if score > 0.15]
-    if not filtered_sections:
-        filtered_sections = sections[:8]
-    else:
-        filtered_sections = filtered_sections[:15]
-
-    scored_tables = [
-        (t, _score_candidate(user_query, t.get("label", ""), t.get("text_excerpt", ""), t.get("owning_section", "")))
-        for t in tables
-    ]
-    filtered_tables = [t for t, score in sorted(scored_tables, key=lambda x: x[1], reverse=True) if score > 0.15]
-    if not filtered_tables:
-        filtered_tables = tables[:6]
-    else:
-        filtered_tables = filtered_tables[:10]
+    # Pass sections and tables fully so the LLM agent can find them semantically
+    filtered_sections = sections
+    filtered_tables = tables
 
     scored_paras = [
         (p, _score_candidate(user_query, p.get("label", ""), p.get("text_excerpt", ""), p.get("owning_section", "")))
         for p in paragraphs
     ]
-    filtered_paras = [p for p, score in sorted(scored_paras, key=lambda x: x[1], reverse=True) if score > 0.18]
-    filtered_paras = filtered_paras[:8]
+    filtered_paras = [p for p, score in sorted(scored_paras, key=lambda x: x[1], reverse=True) if score > 0.12]
+    filtered_paras = filtered_paras[:12] if filtered_paras else paragraphs[:8]
 
     allowed_ids = {item.get("id") for item in filtered_sections + filtered_tables + filtered_paras}
     allowed_ids.add("doc_root")
@@ -5273,11 +5308,18 @@ async def analyze_sop_target(payload: dict):
         active_scope=active_scope,
     )
     if deterministic:
-        fallback = {
-            **deterministic,
-            "candidate_targets": deterministic.get("candidate_targets") if isinstance(deterministic.get("candidate_targets"), list) else [],
-            "source": "fallback",
-        }
+        # Exact live label/selection/document matches are stronger evidence than
+        # a semantic model decision. Return them immediately so an LLM cannot
+        # replace an exact child heading with a broader parent heading/table.
+        return _finalize_target_response(
+            deterministic,
+            user_query=user_query,
+            sections=sections,
+            tables=tables,
+            paragraphs=paragraphs,
+            document_tree=document_tree,
+            source="deterministic_map",
+        )
     else:
         generic_candidates = _candidate_pool_for_prompt(user_query, filtered_sections, filtered_tables, filtered_paras)
         fallback = {
@@ -5420,19 +5462,9 @@ async def analyze_sop_target(payload: dict):
         confidence = 0.0
     candidates = parsed.get("candidate_targets") if isinstance(parsed.get("candidate_targets"), list) else []
 
-    if len(candidates) == 1 and (parsed.get("requires_clarification") or confidence >= 0.45):
-        only = candidates[0] or {}
-        target_type = str(only.get("target_type") or only.get("type") or target_type or fallback["target_type"]).strip().lower()
-        target_id = str(only.get("target_id") or only.get("id") or parsed.get("target_id") or "").strip() or None
-        target_label = str(only.get("label") or only.get("target_label") or parsed.get("target_label") or "").strip() or None
-        owning_section = str(only.get("owning_section") or only.get("owningSection") or parsed.get("owning_section") or "").strip() or None
-        confidence = max(confidence, 0.62)
-        candidates = []
-        parsed["requires_clarification"] = False
-    else:
-        target_id = str(parsed.get("target_id") or "").strip() or None
-        target_label = str(parsed.get("target_label") or "").strip() or None
-        owning_section = str(parsed.get("owning_section") or "").strip() or None
+    target_id = str(parsed.get("target_id") or "").strip() or None
+    target_label = str(parsed.get("target_label") or "").strip() or None
+    owning_section = str(parsed.get("owning_section") or "").strip() or None
 
     return _finalize_target_response({
         "target_type": target_type,

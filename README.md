@@ -2,6 +2,8 @@
 
 An intelligent, production-ready Virtual Assistant designed to perform highly accurate Standard Operating Procedure (SOP) searches. This system utilizes a **Hybrid Retrieval-Augmented Generation (RAG)** approach, combining dense semantic search, sparse lexical search (BM25), and cross-encoder reranking to ensure precise and hallucination-free AI responses.
 
+For the current repository layout, runtime modules, script folders, and generated-artifact policy, see [docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md).
+
 ## 🌟 Key Features
 - **Hybrid Search Engine:** Combines `BAAI/bge-small-en-v1.5` embeddings (Dense) with BM25 (Sparse) in Qdrant.
 - **Intelligent Reranking:** Re-ranks initial hits using `cross-encoder/ms-marco-MiniLM-L-6-v2` for near-perfect context matching.

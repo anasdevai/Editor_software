@@ -16,7 +16,7 @@ export const EDITOR_GAP_APPEND_EVENT = 'editor-actions-gap-append'
 export const EDITOR_SELECTION_QUERY_EVENT = 'kl-editor-selection-query'
 export const EDITOR_SELECTION_RESPONSE_EVENT = 'kl-editor-selection-response'
 
-const SNAPSHOT_TIMEOUT_MS = 4000
+const SNAPSHOT_TIMEOUT_MS = 90000
 
 /**
  * @param {number} [timeoutMs]
@@ -51,10 +51,15 @@ export function queryEditorHasNonEmptySelection(timeoutMs = 150) {
 }
 
 export function requestEditorSnapshot({
+  action = '',
   prompt = '',
   userPrompt = '',
   sectionHint = '',
   targetScope = '',
+  targetId = '',
+  targetType = '',
+  targetLabel = '',
+  owningSection = '',
   lineNumber = null,
   recordId = '',
   preferFullSection = false,
@@ -68,7 +73,7 @@ export function requestEditorSnapshot({
   return new Promise((resolve, reject) => {
     const timer = window.setTimeout(() => {
       window.removeEventListener(EDITOR_SNAPSHOT_RESPONSE_EVENT, onResponse)
-      reject(new Error('Editor did not respond. Open an SOP in the editor first.'))
+      reject(new Error('Editor target resolution timed out. The SOP is open, but target analysis took too long. Try again or use the exact section/table heading.'))
     }, SNAPSHOT_TIMEOUT_MS)
 
     const onResponse = (event) => {
@@ -93,10 +98,15 @@ export function requestEditorSnapshot({
       new CustomEvent(EDITOR_SNAPSHOT_REQUEST_EVENT, {
         detail: {
           requestId,
+          action: String(action || '').trim(),
           prompt: String(prompt || ''),
           userPrompt: String(userPrompt || '').trim(),
           sectionHint: String(sectionHint || '').trim(),
           targetScope: String(targetScope || '').trim().toLowerCase(),
+          targetId: String(targetId || '').trim(),
+          targetType: String(targetType || '').trim().toLowerCase(),
+          targetLabel: String(targetLabel || '').trim(),
+          owningSection: String(owningSection || '').trim(),
           lineNumber: lineNumber ?? null,
           recordId: String(recordId || '').trim(),
           preferFullSection: Boolean(preferFullSection),
@@ -139,6 +149,10 @@ export function dispatchActionsTabRun({
   userPrompt = '',
   sectionHint = '',
   targetScope = '',
+  targetId = '',
+  targetType = '',
+  targetLabel = '',
+  owningSection = '',
   lineNumber = null,
   recordId = null,
   preferFullSection = false,
@@ -153,6 +167,10 @@ export function dispatchActionsTabRun({
         userPrompt: String(userPrompt || '').trim(),
         sectionHint: String(sectionHint || recordId || '').trim(),
         targetScope: String(targetScope || '').trim().toLowerCase(),
+        targetId: String(targetId || '').trim(),
+        targetType: String(targetType || '').trim().toLowerCase(),
+        targetLabel: String(targetLabel || '').trim(),
+        owningSection: String(owningSection || '').trim(),
         lineNumber: lineNumber ?? null,
         recordId: recordId ? String(recordId).trim() : '',
         preferFullSection: Boolean(preferFullSection),

@@ -22,6 +22,41 @@ const INLINE_CONTENT_ACTIONS = new Set([
   EDITOR_AI_ACTIONS.IMPROVE,
 ])
 
+const FALLBACK_EDIT_ACTIONS = [
+  ['gap_check', /\b(?:gap\s*check|compliance\s+(?:check|review)|l(?:u|ue|ü|Ã¼)cken)\b/i],
+  ['improve', /\b(?:improve|enhance|verbessern?|überarbeiten|ueberarbeiten|Ã¼berarbeiten)\b/i],
+  ['rewrite', /\b(?:rewrite|re-?write|umschreiben|neu\s+formulieren)\b/i],
+]
+
+function fallbackEditorActionClassification(text, pathname) {
+  if (!hasActiveSopEditor(pathname)) return null
+  const match = FALLBACK_EDIT_ACTIONS.find(([, pattern]) => pattern.test(text))
+  if (!match) return null
+  const sectionMatch =
+    String(text || '').match(/["']([^"']{2,120})["']/)
+    || String(text || '').match(/\b(?:section|abschnitt)\s+([A-Za-z0-9 _./&()-]{2,120})/i)
+    || String(text || '').match(/\b(?:Abschnitt|section)\s+"?([^"]{2,120}?)"?\s+(?:im|in|with|using|rewrite|umschreiben)/i)
+  const sectionHint = sectionMatch?.[1]?.trim() || null
+  return {
+    flow: 'editor_action',
+    action: match[0],
+    target_scope: sectionHint ? 'section' : 'current_section',
+    section_hint: sectionHint,
+    linked_entity_types: [],
+    constraints: {},
+    clarification_question: null,
+    confidence: 0.72,
+    reasoning: 'frontend_classifier_fallback_after_backend_error',
+    sidebar_intent: 'action',
+    run_editor_action: true,
+    run_query: false,
+    enriched_instruction: text,
+    target_resolution: sectionHint
+      ? { target_scope: 'section', section_hint: sectionHint, prefer_full_section: true }
+      : { target_scope: 'current_section', prefer_full_section: true },
+  }
+}
+
 /**
  * @typedef {object} AssistantIntentClassification
  * @property {'chat'|'editor_action'|'clarify'|'follow_up_action'} flow
@@ -95,6 +130,11 @@ export async function classifyAssistantMessage({
     }
     return normalized
   } catch (err) {
+    const fallback = fallbackEditorActionClassification(text, pathname)
+    if (fallback) {
+      console.warn('[assistant-intent] classification failed, using editor-action fallback', err)
+      return fallback
+    }
     console.warn('[assistant-intent] classification failed, defaulting to chat', err)
     return {
       flow: 'chat',
@@ -203,11 +243,7 @@ export function planEditorActionExecution(classification, opts = {}) {
     }
   }
 
-  const c = classification?.constraints || {}
   let inlineAction = intent
-  if (intent === EDITOR_AI_ACTIONS.REWRITE && (c.tone === 'formal' || c.detail_level)) {
-    inlineAction = EDITOR_AI_ACTIONS.IMPROVE
-  }
 
   const useBridge =
     intent === EDITOR_AI_ACTIONS.COMPARE

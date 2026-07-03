@@ -262,6 +262,18 @@ export async function getSOPs() {
   return res.json()
 }
 
+export async function getClientWorkspaces() {
+  const res = await fetch(`${API_BASE}/api/client-workspaces`)
+  if (!res.ok) await throwApiError(res, 'Failed to fetch client SOP workspaces')
+  return res.json()
+}
+
+export async function getClientWorkspaceSOPs(clientRef) {
+  const res = await fetch(`${API_BASE}/api/client-workspaces/${encodeURIComponent(clientRef)}/sops`)
+  if (!res.ok) await throwApiError(res, 'Failed to fetch client SOP workspace')
+  return res.json()
+}
+
 export async function getDeviations() {
   const res = await fetch(`${API_BASE}/api/deviations`)
   if (!res.ok) await throwApiError(res, 'Failed to fetch deviations')
@@ -296,6 +308,52 @@ export async function searchKnowledge(query) {
   const params = new URLSearchParams({ q: query })
   const res = await fetch(`${API_BASE}/api/search?${params}`)
   if (!res.ok) await throwApiError(res, 'Failed to perform knowledge search')
+  return res.json()
+}
+
+export async function getAgentHealth() {
+  const res = await fetch(`${API_BASE}/api/agents/health`)
+  if (!res.ok) await throwApiError(res, 'Failed to load agent orchestrator status')
+  return res.json()
+}
+
+export async function runAgentSopAction(payload) {
+  const res = await fetch(`${API_BASE}/api/agents/sop-action`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...buildOptionalAuthHeaders() },
+    body: JSON.stringify(payload || {}),
+  })
+  if (!res.ok) await throwApiError(res, 'Agent SOP action failed')
+  return res.json()
+}
+
+export async function learnAgentTemplate(payload) {
+  const res = await fetch(`${API_BASE}/api/agents/learn-template`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...buildOptionalAuthHeaders() },
+    body: JSON.stringify(payload || {}),
+  })
+  if (!res.ok) await throwApiError(res, 'Agent template learning failed')
+  return res.json()
+}
+
+export async function generateAgentSopPreview(payload) {
+  const res = await fetch(`${API_BASE}/api/agents/generate-sop-preview`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...buildOptionalAuthHeaders() },
+    body: JSON.stringify(payload || {}),
+  })
+  if (!res.ok) await throwApiError(res, 'Agent SOP preview generation failed')
+  return res.json()
+}
+
+export async function createAgentSopDraft(payload) {
+  const res = await fetch(`${API_BASE}/api/agents/create-sop-draft`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...buildOptionalAuthHeaders() },
+    body: JSON.stringify(payload || {}),
+  })
+  if (!res.ok) await throwApiError(res, 'Agent SOP draft creation failed')
   return res.json()
 }
 
@@ -339,7 +397,7 @@ export async function classifyAssistantIntent(payload = {}) {
   }
 
   const controller = new AbortController()
-  const timeoutMs = 25000
+  const timeoutMs = 45000
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   let res
   try {
@@ -358,6 +416,30 @@ export async function classifyAssistantIntent(payload = {}) {
     clearTimeout(timer)
   }
   if (!res.ok) await throwApiError(res, 'Intent classification failed')
+  return res.json()
+}
+
+export async function analyzeSopTarget(payload = {}) {
+  const controller = new AbortController()
+  const timeoutMs = 60000
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  let res
+  try {
+    res = await fetch(`${API_BASE}/api/ai/analyze-sop-target`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...buildOptionalAuthHeaders() },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    })
+  } catch (err) {
+    if (err?.name === 'AbortError') {
+      throw new Error('SOP target analysis timed out.')
+    }
+    throw err
+  } finally {
+    clearTimeout(timer)
+  }
+  if (!res.ok) await throwApiError(res, 'SOP target analysis failed')
   return res.json()
 }
 
@@ -389,7 +471,7 @@ export async function queryAI(question, options = {}) {
   }
 
   const controller = new AbortController()
-  const timeoutMs = 70000
+  const timeoutMs = 180000
   const timer = setTimeout(() => controller.abort(), timeoutMs)
   let res
   try {
@@ -440,8 +522,8 @@ export async function performAIAction(payload) {
   // calling /api/ai/action directly avoids a wasted request and a bug where the abort
   // timer was cleared after the first fetch, leaving the follow-up with no time limit.
   const controller = new AbortController()
-  const timeoutMs = 140000
-  const rewriteTimeoutMs = 320000
+  const timeoutMs = 220000
+  const rewriteTimeoutMs = 480000
   const normalizedAction = String(payload?.action || '').trim().toLowerCase().replace(/-/g, '_')
   const requestTimeoutMs = normalizedAction === 'rewrite' ? rewriteTimeoutMs : timeoutMs
   const actionTimer = setTimeout(() => controller.abort(), requestTimeoutMs)

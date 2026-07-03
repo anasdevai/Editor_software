@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Any, Optional, List
 from uuid import UUID
 from datetime import datetime
@@ -128,6 +128,10 @@ class SOPResponse(BaseModel):
     sop_number: str
     title: str
     department: Optional[str] = None
+    client_id: Optional[str] = None
+    client_name: Optional[str] = None
+    category: Optional[str] = None
+    document_family: Optional[str] = None
     source_system: Optional[str] = None
     is_active: bool
     current_version_id: Optional[UUID] = None
@@ -137,6 +141,30 @@ class SOPResponse(BaseModel):
     updated_at: datetime
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class ClientWorkspaceSOPResponse(BaseModel):
+    id: UUID
+    sop_number: str
+    title: str
+    category: Optional[str] = None
+    document_family: Optional[str] = None
+    department: Optional[str] = None
+    current_version_id: Optional[UUID] = None
+    current_version_number: Optional[str] = None
+    version_count: int = 0
+    status: Optional[str] = None
+    updated_at: datetime
+
+
+class ClientWorkspaceResponse(BaseModel):
+    client_id: Optional[str] = None
+    client_name: str
+    sop_count: int = 0
+    category_count: int = 0
+    document_family_count: int = 0
+    version_count: int = 0
+    sops: List[ClientWorkspaceSOPResponse] = Field(default_factory=list)
 
 
 class DeviationCreateUpdate(BaseModel):

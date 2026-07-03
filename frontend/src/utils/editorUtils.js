@@ -85,9 +85,29 @@ const isBulletLine = (line = '') => /^[-*•]\s+/.test(line)
 const isNumberedLine = (line = '') => /^\(?[A-Za-z0-9]+\)?[.)]\s+/.test(line)
 const isKeyValueLine = (line = '') => /^[A-ZÄÖÜ][A-Za-zÄÖÜäöüß\s/&()\-]{1,40}:\s+\S+/.test(line)
 
-const paragraphNode = (text = '') => ({ type: 'paragraph', content: [_text(text)] })
+const paragraphNode = (text = '') => {
+  const value = String(text ?? '')
+  return value ? { type: 'paragraph', content: [_text(value)] } : { type: 'paragraph' }
+}
 const headingNode = (text = '', level = 2) => ({ type: 'heading', attrs: { level }, content: [_text(text)] })
 const listItemNode = (text = '') => ({ type: 'listItem', content: [paragraphNode(text)] })
+
+const blockText = (block) =>
+  String(block?.text ?? block?.content ?? block?.value ?? block?.markdown ?? '').trim()
+
+const normalizeTableRows = (rows = []) => {
+  if (!Array.isArray(rows)) return []
+  const cleaned = rows
+    .map((row) => (Array.isArray(row) ? row.map((cell) => String(cell ?? '').trim()) : []))
+    .filter((row) => row.some(Boolean))
+  const maxCols = cleaned.reduce((max, row) => Math.max(max, row.length), 0)
+  if (!maxCols) return []
+  return cleaned.map((row) => {
+    const next = row.slice(0, maxCols)
+    while (next.length < maxCols) next.push('')
+    return next
+  })
+}
 
 /**
  * Map backend PDF/OCR blocks to a TipTap-compatible doc JSON (StarterKit + table).
@@ -105,18 +125,19 @@ export function mapBlocksToTipTapDoc(blocks, fallbackText = '') {
 
   for (const block of blocks) {
     const typ = String(block.type || '').toLowerCase()
-    if (typ === 'text' && block.content) {
+    const text = blockText(block)
+    if (typ === 'text' && text) {
       const style = String(block.style || 'paragraph').toLowerCase()
       if (style === 'heading') {
-        content.push(headingNode(block.content, 2))
+        content.push(headingNode(text, 2))
       } else {
-        content.push(paragraphNode(block.content))
+        content.push(paragraphNode(text))
       }
-    } else if ((typ === 'section_heading' || typ === 'heading') && block.text) {
+    } else if ((typ === 'section_heading' || typ === 'heading' || typ === 'title') && text) {
       const level = Math.min(3, Math.max(1, Number(block.level) || 2))
-      content.push(headingNode(block.text, level))
-    } else if (typ === 'paragraph' && block.text) {
-      const lines = splitParagraphLines(block.text)
+      content.push(headingNode(text, level))
+    } else if ((typ === 'paragraph' || typ === 'body' || typ === 'caption') && text) {
+      const lines = splitParagraphLines(text)
       if (!lines.length) continue
       if (lines.every(isBulletLine)) {
         content.push({
@@ -167,13 +188,14 @@ export function mapBlocksToTipTapDoc(blocks, fallbackText = '') {
     } else if (typ === 'table' && (Array.isArray(block.rows) || Array.isArray(block.content))) {
       const sourceRows = Array.isArray(block.rows) ? block.rows : block.content
       const headerRows = Math.max(0, Number(block.header_rows ?? block.headerRows ?? 0) || 0)
+      const normalizedRows = normalizeTableRows(sourceRows)
       const rows = []
-      for (let rowIndex = 0; rowIndex < sourceRows.length; rowIndex += 1) {
-        const row = sourceRows[rowIndex]
+      for (let rowIndex = 0; rowIndex < normalizedRows.length; rowIndex += 1) {
+        const row = normalizedRows[rowIndex]
         const cellType = rowIndex < headerRows ? 'tableHeader' : 'tableCell'
-        const cells = (row || []).map((cell) => ({
+        const cells = row.map((cell) => ({
           type: cellType,
-          content: [{ type: 'paragraph', content: [_text(cell)] }],
+          content: [paragraphNode(cell)],
         }))
         if (cells.length) rows.push({ type: 'tableRow', content: cells })
       }
@@ -183,6 +205,8 @@ export function mapBlocksToTipTapDoc(blocks, fallbackText = '') {
           content: rows,
         })
       }
+    } else if (text) {
+      content.push(paragraphNode(text))
     }
   }
 

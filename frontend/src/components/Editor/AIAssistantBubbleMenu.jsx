@@ -33,10 +33,13 @@ const buildAcceptedContent = (aiResult, selectionMeta) => {
   const structured = aiResult?.structured_data || {}
   const selectedFraction = Number(selectionMeta?.selectedFraction || 0)
   const isPartialSelection = selectedFraction > 0 && selectedFraction < 0.6
+  const richSuggestion = aiResult?.suggested_text || ''
+  const hasRichTable = /<\/?(?:table|thead|tbody|tr|td|th)\b/i.test(richSuggestion)
 
   // Partial-range edits should stay text-safe to avoid accidental document-wide
   // structural rewrites when only a small snippet is selected.
   if (isPartialSelection && (action === 'rewrite' || action === 'improve' || action === 'gap_check')) {
+    if (hasRichTable) return richSuggestion
     if (action === 'rewrite') {
       return stripHtml(structured.rewritten_text || aiResult?.suggested_text)
     }

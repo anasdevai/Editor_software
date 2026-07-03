@@ -18,18 +18,28 @@ class MockTargetResolutionLLM:
         target_type = "section"
         target_label = None
         
-        if "table" in query or "tablwe" in query:
+        # Multilingual mapping inside Mock LLM to simulate semantic target matching
+        mapped_query = query
+        if "geltungsbereich" in query:
+            mapped_query += " scope"
+        elif "anderungsverlauf" in query or "history" in query:
+            mapped_query += " history"
+            
+        if "table" in mapped_query or "tablwe" in mapped_query:
             target_type = "table"
             tables = payload.get("table_index") or []
             if tables:
-                tbl = next((t for t in tables if "history" in t.get("id") or "history" in str(t.get("owning_section")).lower()), tables[0])
+                tbl = next((t for t in tables if "history" in t.get("id") or "history" in str(t.get("owning_section")).lower() or "history" in str(t.get("label")).lower()), tables[0])
                 target_id = tbl.get("id")
                 target_label = tbl.get("label")
         else:
             target_type = "section"
             sections = payload.get("section_index") or []
             if sections:
-                sec = next((s for s in sections if "history" in s.get("id") or "history" in str(s.get("label")).lower()), sections[0])
+                if "scope" in mapped_query:
+                    sec = next((s for s in sections if "scope" in s.get("id") or "scope" in str(s.get("label")).lower()), sections[0])
+                else:
+                    sec = next((s for s in sections if "history" in s.get("id") or "history" in str(s.get("label")).lower()), sections[0])
                 target_id = sec.get("id")
                 target_label = sec.get("label")
                 
@@ -147,9 +157,112 @@ async def test_history_table_matching():
 
     print("\n--- ALL HISTORY TABLE ASSERTIONS PASSED ---")
 
+async def test_multilingual_concept_matching():
+    # Test target resolution on literal matches and cross-lingual matches
+    payload_base = {
+        "action": "rewrite",
+        "full_text": "Scope section\nTable 4 - Scope\nSome description.\nDocument History\nVersion 1.0",
+        "document_excerpt": "Scope, Table 4 - Scope, Document History table",
+        "selection": {"empty": True, "text": ""},
+        "active_scope": {"sectionName": "Scope"},
+        "section_index": [
+            {"id": "sec-scope", "type": "section", "label": "Scope", "text": "Some scope."},
+            {"id": "sec-history", "type": "section", "label": "Document History", "text": "History metadata."},
+            {"id": "sec-geltungsbereich", "type": "section", "label": "Geltungsbereich", "text": "Geltungsbereich details."},
+        ],
+        "table_index": [
+            {"id": "tbl-scope", "type": "table", "label": "Table 4 - Scope", "text": "Scope metadata."},
+            {"id": "tbl-history", "type": "table", "label": "Table 2", "text": "Version 1.0 details.", "owning_section": "Document History"},
+        ],
+        "paragraph_index": [],
+        "document_tree": [
+            {"id": "sec-scope", "type": "section", "label": "Scope"},
+            {"id": "tbl-scope", "type": "table", "label": "Table 4 - Scope"},
+            {"id": "sec-history", "type": "section", "label": "Document History"},
+            {"id": "tbl-history", "type": "table", "label": "Table 2", "owning_section": "Document History"},
+            {"id": "sec-geltungsbereich", "type": "section", "label": "Geltungsbereich"},
+        ],
+    }
+
+    # Case 1: Deterministic literal exact match (German to German)
+    det_german = routes._deterministic_target_analysis(
+        user_query="bearbeite den Geltungsbereich",
+        sections=payload_base["section_index"],
+        tables=[],
+        selection=payload_base["selection"],
+        active_scope=payload_base["active_scope"]
+    )
+    print("Deterministic exact match Geltungsbereich -> Geltungsbereich:")
+    print(json.dumps(det_german, indent=2))
+    assert det_german is not None
+    assert det_german["target_id"] == "sec-geltungsbereich"
+
+    # Case 2: Deterministic literal exact match (English to English)
+    det_english = routes._deterministic_target_analysis(
+        user_query="rewrite the Scope section",
+        sections=payload_base["section_index"],
+        tables=[],
+        selection=payload_base["selection"],
+        active_scope=payload_base["active_scope"]
+    )
+    print("Deterministic exact match Scope -> Scope:")
+    print(json.dumps(det_english, indent=2))
+    assert det_english is not None
+    assert det_english["target_id"] == "sec-scope"
+
+    # Case 3: Dynamic cross-lingual target resolution (German query targeting English section) via LLM
+    routes.resolve_sop_target_with_deep_agent = fail_deep_agent
+    routes.create_chat_llm = lambda *args, **kwargs: MockTargetResolutionLLM()
+    routes.TARGET_DEEP_AGENT_TIMEOUT_SECONDS = 1
+    routes.TARGET_LLM_FALLBACK_TIMEOUT_SECONDS = 1
+
+    # German query "bearbeite den Geltungsbereich" resolves to English "Scope"
+    payload_cross_1 = {
+        **payload_base,
+        "user_query": "bearbeite den Geltungsbereich",
+        # Remove the German "Geltungsbereich" section from indexes to force it to match English "Scope"
+        "section_index": [
+            {"id": "sec-scope", "type": "section", "label": "Scope", "text": "Some scope."},
+            {"id": "sec-history", "type": "section", "label": "Document History", "text": "History metadata."},
+        ],
+        "document_tree": [
+            {"id": "sec-scope", "type": "section", "label": "Scope"},
+            {"id": "sec-history", "type": "section", "label": "Document History"},
+        ],
+    }
+    result_cross_1 = await routes.analyze_sop_target(payload_cross_1)
+    print("Dynamic cross-lingual match Geltungsbereich -> Scope:")
+    print(json.dumps(result_cross_1, indent=2, sort_keys=True))
+    assert result_cross_1["target_type"] == "section"
+    assert result_cross_1["target_id"] == "sec-scope"
+    assert result_cross_1["requires_clarification"] is False
+
+    # German query "zeige den anderungsverlauf" resolves to English "Document History"
+    payload_cross_2 = {
+        **payload_base,
+        "user_query": "zeige den anderungsverlauf",
+        "section_index": [
+            {"id": "sec-scope", "type": "section", "label": "Scope", "text": "Some scope."},
+            {"id": "sec-history", "type": "section", "label": "Document History", "text": "History metadata."},
+        ],
+        "document_tree": [
+            {"id": "sec-scope", "type": "section", "label": "Scope"},
+            {"id": "sec-history", "type": "section", "label": "Document History"},
+        ],
+    }
+    result_cross_2 = await routes.analyze_sop_target(payload_cross_2)
+    print("Dynamic cross-lingual match Änderungsverlauf -> Document History:")
+    print(json.dumps(result_cross_2, indent=2, sort_keys=True))
+    assert result_cross_2["target_type"] == "section"
+    assert result_cross_2["target_id"] == "sec-history"
+    assert result_cross_2["requires_clarification"] is False
+
+    print("\n--- ALL MULTILINGUAL CONCEPT ASSERTIONS PASSED ---")
+
 async def main():
     await test_procedure_matching()
     await test_history_table_matching()
+    await test_multilingual_concept_matching()
 
 if __name__ == "__main__":
     asyncio.run(main())

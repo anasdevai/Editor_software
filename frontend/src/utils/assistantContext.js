@@ -47,6 +47,27 @@ function sanitizeObjectStrings(input, maxLen = 240) {
   return out
 }
 
+const FAILED_ACTION_STATUSES = new Set([
+  'error',
+  'failed',
+  'failure',
+  'cancelled',
+  'canceled',
+  'rejected',
+  'invalid',
+  'target_resolution_error',
+])
+
+function isFailedActionMemory(value) {
+  if (!value || typeof value !== 'object') return false
+  const status = sanitizeText(value.status || value.state || '', 80).toLowerCase()
+  if (FAILED_ACTION_STATUSES.has(status)) return true
+  if (value.isError === true || value.is_error === true || value.ok === false) return true
+  if (value.error || value.llm_error || value.failure_stage) return true
+  const code = sanitizeText(value.code || '', 120).toLowerCase()
+  return Boolean(code && (code.includes('error') || code.includes('failed') || code.includes('invalid')))
+}
+
 function deriveLineRows(text) {
   return String(text || '')
     .split(/\r?\n/)
@@ -153,7 +174,33 @@ export function getKLAssistantContext(pathname = '/') {
     pathname.startsWith('/editor') ||
     ((pathname === '/sops' || pathname.startsWith('/sops/')) && workspaceEditorTabActive)
   const editorText = sanitizeText(editorState?.editor_text, 14000)
-  const sections = deriveSopSections(editorText)
+  const liveTargets = editorState?.live_editor_targets && typeof editorState.live_editor_targets === 'object'
+    ? editorState.live_editor_targets
+    : null
+  const liveSections = Array.isArray(liveTargets?.sections)
+    ? liveTargets.sections.map((section, index) => ({
+        id: sanitizeText(section?.id || '', 160),
+        label: sanitizeText(section?.label || `Section ${index + 1}`, 180),
+        order: Number(section?.order) || index + 1,
+        content: sanitizeText(section?.content || '', 2400),
+        from: Number.isFinite(Number(section?.from)) ? Number(section.from) : null,
+        to: Number.isFinite(Number(section?.to)) ? Number(section.to) : null,
+        target_type: 'section',
+      }))
+    : []
+  const compactLiveTargets = (rows, targetType) => (Array.isArray(rows) ? rows : []).slice(0, 180).map((row, index) => ({
+    id: sanitizeText(row?.id || '', 160),
+    label: sanitizeText(row?.label || `${targetType} ${index + 1}`, 180),
+    type: targetType,
+    target_type: targetType,
+    order: Number(row?.order) || index + 1,
+    parent_id: sanitizeText(row?.parent_id || '', 160) || null,
+    owning_section: sanitizeText(row?.owning_section || '', 180),
+    from: Number.isFinite(Number(row?.from)) ? Number(row.from) : null,
+    to: Number.isFinite(Number(row?.to)) ? Number(row.to) : null,
+    content: sanitizeText(row?.content || '', 2400),
+  }))
+  const sections = liveSections.length ? liveSections : deriveSopSections(editorText)
   const selectedSectionPayload = buildSelectedSectionPayload(editorState, sections)
   const metadata = sanitizeObjectStrings(editorState?.sop?.metadata || {}, 220)
   const metadataJson = sanitizeObjectStrings(editorState?.sop?.metadata_json || {}, 220)
@@ -205,6 +252,26 @@ export function getKLAssistantContext(pathname = '/') {
       scope: sanitizeText(editorState?.selected_section?.scope || '', 80),
       text_excerpt: sanitizeText(editorState?.selected_section?.text_excerpt || '', 1200),
     },
+    editor_context_contract: liveTargets
+      ? {
+          schema_version: Number(liveTargets.schema_version) || 1,
+          document_id: sanitizeText(liveTargets.document_id || activeSopId, 160),
+          document_size: Number(liveTargets.document_size) || 0,
+          captured_at: sanitizeText(liveTargets.captured_at || editorState?.updated_at || '', 80),
+          document_schema: sanitizeText(liveTargets.schema || '', 12000),
+          sop_context: { sections },
+          targets: {
+            sections,
+            tables: compactLiveTargets(liveTargets.tables, 'table'),
+            paragraphs: compactLiveTargets(liveTargets.paragraphs, 'paragraph'),
+          },
+          selected_section: {
+            id: selectedSectionPayload.id,
+            label: selectedSectionPayload.label,
+            content: selectedSectionPayload.content,
+          },
+        }
+      : null,
     linked_context: {
       deviations: trimEntityList(editorState?.linked?.deviations, 6),
       capas: trimEntityList(editorState?.linked?.capas, 6),
@@ -281,13 +348,17 @@ export function resetAssistantStateOnce() {
 export function saveAssistantSessionSnapshot(snapshot = {}) {
   if (typeof window === 'undefined' || !snapshot || typeof snapshot !== 'object') return
   const existing = readLocalJson(KL_ASSISTANT_ACTION_MEMORY_KEY, {})
+  const nextActiveScope =
+    snapshot.active_scope && !isFailedActionMemory(snapshot.active_scope)
+      ? snapshot.active_scope
+      : existing.active_scope || null
   try {
     localStorage.setItem(
       KL_ASSISTANT_ACTION_MEMORY_KEY,
       JSON.stringify({
         ...existing,
         updated_at: new Date().toISOString(),
-        active_scope: snapshot.active_scope || existing.active_scope || null,
+        active_scope: nextActiveScope,
         instruction_memory: snapshot.instruction_memory || existing.instruction_memory || [],
         conversation_history: snapshot.conversation_history || existing.conversation_history || [],
       }),
@@ -330,6 +401,7 @@ function getActiveEditorDocumentIdFromStorage() {
 
 export function saveAssistantLastAction(action) {
   if (typeof window === 'undefined' || !action || typeof action !== 'object') return
+  if (isFailedActionMemory(action)) return
   const existing = readLocalJson(KL_ASSISTANT_ACTION_MEMORY_KEY, {})
   const safe = {
     updated_at: new Date().toISOString(),
@@ -393,6 +465,9 @@ export function saveAssistantLastFocus(focus) {
         updated_at: safe.updated_at,
         last_action: existing?.last_action || null,
         last_focus: safe,
+        active_scope: existing?.active_scope || null,
+        instruction_memory: existing?.instruction_memory || [],
+        conversation_history: existing?.conversation_history || [],
       }),
     )
     window.dispatchEvent(new CustomEvent('sop-editor-context-changed'))

@@ -11,10 +11,15 @@ import { wantsFullSopIntent } from './sopActionIntent'
 
 export async function resolveGapCheckTarget(instruction, targetOptions = {}) {
   const snapshot = await requestEditorSnapshot({
+    action: 'gap_check',
     prompt: instruction,
     userPrompt: targetOptions.userPrompt || '',
     sectionHint: targetOptions.sectionHint || '',
     targetScope: targetOptions.targetScope || '',
+    targetId: targetOptions.targetId || '',
+    targetType: targetOptions.targetType || '',
+    targetLabel: targetOptions.targetLabel || '',
+    owningSection: targetOptions.owningSection || '',
     lineNumber: targetOptions.lineNumber ?? null,
     recordId: targetOptions.recordId || '',
     preferFullSection: Boolean(targetOptions.preferFullSection),

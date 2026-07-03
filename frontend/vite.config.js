@@ -15,7 +15,7 @@ export default defineConfig({
         changeOrigin: true,
         // Slightly longer dev timeouts cover slow first-time RAG warmup,
         // while still surfacing genuinely hung backends to the developer.
-        timeout: 120000,
+        timeout: 240000,
       },
     },
   },

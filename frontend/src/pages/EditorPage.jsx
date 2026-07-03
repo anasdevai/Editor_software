@@ -11,6 +11,7 @@ import { Table } from '@tiptap/extension-table'
 import { TableRow } from '@tiptap/extension-table-row'
 import { TableCell } from '@tiptap/extension-table-cell'
 import { TableHeader } from '@tiptap/extension-table-header'
+import UniqueID from '@tiptap/extension-unique-id'
 import {
   CheckCircle2,
   ChevronLeft,
@@ -52,6 +53,7 @@ import {
   KL_ASSISTANT_CONTEXT_REFRESH_REQUEST,
   notifySopEditorContextChanged,
 } from '../utils/editorAiBridge'
+import { parseSopDocument } from '../utils/targeting/sopParser'
 import '../assets/styles/global.css'
 
 const PreviewModal = lazy(() => import('../components/Common/PreviewModal'))
@@ -429,6 +431,10 @@ const EditorPage = ({
     TableRow,
     TableHeader,
     TableCell,
+    UniqueID.configure({
+      attributeName: 'id',
+      types: ['heading', 'paragraph', 'table'],
+    }),
     EditorShortcuts,
     InlineAiSuggestion,
   ]), [])
@@ -629,6 +635,45 @@ const EditorPage = ({
   const persistKlEditorContext = useCallback(() => {
     if (!editor || editor.isDestroyed) return
     const selectionSnapshot = deriveEditorSelectionSnapshot(editor)
+    const parsedSop = parseSopDocument(editor)
+    const liveTargets = {
+      schema_version: 1,
+      document_id: String(documentId || ''),
+      document_size: parsedSop.docSize || 0,
+      captured_at: new Date().toISOString(),
+      schema: parsedSop.schema || '',
+      sections: (parsedSop.sections || []).map((section, index) => ({
+        id: section.id,
+        type: 'section',
+        label: section.title || `Section ${index + 1}`,
+        order: index + 1,
+        from: section.position?.from,
+        to: section.position?.to,
+        content: section.content || '',
+      })),
+      tables: (parsedSop.tables || []).map((table, index) => ({
+        id: table.id,
+        type: 'table',
+        label: table.caption || table.title || `Table ${index + 1}`,
+        order: index + 1,
+        parent_id: table.parent_id || null,
+        owning_section: table.owningSection || '',
+        from: table.position?.from,
+        to: table.position?.to,
+        content: table.content || '',
+      })),
+      paragraphs: (parsedSop.paragraphs || []).map((paragraph, index) => ({
+        id: paragraph.id,
+        type: 'paragraph',
+        label: `P${index + 1}${paragraph.parent_title ? ` · ${paragraph.parent_title}` : ''}`,
+        order: index + 1,
+        parent_id: paragraph.parent_id || null,
+        owning_section: paragraph.parent_title || '',
+        from: paragraph.position?.from,
+        to: paragraph.position?.to,
+        content: paragraph.content || '',
+      })),
+    }
     const linked = {
       deviations: Array.isArray(relatedContextSnapshot?.related_deviations) ? relatedContextSnapshot.related_deviations : [],
       capas: Array.isArray(relatedContextSnapshot?.related_capas) ? relatedContextSnapshot.related_capas : [],
@@ -665,6 +710,7 @@ const EditorPage = ({
       selected_range: selectionSnapshot.selectedRange,
       selected_section_name: selectionSnapshot.selectedSection.name,
       selected_section: selectionSnapshot.selectedSection,
+      live_editor_targets: liveTargets,
     }
     try {
       localStorage.setItem(KL_EDITOR_CONTEXT_KEY, JSON.stringify(payload))
@@ -1038,7 +1084,13 @@ const EditorPage = ({
       console.debug('[OCR] metadata received', imported.metadata || imported.response?.sop_metadata || {})
       // Yield one frame so UI can paint loading state before heavy content insert.
       await new Promise((resolve) => window.requestAnimationFrame(resolve))
-      editor.commands.setContent(imported.docJson || imported.html, false)
+      try {
+        editor.commands.setContent(imported.docJson || imported.html, false)
+      } catch (setContentError) {
+        if (!imported.html) throw setContentError
+        console.warn('[SOP Import] TipTap JSON import failed; retrying with HTML fallback.', setContentError)
+        editor.commands.setContent(imported.html, false)
+      }
 
       const ui = imported.metadata || {}
       if (ui && typeof ui === 'object') {
